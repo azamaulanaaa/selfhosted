@@ -8,3 +8,9 @@
 
 # smolvm runtime state. Created by any smolvm CLI call from this directory.
 .smolvm/
+
+# Local wizard output. This directory is user-specific and can hold secrets.
+/config/
+
+# Runtime application data.
+/data/

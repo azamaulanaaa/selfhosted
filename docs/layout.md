@@ -27,16 +27,17 @@ A per-application directory set has this form:
 ```text
 ./
 ├── compose.yaml            # stack definition (repo root)
-├── setup.sh                # interactive wizard
+├── setup.sh                # service dispatcher
 ├── config/
 │   └── <app>/
 │       ├── <app>.env       # wizard answers (domain, email, ...)
 │       └── secrets/        # API keys as files, mode 600
 ├── state/
 │   └── <app>/
+│       ├── setup.sh          # per-service wizard
 │       ├── <app>.env.example # committed example of config/<app>/<app>.env
-│       └── Caddyfile       # hand-maintained advanced config, OR
-│       └── Caddyfile.tpl # rendered at runtime; output not committed
+│       └── Caddyfile         # hand-maintained advanced config, OR
+│       └── Caddyfile.tpl     # rendered at runtime; output not committed
 └── data/
     └── <app>/
         ├── run/            # renderer output; disposable; no backup
@@ -67,12 +68,14 @@ A per-application directory set has this form:
   `state/<app>/`. Rendered output is never committed.
 - Example environment files (`<app>.env.example`) are the only
   committed form of `config/<app>/<app>.env`.
+- Service wizards live in `state/<app>/setup.sh` and are committed.
+  See [Wizards and cleanup](#wizards-and-cleanup).
 
 ### `data/` — runtime only
 
 - `data/` is gitignored.
 - `data/<app>/run/` holds renderer output. It is disposable.
-  `setup.sh` or the renderer may delete and recreate it. It is never
+  `setup.sh` or the renderer may remove and recreate it. It is never
   backed up.
 - `data/<app>/store/` holds the application payload. No repository
   tooling writes it. It is always backed up. Directories are mode 700.
@@ -105,6 +108,49 @@ A per-application directory set has this form:
 - Each application has exactly one directory per domain:
   `config/<app>/`, `state/<app>/`, `data/<app>/`.
 
+## Wizards and cleanup
+
+The root `setup.sh` is a dispatcher. It holds no service-specific
+logic. It finds the services by scanning `state/*/setup.sh`. It asks
+the stack-wide questions (for example `PUBLIC_IP`). It asks which
+services to enable. Then it calls each selected service wizard in turn.
+
+Each service owns one wizard at `state/<app>/setup.sh`. The service
+wizard asks the service-specific questions. It generates the service
+secrets. It renders the service config files. The root dispatcher does
+not know the service questions, the service secrets, or the service
+config keys.
+
+Stack-wide values are asked once by the root dispatcher. All services
+read them from the root `.env` file. The `.env` file is gitignored.
+Per-service values stay in `config/<app>/`.
+
+### Dispatch
+
+- `setup.sh` with no argument runs the dispatcher.
+- `setup.sh <app> [args...]` passes the arguments to that service
+  wizard. Example: `setup.sh <app> clean`.
+- Non-interactive selection comes from `SETUP_SERVICES`. The value is
+  a comma-separated list of service names. `all` selects every
+  discovered service. `none` selects no service. The default is every
+  discovered service.
+
+### Cleanup
+
+Each service wizard supports `clean`.
+
+- `setup.sh <app> clean` removes only `config/<app>/`. It removes the
+  wizard answers, the peer lists, the rendered files, and the secrets.
+- `data/<app>/` is never removed without `--data`.
+- `--data` also removes the whole `data/<app>/` tree. Use it with care.
+- Destructive actions ask for confirmation. `--yes` skips the prompt
+  for scripted runs. A declined prompt removes nothing and exits 0.
+- `clean` never touches `state/`, the root `.env`, or the other
+  services.
+- After a cleanup, run the service wizard again to regenerate the
+  files. A service that was part of a cluster may need its own admin
+  commands to leave the cluster cleanly.
+
 ## Out of scope
 
 This contract covers placement only.
@@ -112,8 +158,7 @@ This contract covers placement only.
 - Backup scope, encryption format, and schedule: separate document.
 - Restore procedure: separate document.
 - CI smoke tests for rendering: separate document.
-- The template renderer choice (`consul-template` or `gomplate`):
-  not decided by this contract.
+- The template renderer choice: not decided by this contract.
 - The compose file layout (single root `compose.yaml` against
   per-application files): not decided by this contract. The tree
   above shows a root `compose.yaml` as the current form.

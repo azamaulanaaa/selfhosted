@@ -1,0 +1,670 @@
+#!/usr/bin/env bash
+# Generate the Forgejo wizard files for this stack.
+# Safe to run again: it keeps existing secrets unless rotation is asked for.
+# It never prints secret values. It prints paths only.
+#
+# The root dispatcher (setup.sh) calls this script. It can also run standalone.
+#
+# Usage:
+#   setup.sh forgejo                          Run the Forgejo wizard.
+#   setup.sh forgejo clean [--data] [--yes]   Remove the forgejo configuration.
+#                                             With --data also remove the forgejo data.
+#                                             Ask for confirmation unless --yes is given.
+#
+# Non-interactive environment variables:
+#   STACK_DOMAIN              Base domain for the stack. Read from the environment,
+#                             then the root .env, then sh.lan.
+#   FORGEJO_APP_NAME          Display name for the forge. Default: Forgejo.
+#   FORGEJO_USE_LOCAL_CONSUL  1 to use this repo's consul service, 0 for a remote one.
+#                             Default 1.
+#   FORGEJO_CONSUL_HOST       Consul IP or hostname. Required when the consul is remote.
+#   FORGEJO_CONSUL_PORT       Consul HTTP port. Default 8500.
+#   FORGEJO_CONSUL_TOKEN      Consul ACL token when the consul is remote. When empty,
+#                             an existing token file is kept.
+#   FORGEJO_OIDC_ISSUER_URL   OIDC issuer URL. Required. Must start with https://.
+#   FORGEJO_OIDC_CLIENT_ID    OIDC client ID. Required.
+#   FORGEJO_OIDC_CLIENT_SECRET  OIDC client secret. When empty, an existing secret
+#                             file is kept. Interactive runs prompt for it.
+#   FORGEJO_OIDC_PROVIDER_NAME Name shown for the OIDC provider. Default: oidc.
+#   FORGEJO_OIDC_AUTO_REGISTER  yes to create accounts for new OIDC users. Default: no.
+#   FORGEJO_PEER_GIT_PORT     Port used by peer git pushes. Default 3000.
+#   FORGEJO_ROTATE_SECRETS    1 to replace the OIDC client secret and the Forgejo
+#                             secret key. Default 0.
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+readonly REPO_ROOT
+
+readonly CONFIG_DIR="config/forgejo"
+readonly SECRETS_DIR="config/forgejo/secrets"
+readonly STORE_DIR="data/forgejo/store"
+readonly ENV_FILE="config/forgejo/forgejo.env"
+readonly CT_FILE="config/forgejo/consul-template.hcl"
+readonly OIDC_SECRET_FILE="config/forgejo/secrets/oidc-client-secret"
+readonly FORGEJO_SECRET_FILE="config/forgejo/secrets/secret-key"
+readonly CONSUL_TOKEN_FILE="config/forgejo/secrets/consul-token"
+
+readonly DEFAULT_STACK_DOMAIN="sh.lan"
+readonly DEFAULT_APP_NAME="Forgejo"
+readonly DEFAULT_OIDC_PROVIDER="oidc"
+readonly DEFAULT_PEER_GIT_PORT="3000"
+
+# Print the STACK_DOMAIN value from the root .env file.
+read_env_stack_domain() {
+  if [ ! -f .env ]; then
+    return 0
+  fi
+  { grep -E '^STACK_DOMAIN=' .env || true; } | tail -n1 | cut -d= -f2- |
+    sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\\1/" -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
+}
+
+# Resolve the stack domain. Set stack_domain and stack_domain_source.
+resolve_stack_domain() {
+  if [ -n "${STACK_DOMAIN:-}" ]; then
+    stack_domain="$STACK_DOMAIN"
+    stack_domain_source="env"
+    return 0
+  fi
+  candidate="$(read_env_stack_domain)"
+  if [ -n "$candidate" ]; then
+    stack_domain="$candidate"
+    stack_domain_source="envfile"
+    return 0
+  fi
+  stack_domain="$DEFAULT_STACK_DOMAIN"
+  stack_domain_source="default"
+}
+
+# Print an STE error for an invalid resolved stack domain and exit 1.
+stack_domain_invalid() {
+  case "$stack_domain_source" in
+  env)
+    echo "error: STACK_DOMAIN '$stack_domain' is not a valid base domain." >&2
+    ;;
+  envfile)
+    echo "error: The root .env holds the invalid STACK_DOMAIN '$stack_domain'." >&2
+    echo "error: Fix .env by hand or set STACK_DOMAIN." >&2
+    ;;
+  *)
+    echo "error: '$stack_domain' is not a valid base domain." >&2
+    ;;
+  esac
+  echo "error: Use lowercase labels separated by dots. Use at least two labels." >&2
+  exit 1
+}
+
+# Return 0 when the argument is a valid base domain.
+is_valid_domain() {
+  local domain="$1"
+  [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]
+}
+
+# Return 0 when the argument is an HTTPS URL with a host.
+is_valid_issuer_url() {
+  [[ "$1" =~ ^https://[A-Za-z0-9][A-Za-z0-9.:_-]*(/[^[:space:]]*)?$ ]]
+}
+
+# Return 0 when the argument is a valid OIDC client ID.
+is_valid_client_id() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+# Return 0 when the argument is a valid provider name.
+is_valid_provider_name() {
+  [[ "$1" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]
+}
+
+# Return 0 when the argument is a plausible consul host.
+is_valid_consul_host() {
+  [[ "$1" =~ ^[a-zA-Z0-9.:-]+$ ]]
+}
+
+# Return 0 when the argument is a TCP port from 1 to 65535.
+is_valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# Return 0 when the argument is yes or no.
+is_yes_no() {
+  case "$1" in
+  [Yy] | [Yy][Ee][Ss] | [Nn] | [Nn][Oo] | 0 | 1 | true | false) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+# Resolve a removal target and make sure it stays inside the base directory.
+# Print the resolved absolute path. Return 1 when the target escapes the base.
+resolve_removal_target() {
+  local target="$1" base="$2" resolved
+  if command -v realpath >/dev/null 2>&1; then
+    resolved="$(realpath -m -- "$target")" || {
+      echo "error: Cannot resolve '$target'." >&2
+      return 1
+    }
+  else
+    resolved="$target"
+  fi
+  case "$resolved" in
+  "$base" | "$base"/*)
+    printf '%s\n' "$resolved"
+    return 0
+    ;;
+  *)
+    echo "error: Refusing to remove '$resolved'. It is not inside '$base'." >&2
+    return 1
+    ;;
+  esac
+}
+
+usage_clean() {
+  echo "usage: setup.sh forgejo clean [--data] [--yes]" >&2
+}
+
+# Remove the forgejo configuration. With --data also remove the forgejo data.
+# Never touch state/, .env, other services, or paths outside the two trees.
+clean_service() {
+  local with_data=0 assume_yes=0 flag
+  for flag in "$@"; do
+    case "$flag" in
+    --data) with_data=1 ;;
+    --yes) assume_yes=1 ;;
+    *)
+      echo "error: Unknown flag '$flag'." >&2
+      usage_clean
+      exit 2
+      ;;
+    esac
+  done
+
+  if [ -L "$REPO_ROOT/config/forgejo" ]; then
+    echo "error: '$REPO_ROOT/config/forgejo' is a symlink. Refusing to remove it." >&2
+    exit 1
+  fi
+  if [ "$with_data" -eq 1 ] && [ -L "$REPO_ROOT/data/forgejo" ]; then
+    echo "error: '$REPO_ROOT/data/forgejo' is a symlink. Refusing to remove it." >&2
+    exit 1
+  fi
+
+  local config_target data_target
+  config_target="$(resolve_removal_target "$REPO_ROOT/config/forgejo" "$REPO_ROOT/config/forgejo")" || exit 1
+  if [ "$with_data" -eq 1 ]; then
+    data_target="$(resolve_removal_target "$REPO_ROOT/data/forgejo" "$REPO_ROOT/data/forgejo")" || exit 1
+  fi
+
+  local -a remove_paths=()
+  local path
+  if [ -d "$config_target" ]; then
+    while IFS= read -r path; do
+      remove_paths+=("$path")
+    done < <(find "$config_target" -mindepth 1 | LC_ALL=C sort)
+    remove_paths+=("$config_target")
+  fi
+  if [ "$with_data" -eq 1 ] && [ -d "$data_target" ]; then
+    remove_paths+=("$data_target")
+  fi
+
+  if [ "${#remove_paths[@]}" -eq 0 ]; then
+    echo "Nothing to remove."
+    return 0
+  fi
+
+  echo "This will remove:"
+  for path in "${remove_paths[@]}"; do
+    echo "  $path"
+  done
+
+  if [ "$assume_yes" -eq 0 ]; then
+    if [ -t 0 ]; then
+      local prompt answer
+      if [ "$with_data" -eq 1 ]; then
+        prompt="Remove the configuration AND DATA for forgejo? This deletes the litefs-backed database and git repositories. [y/N] "
+      else
+        prompt="Remove the configuration for forgejo? [y/N] "
+      fi
+      if ! read -r -p "$prompt" answer; then
+        answer=""
+      fi
+      case "${answer:-N}" in
+      [Yy] | [Yy][Ee][Ss]) ;;
+      [Nn] | [Nn][Oo] | "")
+        echo "Aborted. Nothing removed."
+        return 0
+        ;;
+      *)
+        echo "error: Answer Y or N." >&2
+        return 1
+        ;;
+      esac
+    else
+      echo "Aborted. Nothing removed."
+      echo "hint: Pass --yes to remove without a prompt."
+      return 0
+    fi
+  fi
+
+  rm -rf -- "$config_target"
+  if [ "$with_data" -eq 1 ]; then
+    rm -rf -- "$data_target"
+  fi
+  local removed_path
+  for removed_path in "${remove_paths[@]}"; do
+    echo "removed: $removed_path"
+  done
+  echo "Removed the forgejo configuration."
+  if [ "$with_data" -eq 1 ]; then
+    echo "Removed the forgejo data."
+  fi
+  echo "Run 'bash setup.sh forgejo' to generate fresh files for a future install."
+  echo "hint: The litefs cluster state in consul is not removed."
+  return 0
+}
+
+# The clean subcommand removes the forgejo configuration and data.
+if [ "${1:-}" = "clean" ]; then
+  shift
+  clean_service "$@"
+  exit 0
+fi
+
+# Write a secret file with mode 0600 and no trailing newline.
+write_secret_file() {
+  local path="$1" value="$2"
+  (
+    umask 077
+    printf '%s' "$value" >"$path"
+  )
+  chmod 0600 "$path"
+}
+
+# Print the value of one KEY=VALUE line from a file.
+read_env_value() {
+  local key="$1" file="$2"
+  [ -f "$file" ] || return 0
+  { grep -E "^${key}=" "$file" || true; } | tail -n1 | cut -d= -f2-
+}
+
+# Return 0 when the line's key is one that this wizard manages.
+is_managed_key() {
+  local key="$1"
+  case "$key" in
+  FORGEJO_APP_NAME | FORGEJO_OIDC_ISSUER_URL | FORGEJO_OIDC_CLIENT_ID | \
+    FORGEJO_OIDC_PROVIDER_NAME | FORGEJO_OIDC_AUTO_REGISTER | \
+    FORGEJO_PEER_GIT_PORT | FORGEJO_OIDC_CLIENT_SECRET_FILE | \
+    FORGEJO_SECRET_KEY_FILE) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+# Step 1: fail early when openssl is missing.
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "error: openssl is not on PATH. Install openssl first." >&2
+  exit 1
+fi
+
+# Step 2: resolve and validate the stack domain.
+resolve_stack_domain
+if ! is_valid_domain "$stack_domain"; then
+  stack_domain_invalid
+fi
+
+# Step 3: collect the answers. Use the environment when stdin is not a TTY.
+# Resolve one value from the environment, then the existing answer file, then
+# the default. Print the resolved value.
+resolve_answer() {
+  local env_value="$1" key="$2" default_value="$3" saved
+  if [ -n "$env_value" ]; then
+    printf '%s' "$env_value"
+    return 0
+  fi
+  saved="$(read_env_value "$key" "$ENV_FILE")"
+  if [ -n "$saved" ]; then
+    printf '%s' "$saved"
+    return 0
+  fi
+  printf '%s' "$default_value"
+}
+
+app_name="$(resolve_answer "${FORGEJO_APP_NAME:-}" FORGEJO_APP_NAME "$DEFAULT_APP_NAME")"
+issuer_url="$(resolve_answer "${FORGEJO_OIDC_ISSUER_URL:-}" FORGEJO_OIDC_ISSUER_URL "")"
+client_id="$(resolve_answer "${FORGEJO_OIDC_CLIENT_ID:-}" FORGEJO_OIDC_CLIENT_ID "")"
+client_secret="${FORGEJO_OIDC_CLIENT_SECRET:-}"
+provider_name="$(resolve_answer "${FORGEJO_OIDC_PROVIDER_NAME:-}" FORGEJO_OIDC_PROVIDER_NAME "$DEFAULT_OIDC_PROVIDER")"
+auto_register="$(resolve_answer "${FORGEJO_OIDC_AUTO_REGISTER:-}" FORGEJO_OIDC_AUTO_REGISTER "no")"
+peer_git_port="$(resolve_answer "${FORGEJO_PEER_GIT_PORT:-}" FORGEJO_PEER_GIT_PORT "$DEFAULT_PEER_GIT_PORT")"
+use_local_consul=1
+consul_host="127.0.0.1"
+consul_port="8500"
+consul_token="${FORGEJO_CONSUL_TOKEN:-}"
+rotate=0
+
+if [ -t 0 ]; then
+  if ! read -r -p "Base domain for the stack? [$stack_domain] " domain_answer; then
+    domain_answer=""
+  fi
+  if [ -n "$domain_answer" ]; then
+    if ! is_valid_domain "$domain_answer"; then
+      echo "error: '$domain_answer' is not a valid base domain." >&2
+      echo "error: Use lowercase labels separated by dots. Use at least two labels." >&2
+      exit 1
+    fi
+    stack_domain="$domain_answer"
+  fi
+
+  if ! read -r -p "Use this repo's consul service for consul-template? [Y/n] " local_answer; then
+    local_answer=""
+  fi
+  case "${local_answer:-Y}" in
+  [Yy] | [Yy][Ee][Ss]) use_local_consul=1 ;;
+  [Nn] | [Nn][Oo]) use_local_consul=0 ;;
+  *)
+    echo "error: Answer Y or N." >&2
+    exit 1
+    ;;
+  esac
+  if [ "$use_local_consul" -eq 0 ]; then
+    if ! read -r -p "Consul IP or hostname? " host_answer; then
+      host_answer=""
+    fi
+    if ! is_valid_consul_host "$host_answer"; then
+      echo "error: '$host_answer' is not a valid Consul IP or hostname." >&2
+      echo "error: Use letters, digits, dots, dashes, and colons." >&2
+      exit 1
+    fi
+    consul_host="$host_answer"
+    if ! read -r -p "Consul HTTP port? [$consul_port] " port_answer; then
+      port_answer=""
+    fi
+    if [ -n "$port_answer" ]; then
+      if ! is_valid_port "$port_answer"; then
+        echo "error: '$port_answer' is not a valid port. Use 1 to 65535." >&2
+        exit 1
+      fi
+      consul_port="$port_answer"
+    fi
+    if ! read -r -s -p "Consul ACL token? (empty for anonymous) " token_answer; then
+      token_answer=""
+    fi
+    echo >&2
+    consul_token="$token_answer"
+  fi
+
+  if ! read -r -p "Display name for the forge? [$app_name] " name_answer; then
+    name_answer=""
+  fi
+  app_name="${name_answer:-$app_name}"
+
+  if ! read -r -p "OIDC issuer URL? " issuer_url; then
+    issuer_url=""
+  fi
+  if ! read -r -p "OIDC client ID? " client_id; then
+    client_id=""
+  fi
+  if ! read -r -s -p "OIDC client secret? " secret_answer; then
+    secret_answer=""
+  fi
+  echo >&2
+  if [ -n "$secret_answer" ]; then
+    client_secret="$secret_answer"
+  fi
+
+  if ! read -r -p "Name shown for the OIDC provider? [$provider_name] " provider_answer; then
+    provider_answer=""
+  fi
+  provider_name="${provider_answer:-$provider_name}"
+
+  if ! read -r -p "Create accounts for new OIDC users? [y/N] " auto_answer; then
+    auto_answer=""
+  fi
+  case "${auto_answer:-N}" in
+  [Yy] | [Yy][Ee][Ss]) auto_register="yes" ;;
+  [Nn] | [Nn][Oo] | "") auto_register="no" ;;
+  *)
+    echo "error: Answer Y or N." >&2
+    exit 1
+    ;;
+  esac
+
+  if ! read -r -p "Port used by peer git pushes? [$peer_git_port] " port_answer; then
+    port_answer=""
+  fi
+  peer_git_port="${port_answer:-$peer_git_port}"
+
+  if [ -f "$OIDC_SECRET_FILE" ]; then
+    if ! read -r -p "Rotate the OIDC secret and the Forgejo secret key? [y/N] " rotate_answer; then
+      rotate_answer=""
+    fi
+    case "${rotate_answer:-N}" in
+    [Yy] | [Yy][Ee][Ss]) rotate=1 ;;
+    [Nn] | [Nn][Oo] | "") rotate=0 ;;
+    *)
+      echo "error: Answer Y or N." >&2
+      exit 1
+      ;;
+    esac
+  fi
+else
+  case "${FORGEJO_USE_LOCAL_CONSUL:-1}" in
+  0 | 1) use_local_consul="${FORGEJO_USE_LOCAL_CONSUL:-1}" ;;
+  *)
+    echo "error: FORGEJO_USE_LOCAL_CONSUL must be 0 or 1." >&2
+    exit 1
+    ;;
+  esac
+  if [ "$use_local_consul" -eq 0 ]; then
+    consul_host="${FORGEJO_CONSUL_HOST:-}"
+    consul_port="${FORGEJO_CONSUL_PORT:-8500}"
+    if [ -z "$consul_host" ]; then
+      echo "error: FORGEJO_CONSUL_HOST is required when FORGEJO_USE_LOCAL_CONSUL=0." >&2
+      exit 1
+    fi
+    if ! is_valid_consul_host "$consul_host"; then
+      echo "error: FORGEJO_CONSUL_HOST '$consul_host' is not a valid Consul host." >&2
+      echo "error: Use letters, digits, dots, dashes, and colons." >&2
+      exit 1
+    fi
+    if ! is_valid_port "$consul_port"; then
+      echo "error: FORGEJO_CONSUL_PORT '$consul_port' is not a valid port. Use 1 to 65535." >&2
+      exit 1
+    fi
+  fi
+  case "${FORGEJO_ROTATE_SECRETS:-0}" in
+  0 | 1) rotate="${FORGEJO_ROTATE_SECRETS:-0}" ;;
+  *)
+    echo "error: FORGEJO_ROTATE_SECRETS must be 0 or 1." >&2
+    exit 1
+    ;;
+  esac
+fi
+
+# Step 4: validate every answer before any file is written.
+if [ -z "$issuer_url" ]; then
+  echo "error: The OIDC issuer URL is not set." >&2
+  echo "error: Set FORGEJO_OIDC_ISSUER_URL or run the wizard on a terminal." >&2
+  exit 1
+fi
+if ! is_valid_issuer_url "$issuer_url"; then
+  echo "error: '$issuer_url' is not a valid OIDC issuer URL." >&2
+  echo "error: Use an HTTPS URL such as https://auth.example.com." >&2
+  exit 1
+fi
+if [ -z "$client_id" ]; then
+  echo "error: The OIDC client ID is not set." >&2
+  echo "error: Set FORGEJO_OIDC_CLIENT_ID or run the wizard on a terminal." >&2
+  exit 1
+fi
+if ! is_valid_client_id "$client_id"; then
+  echo "error: '$client_id' is not a valid OIDC client ID." >&2
+  echo "error: Use letters, digits, dots, underscores, and hyphens." >&2
+  exit 1
+fi
+if [ -z "$provider_name" ] || ! is_valid_provider_name "$provider_name"; then
+  echo "error: '$provider_name' is not a valid provider name." >&2
+  echo "error: Use lowercase letters, digits, and hyphens between words." >&2
+  exit 1
+fi
+if ! is_yes_no "$auto_register"; then
+  echo "error: '$auto_register' is not a yes or no value." >&2
+  exit 1
+fi
+if ! is_valid_port "$peer_git_port"; then
+  echo "error: '$peer_git_port' is not a valid port. Use 1 to 65535." >&2
+  exit 1
+fi
+
+case "$auto_register" in
+[Yy] | [Yy][Ee][Ss] | 1 | true) auto_register="true" ;;
+*) auto_register="false" ;;
+esac
+
+# Step 5: create the directory layout with strict modes.
+mkdir -p "$CONFIG_DIR"
+mkdir -p "$SECRETS_DIR"
+mkdir -p "$STORE_DIR"
+chmod 0750 "$CONFIG_DIR"
+chmod 0700 "$SECRETS_DIR"
+chmod 0700 "$STORE_DIR"
+
+# Step 6: write the secrets. Existing files are kept unless rotation or a new
+# value was asked for. Never print the values.
+oidc_state="kept"
+if [ -z "$client_secret" ]; then
+  if [ ! -s "$OIDC_SECRET_FILE" ]; then
+    echo "error: The OIDC client secret is not set." >&2
+    echo "error: Set FORGEJO_OIDC_CLIENT_SECRET or run the wizard on a terminal." >&2
+    exit 1
+  fi
+else
+  if [ ! -s "$OIDC_SECRET_FILE" ] || [ "$rotate" = "1" ]; then
+    if [ -s "$OIDC_SECRET_FILE" ]; then
+      oidc_state="rotated"
+    else
+      oidc_state="created"
+    fi
+    write_secret_file "$OIDC_SECRET_FILE" "$client_secret"
+  fi
+fi
+chmod 0600 "$OIDC_SECRET_FILE"
+
+secret_key_state="kept"
+if [ ! -s "$FORGEJO_SECRET_FILE" ] || [ "$rotate" = "1" ]; then
+  if [ -s "$FORGEJO_SECRET_FILE" ]; then
+    secret_key_state="rotated"
+  else
+    secret_key_state="created"
+  fi
+  forgejo_secret="$(openssl rand -hex 32)"
+  write_secret_file "$FORGEJO_SECRET_FILE" "$forgejo_secret"
+fi
+chmod 0600 "$FORGEJO_SECRET_FILE"
+
+token_state="anonymous"
+if [ "$use_local_consul" -eq 0 ]; then
+  if [ -n "$consul_token" ]; then
+    (
+      umask 077
+      printf '%s\n' "$consul_token" >"$CONSUL_TOKEN_FILE"
+    )
+    chmod 0600 "$CONSUL_TOKEN_FILE"
+    token_state="written"
+  elif [ -f "$CONSUL_TOKEN_FILE" ]; then
+    chmod 0600 "$CONSUL_TOKEN_FILE"
+    token_state="kept"
+  fi
+fi
+
+# Step 7: write the consul-template configuration. The token flows as a file.
+# For local consul the LiteFS token is created by the entrypoint at boot.
+if [ "$use_local_consul" -eq 1 ]; then
+  consul_address="http://consul:8500"
+  token_file="/etc/forgejo/secrets/litefs-token"
+else
+  consul_address="http://$consul_host:$consul_port"
+  token_file=""
+  if [ "$token_state" = "written" ] || [ "$token_state" = "kept" ]; then
+    token_file="/etc/forgejo/secrets/consul-token"
+  fi
+fi
+{
+  printf '# Generated by state/forgejo/setup.sh. Do not edit.\n'
+  printf '# Run the wizard again to regenerate this file.\n'
+  printf 'consul {\n'
+  printf '  address = "%s"\n' "$consul_address"
+  if [ -n "$token_file" ]; then
+    printf '  token_file = "%s"\n' "$token_file"
+  fi
+  printf '}\n'
+  printf '\n'
+  printf 'template {\n'
+  printf '  source = "/etc/consul-template/templates/app.ini.tpl"\n'
+  printf '  destination = "/run/forgejo/app.ini"\n'
+  printf '  backup = false\n'
+  printf '  perms = "0640"\n'
+  printf '  command = "/usr/local/bin/entrypoint.sh --render-fixed"\n'
+  printf '  command_timeout = "10s"\n'
+  printf '}\n'
+  printf '\n'
+  printf 'template {\n'
+  printf '  source = "/etc/consul-template/templates/post-receive.tpl"\n'
+  printf '  destination = "/run/forgejo/post-receive"\n'
+  printf '  backup = false\n'
+  printf '  perms = "0755"\n'
+  printf '  command = "/usr/local/bin/entrypoint.sh --install-hooks"\n'
+  printf '  command_timeout = "30s"\n'
+  printf '}\n'
+} >"$CT_FILE"
+chmod 0640 "$CT_FILE"
+
+# Step 8: write the answer file. Keep lines this wizard does not own.
+tmp_env="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
+if [ -f "$ENV_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    key="${line%%=*}"
+    case "$line" in
+    '' | \#*) printf '%s\n' "$line" >>"$tmp_env" ;;
+    *)
+      if is_managed_key "$key"; then
+        continue
+      fi
+      printf '%s\n' "$line" >>"$tmp_env"
+      ;;
+    esac
+  done <"$ENV_FILE"
+fi
+{
+  printf '# Generated by state/forgejo/setup.sh.\n'
+  printf '# Do not commit this file. Secrets stay in 0600 files under secrets/.\n'
+  printf 'FORGEJO_APP_NAME=%s\n' "$app_name"
+  printf 'FORGEJO_OIDC_ISSUER_URL=%s\n' "$issuer_url"
+  printf 'FORGEJO_OIDC_CLIENT_ID=%s\n' "$client_id"
+  printf 'FORGEJO_OIDC_PROVIDER_NAME=%s\n' "$provider_name"
+  printf 'FORGEJO_OIDC_AUTO_REGISTER=%s\n' "$auto_register"
+  printf 'FORGEJO_PEER_GIT_PORT=%s\n' "$peer_git_port"
+  printf 'FORGEJO_OIDC_CLIENT_SECRET_FILE=/etc/forgejo/secrets/oidc-client-secret\n'
+  printf 'FORGEJO_SECRET_KEY_FILE=/etc/forgejo/secrets/secret-key\n'
+} >>"$tmp_env"
+chmod 0640 "$tmp_env"
+mv "$tmp_env" "$ENV_FILE"
+
+# Step 9: print the summary. Never print secret values.
+echo "Configured the forgejo wizard files:"
+echo "  $CT_FILE"
+echo "  $ENV_FILE"
+echo "  $OIDC_SECRET_FILE (OIDC secret $oidc_state)"
+echo "  $FORGEJO_SECRET_FILE (Forgejo secret key $secret_key_state)"
+case "$token_state" in
+written) echo "  $CONSUL_TOKEN_FILE (written)" ;;
+kept) echo "  $CONSUL_TOKEN_FILE (kept)" ;;
+esac
+echo "OIDC issuer: $issuer_url"
+echo "OIDC client ID: $client_id"
+echo "OIDC provider name: $provider_name"
+echo "Peer git port: $peer_git_port"
+echo "Base domain: $stack_domain"
+if [ "$use_local_consul" -eq 1 ] && [ -f "$CONSUL_TOKEN_FILE" ]; then
+  echo "warning: $CONSUL_TOKEN_FILE exists but the new configuration does not use it." >&2
+fi
+echo "hint: LiteFS elects a primary through a consul lease (key forgejo/litefs)."
+echo "hint: consul-template renders app.ini and the post-receive hook inside the container."
+echo "hint: the git hook launcher is installed in every repository by the entrypoint."
+echo "Next step: docker compose up -d forgejo"

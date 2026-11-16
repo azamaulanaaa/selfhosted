@@ -1,0 +1,50 @@
+services:
+  # LLDAP, wrapped with LiteFS. LiteFS replicates the SQLite database between
+  # nodes through consul. A single node is the LiteFS primary. Only the primary
+  # can write the database. Consul ACLs protect the litefs lease (key
+  # "lldap/litefs"). The token is created by the entrypoint at boot.
+  # The LDAP port is intentionally not published. The HTTP UI goes through
+  # caddy at lldap.<STACK_DOMAIN>. A single host serves a 200 at the UI root.
+  # Note: LLDAP needs a writable SQLite database. A litefs replica is
+  # read-only, therefore LLDAP does not run on replicas.
+  lldap:
+    image: lldap-litefs:local
+    build:
+      context: ./state/lldap
+    # The image is built locally. Never pull it from a registry.
+    container_name: lldap
+    volumes:
+      # LLDAP configuration and secrets. Rendered by setup.sh. Read-only.
+      - ./config/lldap/lldap_config.toml:/etc/lldap/lldap_config.toml:ro
+      - ./config/lldap/secrets:/etc/lldap/secrets:ro
+      # LiteFS internal data (LTX files). Back this up.
+      - ./data/lldap/store:/var/lib/litefs:rw
+    environment:
+      - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
+      - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
+      - CONSUL_HTTP_ADDR=${CONSUL_HTTP_ADDR:-http://consul:8500}
+      - LLDAP_HTTP_URL=http://lldap.${STACK_DOMAIN:-sh.lan}
+      # The wizard writes these files. LLDAP reads the file contents.
+      - LLDAP_JWT_SECRET_FILE=/etc/lldap/secrets/jwt_secret
+      - LLDAP_KEY_SEED_FILE=/etc/lldap/secrets/key_seed
+      - LLDAP_LDAP_USER_PASS_FILE=/etc/lldap/secrets/ldap_user_pass
+    ports:
+      # HTTP UI and API. Trusted LAN only. Goes through caddy.
+      - '0.0.0.0:17170:17170/tcp'
+      # LDAP 3890 is not published. Publishing it is deferred.
+    restart: unless-stopped
+    healthcheck:
+      # Unauthenticated endpoint. The login page returns 200.
+      test: [ "CMD", "curl", "-fsS", "http://127.0.0.1:17170/" ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 40s
+    # LiteFS mounts a FUSE filesystem through /dev/fuse. cap_add SYS_ADMIN
+    # allows FUSE mounts. devices exposes /dev/fuse. No blanket privileges.
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    # Built locally. Never pull it from a registry.
+    pull_policy: build

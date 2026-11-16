@@ -1,0 +1,12 @@
+name: consul-compose
+# Stack assembler. See docs/layout.md. Each service owns compose/<service>.yaml.
+include:
+  - path: compose/consul.yaml
+    project_directory: .
+    env_file: .env
+  - path: compose/caddy.yaml
+    project_directory: .
+    env_file: .env
+  - path: compose/lldap.yaml
+    project_directory: .
+    env_file: .env

@@ -1,0 +1,48 @@
+services:
+  # Tinyauth, wrapped with LiteFS. LiteFS replicates the SQLite database and
+  # the OIDC keys between nodes through consul. A single node is the LiteFS
+  # primary. Only the primary can write the database. Consul ACLs protect the
+  # litefs lease (key "tinyauth/litefs"). The entrypoint creates the token.
+  # No ports are published. Caddy proxies tinyauth:3000 on the shared network
+  # at tinyauth.<STACK_DOMAIN>. The LDAP port is not published either.
+  tinyauth:
+    image: tinyauth-litefs:local
+    build:
+      context: ./state/tinyauth
+    # The image is built locally. Never pull it from a registry.
+    container_name: tinyauth
+    volumes:
+      # The wizard-written answer file. compose reads it through env_file below.
+      # The read-only mount also makes the file visible inside the container.
+      - ./config/tinyauth/tinyauth.env:/etc/tinyauth/tinyauth.env:ro
+      # LiteFS token. Created by the entrypoint at boot, then reused.
+      # The directory needs write access so the entrypoint can store the token.
+      - ./config/tinyauth/secrets:/etc/tinyauth/secrets:rw
+      # Consul agent secrets, read by the entrypoint to bootstrap the litefs
+      # token when it does not exist yet. Read-only. Missing when consul is remote.
+      - ./config/consul/secrets/agent.hcl:/config/consul/agent.hcl:ro
+      # LiteFS internal data (LTX files). Back this up.
+      - ./data/tinyauth/store:/var/lib/litefs:rw
+    environment:
+      - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
+      - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
+      - CONSUL_HTTP_ADDR=${CONSUL_HTTP_ADDR:-http://consul:8500}
+    env_file:
+      # Wizard-generated. Holds TINYAUTH_* keys and *_FILE paths only.
+      - ./config/tinyauth/tinyauth.env
+    restart: unless-stopped
+    healthcheck:
+      # Unauthenticated endpoint. Busybox wget is in the base image.
+      test: [ "CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/healthz" ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 40s
+    # LiteFS mounts a FUSE filesystem through /dev/fuse. cap_add SYS_ADMIN
+    # allows FUSE mounts. devices exposes /dev/fuse. No blanket privileges.
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    # Built locally. Never pull it from a registry.
+    pull_policy: build

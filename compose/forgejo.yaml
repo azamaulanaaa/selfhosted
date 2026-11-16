@@ -1,0 +1,59 @@
+services:
+  # Forgejo, wrapped with LiteFS. LiteFS replicates the SQLite database between
+  # nodes through consul. A single node is the LiteFS primary. Only the primary
+  # can write the database. Consul ACLs protect the litefs lease (key
+  # "forgejo/litefs"). The entrypoint creates the token at boot.
+  # Git repositories live under the same LiteFS mount. A reactive git
+  # post-receive hook pushes each repository to the other peers.
+  # No ports are published. Caddy proxies forgejo:3000 on the shared network
+  # at forgejo.<STACK_DOMAIN> on a caddy branch.
+  forgejo:
+    image: forgejo-litefs:local
+    build:
+      context: ./state/forgejo
+    # The image is built locally. Never pull it from a registry.
+    container_name: forgejo
+    depends_on:
+      consul:
+        condition: service_healthy
+    volumes:
+      # Consul-template templates. Read-only. Rendered output is never committed.
+      - ./state/forgejo/app.ini.tpl:/etc/consul-template/templates/app.ini.tpl:ro
+      - ./state/forgejo/post-receive.tpl:/etc/consul-template/templates/post-receive.tpl:ro
+      # Wizard-written consul-template configuration. Read-only.
+      - ./config/forgejo/consul-template.hcl:/etc/consul-template/config.hcl:ro
+      # Wizard-written answer file. env_file loads it into the container.
+      # The read-only mount also makes the file visible inside the container.
+      - ./config/forgejo/forgejo.env:/etc/forgejo/forgejo.env:ro
+      # LiteFS token and OIDC secrets. The entrypoint writes the token at boot,
+      # then reuses it. The directory needs write access.
+      - ./config/forgejo/secrets:/etc/forgejo/secrets:rw
+      # Consul agent secrets. Read by the entrypoint to bootstrap the litefs
+      # token when it does not exist yet. Missing when consul is remote.
+      - ./config/consul/secrets/agent.hcl:/config/consul/agent.hcl:ro
+      # LiteFS internal data (LTX files). Back this up. The FUSE mount holds
+      # the SQLite database and the git repositories.
+      - ./data/forgejo/store:/var/lib/litefs:rw
+    environment:
+      - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
+      - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
+      - CONSUL_HTTP_ADDR=${CONSUL_HTTP_ADDR:-http://consul:8500}
+    env_file:
+      # Wizard-generated. Holds FORGEJO_* answers and *_FILE paths only.
+      - ./config/forgejo/forgejo.env
+    restart: unless-stopped
+    healthcheck:
+      # Unauthenticated endpoint. curl is in the base image.
+      test: [ "CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/healthz" ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 40s
+    # LiteFS mounts a FUSE filesystem through /dev/fuse. cap_add SYS_ADMIN
+    # allows FUSE mounts. devices exposes /dev/fuse. No blanket privileges.
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    # Built locally. Never pull it from a registry.
+    pull_policy: build

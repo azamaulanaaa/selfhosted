@@ -26,7 +26,9 @@ A per-application directory set has this form:
 
 ```text
 ./
-├── compose.yaml            # stack definition (repo root)
+├── compose.yaml    # Stack assembler (include of compose/<service>.yaml)
+├── compose/
+│   └── <service>.yaml  # service definition
 ├── setup.sh                # service dispatcher
 ├── config/
 │   └── <app>/
@@ -151,6 +153,21 @@ Each service wizard supports `clean`.
   files. A service that was part of a cluster may need its own admin
   commands to leave the cluster cleanly.
 
+## Compose files
+
+The root `compose.yaml` is an assembler. It contains no service
+definitions. It includes one file per service from
+`compose/<service>.yaml` with the long syntax for `include`. Every
+include sets `project_directory: .` so service paths resolve against
+the repository layout. Every include reads the root `.env` file. The
+stack requires the `.env` file. `setup.sh` creates it when it is
+missing.
+
+Each service fragment owns its own service definition. A service branch
+contains its fragment and its `state/<service>/` tree. Fragments do not
+reference each other. All cross-service references work through the
+shared Docker network.
+
 ## Out of scope
 
 This contract covers placement only.
@@ -159,9 +176,6 @@ This contract covers placement only.
 - Restore procedure: separate document.
 - CI smoke tests for rendering: separate document.
 - The template renderer choice: not decided by this contract.
-- The compose file layout (single root `compose.yaml` against
-  per-application files): not decided by this contract. The tree
-  above shows a root `compose.yaml` as the current form.
 
 ## Not decided
 

@@ -18,9 +18,6 @@ services:
       # LiteFS token. Created by the entrypoint at boot, then reused.
       # The directory needs write access so the entrypoint can store the token.
       - ./config/tinyauth/secrets:/etc/tinyauth/secrets:rw
-      # Consul agent secrets, read by the entrypoint to bootstrap the litefs
-      # token when it does not exist yet. Read-only. Missing when consul is remote.
-      - ./config/consul/secrets/agent.hcl:/config/consul/agent.hcl:ro
       # LiteFS internal data (LTX files). Back this up.
       - ./data/tinyauth/store:/var/lib/litefs:rw
     environment:

@@ -22,6 +22,8 @@
 #                           password, the API, or docker is not available.
 #   TINYAUTH_LDAP_BINDDN    Observer bind DN for manual mode.
 #   TINYAUTH_LDAP_BINDPASSWORD  Observer bind password for manual mode.
+#   TINYAUTH_CONSUL_MANAGEMENT  Consul management token to copy into this service's
+#                               secrets tree. Default: read from the local consul config.
 #   LLDAP_HTTP_URL          LLDAP HTTP base URL for the GraphQL API.
 #                           Default: http://localhost:17170.
 #   LLDAP_ADMIN_USER        LLDAP admin username for auto-create. Default: admin.
@@ -41,6 +43,8 @@ readonly OIDC_SECRETS_DIR="config/tinyauth/secrets/oidc"
 readonly ENV_FILE="config/tinyauth/tinyauth.env"
 readonly LDAP_SECRET_FILE="config/tinyauth/secrets/ldap-observer"
 readonly LLDAP_CONFIG_FILE="config/lldap/lldap_config.toml"
+readonly CONSUL_AGENT_HCL_HOST="config/consul/secrets/agent.hcl"
+readonly CONSUL_MANAGEMENT_FILE="config/tinyauth/secrets/consul-management-token"
 
 readonly DEFAULT_LDAP_ADDRESS="ldap://lldap:3890"
 readonly DEFAULT_BASE_DN="dc=home,dc=lan"
@@ -129,6 +133,14 @@ stack_domain_invalid() {
     ;;
   esac
   exit 1
+}
+
+# Read the Consul initial management token from the local consul config.
+# Print nothing when the file or the key is missing.
+read_consul_management() {
+  [ -r "$CONSUL_AGENT_HCL_HOST" ] || return 0
+  { grep -E '^[[:space:]]*initial_management[[:space:]]*=' "$CONSUL_AGENT_HCL_HOST" || true; } |
+    head -n1 | cut -d'"' -f2
 }
 
 # Print the value of one key from the local LLDAP config file.
@@ -518,6 +530,24 @@ fi
 
 mkdir -p "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
 chmod 0700 "$CONFIG_DIR" "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
+
+# Keep a dedicated copy of the Consul management token in this service's
+# secrets tree. The entrypoint uses it to bootstrap the litefs token.
+# A re-run keeps an existing file.
+if [ ! -s "$CONSUL_MANAGEMENT_FILE" ]; then
+  consul_management="$(read_consul_management)"
+  if [ -n "${TINYAUTH_CONSUL_MANAGEMENT:-}" ]; then
+    consul_management="$TINYAUTH_CONSUL_MANAGEMENT"
+  fi
+  if [ -n "$consul_management" ]; then
+    write_secret_file "$CONSUL_MANAGEMENT_FILE" "$consul_management"
+    echo "Copied the consul management token to $CONSUL_MANAGEMENT_FILE."
+  else
+    echo "warning: the consul management token is missing." >&2
+    echo "hint: write a management token to $CONSUL_MANAGEMENT_FILE," >&2
+    echo "hint: or write a prepared litefs token to config/tinyauth/secrets/litefs-token." >&2
+  fi
+fi
 
 observer_dn=""
 observer_password=""

@@ -12,7 +12,7 @@ set -eu
 # These variables point at the runtime paths. The defaults match the image.
 # The tests override them with a scratch tree.
 TINYAUTH_SECRETS_DIR="${TINYAUTH_SECRETS_DIR:-/etc/tinyauth/secrets}"
-CONSUL_AGENT_HCL="${CONSUL_AGENT_HCL:-/config/consul/agent.hcl}"
+CONSUL_MANAGEMENT_FILE="${CONSUL_MANAGEMENT_FILE:-${TINYAUTH_SECRETS_DIR}/consul-management-token}"
 LITEFS_YML="${LITEFS_YML:-/run/litefs.yml}"
 LITEFS_MOUNT_DIR="${LITEFS_MOUNT_DIR:-/data}"
 LITEFS_DATA_DIR="${LITEFS_DATA_DIR:-/var/lib/litefs}"
@@ -22,7 +22,7 @@ PUBLIC_IP="${PUBLIC_IP:-}"
 CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-http://consul:8500}"
 STACK_DOMAIN="${STACK_DOMAIN:-sh.lan}"
 
-readonly TINYAUTH_SECRETS_DIR CONSUL_AGENT_HCL LITEFS_YML
+readonly TINYAUTH_SECRETS_DIR CONSUL_MANAGEMENT_FILE LITEFS_YML
 readonly LITEFS_MOUNT_DIR LITEFS_DATA_DIR PUBLIC_IP CONSUL_HTTP_ADDR STACK_DOMAIN
 
 readonly TOKEN_FILE="${TINYAUTH_SECRETS_DIR}/litefs-token"
@@ -52,14 +52,13 @@ err() { echo "tinyauth-litefs: error: $1" >&2; }
 export TINYAUTH_APPURL TINYAUTH_DATABASE_PATH
 export TINYAUTH_OIDC_PRIVATEKEYPATH TINYAUTH_OIDC_PUBLICKEYPATH
 
-# Read the initial management token from the Consul agent configuration.
-# Print the token on stdout. Return 1 when the file or the key is missing.
-read_initial_management() {
-  if [ ! -r "$CONSUL_AGENT_HCL" ]; then
+# Read the Consul management token from this service's secrets tree.
+# Print the token on stdout. Return 1 when the file is missing.
+read_consul_management() {
+  if [ ! -r "$CONSUL_MANAGEMENT_FILE" ]; then
     return 1
   fi
-  { grep -E '^[[:space:]]*initial_management[[:space:]]*=' "$CONSUL_AGENT_HCL" || true; } |
-    head -n1 | cut -d'"' -f2
+  cat "$CONSUL_MANAGEMENT_FILE"
 }
 
 # Print the value of one string field from a flat JSON response.
@@ -87,21 +86,19 @@ is_token_chars() {
 # The function prints the token on stdout.
 # Return 1 with a message on stderr when any step fails.
 create_litefs_token() {
-  mgmt_token="$(read_initial_management)" || {
-    err "consul secrets not found at $CONSUL_AGENT_HCL."
-    err "Run the consul wizard first: bash setup.sh consul"
-    err "Then start consul: docker compose up -d consul"
-    err "For a remote consul, create a token with write access to the key"
-    err "\"tinyauth/litefs\" and to the session \"litefs\", then place it at"
-    err "config/tinyauth/secrets/litefs-token."
+  mgmt_token="$(read_consul_management)" || {
+    err "the consul management token at $CONSUL_MANAGEMENT_FILE is missing."
+    err "Run the tinyauth wizard: bash setup.sh tinyauth"
+    err "For a remote consul, write a management token to $CONSUL_MANAGEMENT_FILE."
+    err "You may write a prepared litefs token to ${TINYAUTH_SECRETS_DIR}/litefs-token."
     return 1
   }
   if [ -z "$mgmt_token" ]; then
-    err "the initial_management key is missing or empty in $CONSUL_AGENT_HCL."
+    err "the consul management token at $CONSUL_MANAGEMENT_FILE is empty."
     return 1
   fi
   if ! is_token_chars "$mgmt_token"; then
-    err "the initial_management value in $CONSUL_AGENT_HCL has unexpected characters."
+    err "the consul management token at $CONSUL_MANAGEMENT_FILE has unexpected characters."
     return 1
   fi
 

@@ -1,4 +1,4 @@
-name: consul-compose
+name: services
 # Stack assembler. See docs/layout.md. Each service owns compose/<service>.yaml.
 include:
   - path: compose/consul.yaml

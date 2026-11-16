@@ -12,10 +12,13 @@ if ! command -v cog >/dev/null 2>&1; then
   exit 1
 fi
 
-# Git and libgit2 reject a repository that another user owns. Trust this checkout.
-git config --global --add safe.directory "${GITHUB_WORKSPACE:-$PWD}"
+# Git needs access to the repository before it trusts this checkout.
+# The -c option lets git find the root even when it distrusts the owner.
+repo_root="$(git -c safe.directory='*' rev-parse --show-toplevel)"
+cd "$repo_root"
 
-cd "$(git rev-parse --show-toplevel)"
+# Git and libgit2 reject a repository that another user owns. Trust the root.
+git config --global --add safe.directory "$repo_root"
 
 # Check from the latest tag. Check all commits when the repository has no tag.
 if [[ -n "$(git tag --list)" ]]; then

@@ -245,7 +245,11 @@ else
   log "stored the litefs token at $TOKEN_FILE"
 fi
 
+# Create the backed-up store and set its mode here at runtime.
+# The wizard never writes data/. Root owns the directory because litefs writes
+# its LTX files as root before gosu drops privileges for the app.
 mkdir -p "$LITEFS_DATA_DIR"
+chmod 0700 "$LITEFS_DATA_DIR"
 mkdir -p "$LITEFS_MOUNT_DIR"
 
 # Generate the LiteFS configuration. Values come from the container

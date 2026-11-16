@@ -38,7 +38,6 @@ readonly REPO_ROOT
 readonly CONFIG_DIR="config/tinyauth"
 readonly SECRETS_DIR="config/tinyauth/secrets"
 readonly OIDC_SECRETS_DIR="config/tinyauth/secrets/oidc"
-readonly STORE_DIR="data/tinyauth/store"
 readonly ENV_FILE="config/tinyauth/tinyauth.env"
 readonly LDAP_SECRET_FILE="config/tinyauth/secrets/ldap-observer"
 readonly LLDAP_CONFIG_FILE="config/lldap/lldap_config.toml"
@@ -517,8 +516,8 @@ else
   esac
 fi
 
-mkdir -p "$SECRETS_DIR" "$OIDC_SECRETS_DIR" "$STORE_DIR"
-chmod 0700 "$CONFIG_DIR" "$SECRETS_DIR" "$OIDC_SECRETS_DIR" "$STORE_DIR"
+mkdir -p "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
+chmod 0700 "$CONFIG_DIR" "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
 
 observer_dn=""
 observer_password=""

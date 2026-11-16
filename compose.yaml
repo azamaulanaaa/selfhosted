@@ -10,3 +10,6 @@ include:
   - path: compose/lldap.yaml
     project_directory: .
     env_file: .env
+  - path: compose/tinyauth.yaml
+    project_directory: .
+    env_file: .env

@@ -2,6 +2,7 @@
 # Ask which services to enable, ask for the shared PUBLIC_IP, and run the
 # wizard of each enabled service.
 # The per-service wizards live in state/<service>/setup.sh.
+# The stack assembles compose services with include. compose requires .env; this script creates it when it is missing.
 # Safe to run again: the per-service wizards are idempotent. This script
 # rewrites the PUBLIC_IP line in the root .env and keeps the other lines.
 # It never prints secret values. It prints paths only.
@@ -195,6 +196,9 @@ if [ "${#services[@]}" -eq 0 ]; then
   echo "No services found in state/."
   exit 1
 fi
+
+# Create the root .env when it is missing. compose requires it.
+if [ ! -e .env ]; then : >.env && chmod 0640 .env; fi
 
 # Step 2: select the services to enable.
 enabled=()

@@ -13,10 +13,8 @@ services:
     # The image is built locally. Never pull it from a registry.
     container_name: tinyauth
     volumes:
-      # The wizard-written answer file. compose reads it through env_file below.
-      # The read-only mount also makes the file visible inside the container.
-      - ./config/tinyauth/tinyauth.env:/etc/tinyauth/tinyauth.env:ro
-      # LiteFS token. Created by the entrypoint at boot, then reused.
+      # LiteFS and Consul tokens. The entrypoint creates the LiteFS token at
+      # boot and reuses it. The wizard writes the Consul management token.
       # The directory needs write access so the entrypoint can store the token.
       - ./config/tinyauth/secrets:/etc/tinyauth/secrets:rw
       # LiteFS internal data (LTX files). Back this up.

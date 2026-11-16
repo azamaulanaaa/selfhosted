@@ -3,8 +3,9 @@ services:
   # the OIDC keys between nodes through consul. A single node is the LiteFS
   # primary. Only the primary can write the database. Consul ACLs protect the
   # litefs lease (key "tinyauth/litefs"). The entrypoint creates the token.
-  # No ports are published. Caddy proxies tinyauth:3000 on the shared network
-  # at tinyauth.<STACK_DOMAIN>. The LDAP port is not published either.
+  # Caddy proxies tinyauth:3000 on the shared network at
+  # tinyauth.<STACK_DOMAIN>. Port 20202 is published for LiteFS peers.
+  # The LDAP port is not published either.
   tinyauth:
     image: tinyauth-litefs:local
     build:
@@ -27,6 +28,12 @@ services:
     env_file:
       # Wizard-generated. Holds TINYAUTH_* keys and *_FILE paths only.
       - ./config/tinyauth/tinyauth.env
+    ports:
+      # LiteFS peer API. Peers reach the advertised URL on this interface.
+      - target: 20202
+        published: 20202
+        host_ip: "${PUBLIC_IP}"
+        protocol: tcp
     restart: unless-stopped
     healthcheck:
       # Unauthenticated endpoint. Busybox wget is in the base image.

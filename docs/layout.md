@@ -61,7 +61,9 @@ A per-application directory set has this form:
 
 ### `state/` — committed desired state
 
-- `state/` is the only committed tree for per-application files.
+- `state/` is the committed tree for per-application state, examples,
+  and wizards. A service branch commits its fragment to
+  `compose/<service>.yaml`.
 - No secrets in `state/`, ever.
 - Changes to `state/` come only from commits. They are reviewed.
 - Hand-maintained advanced configuration (for example `Caddyfile`)

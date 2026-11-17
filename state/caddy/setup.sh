@@ -3,10 +3,12 @@
 # Safe to run again: it rewrites consul-template.hcl. It never prints secret
 # values. It prints paths only.
 #
-# One container serves consul.<STACK_DOMAIN>: the caddy image (built locally
-# from state/caddy/Dockerfile) embeds consul-template. consul-template renders
-# /etc/caddy/Caddyfile from state/caddy/Caddyfile.tpl, and caddy reloads itself
-# on change (caddy run --watch). There is no sidecar service.
+# One container serves consul.<STACK_DOMAIN> and lldap.<STACK_DOMAIN> over HTTPS: the
+# caddy image (built locally from state/caddy/Dockerfile) embeds
+# consul-template. consul-template renders /etc/caddy/Caddyfile from
+# state/caddy/Caddyfile.tpl, and caddy reloads itself on change (caddy run
+# --watch). There is no sidecar service.
+# TLS mode is asked on every run. There is no default.
 #
 # The root dispatcher (setup.sh) calls this script. It can also run standalone.
 #
@@ -28,6 +30,20 @@
 #                           written to config/caddy/secrets/consul-token.
 #                           When empty, an existing token file is kept; when the file
 #                           does not exist, an anonymous token is used.
+#   CADDY_TLS_MODE          TLS mode: internal, letsencrypt, or existing.
+#                           There is no default. Non-interactive runs must set it.
+#   CADDY_TLS_EMAIL         ACME contact email. Required when CADDY_TLS_MODE=letsencrypt.
+#   CADDY_TLS_CERTS         For CADDY_TLS_MODE=existing. One of:
+#                             wildcard                          keep the existing
+#                                                              wildcard pair in
+#                                                              config/caddy/certs/wildcard
+#                             wildcard:<fullchain>:<key>          copy that pair into
+#                                                              config/caddy/certs/wildcard
+#                             consul:<fullchain>:<key>,lldap:<fullchain>:<key>
+#                                                              copy per-vhost pairs into
+#                                                              config/caddy/certs/<vhost>
+#                           When unset, the existing certs under config/caddy/certs are
+#                           kept; when nothing is present, the run fails.
 #
 # The rendered vhost label is computed at render time by consul-template.
 # STACK_DOMAIN is not a secret; compose passes it to the caddy container as an
@@ -101,17 +117,29 @@ is_valid_domain() {
   [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]
 }
 
-# Write the root .env with the shared STACK_DOMAIN. Keep the other lines.
-# Preserve every line except the STACK_DOMAIN=... lines.
+# Write the root .env with the shared STACK_DOMAIN and the TLS answers. Keep the other lines.
+# Preserve every line except the managed keys (STACK_DOMAIN, CADDY_TLS_MODE,
+# CADDY_TLS_EMAIL, CADDY_TLS_CERT_LAYOUT). Stale keys from a previous run are
+# removed when they do not apply to the new mode.
 # chmod 0640 the file. Never print the contents beyond paths.
 write_env_file() {
   local stack_domain="$1"
+  local tls_mode="$2"
+  local tls_email="$3"
+  local tls_cert_layout="$4"
   local tmp_env
   tmp_env="$(mktemp ./.env.tmp.XXXXXX)"
   if [ -f .env ]; then
-    { grep -E -v '^STACK_DOMAIN=' .env || true; } >"$tmp_env"
+    { grep -E -v '^(STACK_DOMAIN|CADDY_TLS_MODE|CADDY_TLS_EMAIL|CADDY_TLS_CERT_LAYOUT)=' .env || true; } >"$tmp_env"
   fi
   printf 'STACK_DOMAIN=%s\n' "$stack_domain" >>"$tmp_env"
+  printf 'CADDY_TLS_MODE=%s\n' "$tls_mode" >>"$tmp_env"
+  if [ "$tls_mode" = "letsencrypt" ]; then
+    printf 'CADDY_TLS_EMAIL=%s\n' "$tls_email" >>"$tmp_env"
+  fi
+  if [ "$tls_mode" = "existing" ]; then
+    printf 'CADDY_TLS_CERT_LAYOUT=%s\n' "$tls_cert_layout" >>"$tmp_env"
+  fi
   chmod 0640 "$tmp_env"
   mv "$tmp_env" .env
 }
@@ -125,6 +153,37 @@ is_valid_consul_host() {
 # Return 0 when the argument is a valid TCP port. 1 to 65535.
 is_valid_port() {
   [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# Return 0 when the argument is a valid email address. user@host.tld shape.
+is_valid_email() {
+  [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
+}
+
+# Copy one certificate file into the destination with the given mode.
+# A source that is already in place keeps its contents and only gets the mode.
+# Never prints the contents. Prints paths only.
+install_cert_copy() {
+  local src="$1" dst="$2" mode="$3"
+  mkdir -p "$(dirname -- "$dst")"
+  if command -v realpath >/dev/null 2>&1; then
+    local src_real dst_real
+    src_real="$(realpath -e -- "$src")" || {
+      echo "error: Cannot resolve '$src'." >&2
+      exit 1
+    }
+    if [ -f "$dst" ]; then
+      dst_real="$(realpath -e -- "$dst")" || dst_real="$dst"
+      if [ "$src_real" = "$dst_real" ]; then
+        chmod "$mode" "$dst"
+        echo "kept: $dst"
+        return 0
+      fi
+    fi
+  fi
+  cp -- "$src" "$dst"
+  chmod "$mode" "$dst"
+  echo "wrote: $dst"
 }
 
 usage_clean() {
@@ -163,6 +222,7 @@ resolve_removal_target() {
 clean_service() {
   local with_data=0
   local assume_yes=0
+  local certs_removed=""
   local flag
   for flag in "$@"; do
     case "$flag" in
@@ -248,11 +308,19 @@ clean_service() {
   local removed_path
   for removed_path in "${remove_paths[@]}"; do
     echo "removed: $removed_path"
+    case "$removed_path" in
+    */certs/*)
+      certs_removed=1
+      ;;
+    esac
   done
 
   echo "Removed the caddy configuration."
   if [ "$with_data" -eq 1 ]; then
     echo "Removed the caddy data."
+  fi
+  if [ -n "$certs_removed" ]; then
+    echo "hint: TLS certificate files under config/caddy/certs were removed with it."
   fi
   echo "Run 'bash setup.sh caddy' (or setup.sh) to generate the caddy files again."
   echo "hint: .env is never removed. STACK_DOMAIN and PUBLIC_IP stay."
@@ -365,17 +433,203 @@ else
   esac
 fi
 
+# Step 1b: collect the TLS answers. The mode is always asked. There is no default.
+# Collect everything, then create the files. Invalid answers exit before any writes.
+tls_mode=""
+if [ -t 0 ]; then
+  if ! read -r -p "TLS mode (internal, letsencrypt, existing)? " tls_answer; then
+    tls_answer=""
+  fi
+  tls_mode="$(printf '%s' "$tls_answer" | tr '[:upper:]' '[:lower:]')"
+  case "$tls_mode" in
+  internal | letsencrypt | existing) ;;
+  *)
+    echo "error: '$tls_answer' is not a valid TLS mode. Use internal, letsencrypt, or existing." >&2
+    exit 1
+    ;;
+  esac
+else
+  tls_mode="$(printf '%s' "${CADDY_TLS_MODE:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$tls_mode" in
+  internal | letsencrypt | existing) ;;
+  *)
+    echo "error: CADDY_TLS_MODE must be internal, letsencrypt, or existing. Non-interactive runs must set CADDY_TLS_MODE." >&2
+    exit 1
+    ;;
+  esac
+fi
+
+# The caddy stack serves these vhosts today. Update this list when a vhost is added.
+readonly TLS_VHOSTS="consul lldap"
+
+tls_email=""
+if [ "$tls_mode" = "letsencrypt" ]; then
+  if [ -t 0 ]; then
+    if ! read -r -p "ACME contact email? " email_answer; then
+      email_answer=""
+    fi
+    tls_email="$email_answer"
+  else
+    tls_email="${CADDY_TLS_EMAIL:-}"
+  fi
+  if ! is_valid_email "$tls_email"; then
+    echo "error: '$tls_email' is not a valid email address. Use the form user@host.tld." >&2
+    exit 1
+  fi
+fi
+
+tls_cert_layout="per-vhost"
+# Pending certificate copies: entries of the form "vhost|src_fullchain|src_key".
+# The wildcard target uses the pseudo-vhost name "wildcard".
+declare -a cert_copies=()
+if [ "$tls_mode" = "existing" ]; then
+  if [ -t 0 ]; then
+    if ! read -r -p "Use one wildcard certificate for all vhosts? [y/N] " wildcard_answer; then
+      wildcard_answer=""
+    fi
+    case "${wildcard_answer:-N}" in
+    [Yy] | [Yy][Ee][Ss])
+      tls_cert_layout="wildcard"
+      ;;
+    [Nn] | [Nn][Oo] | "")
+      tls_cert_layout="per-vhost"
+      ;;
+    *)
+      echo "error: Answer Y or N." >&2
+      exit 1
+      ;;
+    esac
+    if [ "$tls_cert_layout" = "wildcard" ]; then
+      if ! read -r -p "Wildcard fullchain path? " wildcard_fc; then
+        wildcard_fc=""
+      fi
+      if ! read -r -p "Wildcard private key path? " wildcard_key; then
+        wildcard_key=""
+      fi
+      if [ -z "$wildcard_fc" ] || [ -z "$wildcard_key" ] || [ ! -r "$wildcard_fc" ] || [ ! -r "$wildcard_key" ]; then
+        echo "error: Both wildcard paths must exist and be readable." >&2
+        exit 1
+      fi
+      cert_copies+=("wildcard|$wildcard_fc|$wildcard_key")
+    else
+      for vhost in $TLS_VHOSTS; do
+        if ! read -r -p "Fullchain path for the $vhost vhost? " fc_path; then
+          fc_path=""
+        fi
+        if ! read -r -p "Private key path for the $vhost vhost? " key_path; then
+          key_path=""
+        fi
+        if [ -z "$fc_path" ] || [ -z "$key_path" ] || [ ! -r "$fc_path" ] || [ ! -r "$key_path" ]; then
+          echo "error: Both paths for the $vhost vhost must exist and be readable." >&2
+          exit 1
+        fi
+        cert_copies+=("$vhost|$fc_path|$key_path")
+      done
+    fi
+  else
+    certs_spec="${CADDY_TLS_CERTS:-}"
+    if [ -z "$certs_spec" ]; then
+      if [ -r config/caddy/certs/wildcard/fullchain.pem ] && [ -r config/caddy/certs/wildcard/privkey.pem ]; then
+        tls_cert_layout="wildcard"
+      elif [ -r config/caddy/certs/consul/fullchain.pem ] && [ -r config/caddy/certs/consul/privkey.pem ] && [ -r config/caddy/certs/lldap/fullchain.pem ] && [ -r config/caddy/certs/lldap/privkey.pem ]; then
+        tls_cert_layout="per-vhost"
+      else
+        echo "error: CADDY_TLS_CERTS is required when CADDY_TLS_MODE=existing and no certs are present." >&2
+        echo "error: Use 'wildcard', 'wildcard:<fullchain>:<key>', or 'consul:<fullchain>:<key>,lldap:<fullchain>:<key>'." >&2
+        exit 1
+      fi
+    else
+      case "$certs_spec" in
+      wildcard)
+        if [ ! -r config/caddy/certs/wildcard/fullchain.pem ] || [ ! -r config/caddy/certs/wildcard/privkey.pem ]; then
+          echo "error: CADDY_TLS_CERTS=wildcard requires config/caddy/certs/wildcard/fullchain.pem and privkey.pem to exist." >&2
+          exit 1
+        fi
+        tls_cert_layout="wildcard"
+        ;;
+      wildcard:*)
+        wildcard_rest="${certs_spec#wildcard:}"
+        wildcard_fc="${wildcard_rest%%:*}"
+        wildcard_key="${wildcard_rest##*:}"
+        if [ -z "$wildcard_fc" ] || [ -z "$wildcard_key" ] || [ "$wildcard_fc" = "$wildcard_rest" ] || [ ! -r "$wildcard_fc" ] || [ ! -r "$wildcard_key" ]; then
+          echo "error: CADDY_TLS_CERTS=wildcard:<fullchain>:<key> needs two readable paths." >&2
+          exit 1
+        fi
+        tls_cert_layout="wildcard"
+        cert_copies+=("wildcard|$wildcard_fc|$wildcard_key")
+        ;;
+      consul:* | lldap:* | *:*)
+        tls_cert_layout="per-vhost"
+        seen_consul=0
+        seen_lldap=0
+        old_ifs="$IFS"
+        IFS=','
+        # Split the pairs on commas.
+        read -r -a spec_pairs <<<"$certs_spec"
+        IFS="$old_ifs"
+        for pair in "${spec_pairs[@]}"; do
+          vhost="${pair%%:*}"
+          pair_rest="${pair#*:}"
+          fc_path="${pair_rest%%:*}"
+          key_path="${pair_rest##*:}"
+          case "$vhost" in
+          consul | lldap) ;;
+          *)
+            echo "error: CADDY_TLS_CERTS contains the unknown vhost '$vhost'. Use consul and lldap." >&2
+            exit 1
+            ;;
+          esac
+          if [ -z "$fc_path" ] || [ -z "$key_path" ] || [ "$fc_path" = "$pair_rest" ] || [ ! -r "$fc_path" ] || [ ! -r "$key_path" ]; then
+            echo "error: CADDY_TLS_CERTS entry '$pair' needs two readable paths." >&2
+            exit 1
+          fi
+          cert_copies+=("$vhost|$fc_path|$key_path")
+          case "$vhost" in
+          consul) seen_consul=1 ;;
+          lldap) seen_lldap=1 ;;
+          esac
+        done
+        if [ "$seen_consul" -eq 0 ] || [ "$seen_lldap" -eq 0 ]; then
+          echo "error: CADDY_TLS_CERTS per-vhost needs both consul:<fullchain>:<key> and lldap:<fullchain>:<key>." >&2
+          exit 1
+        fi
+        ;;
+      *)
+        echo "error: CADDY_TLS_CERTS must be 'wildcard', 'wildcard:<fullchain>:<key>', or 'consul:<fullchain>:<key>,lldap:<fullchain>:<key>'." >&2
+        exit 1
+        ;;
+      esac
+    fi
+  fi
+fi
+
 # Step 2: create the directory layout with strict modes.
 mkdir -p config/caddy
 mkdir -p config/caddy/secrets
+mkdir -p config/caddy/certs
 mkdir -p data/caddy/store
 chmod 0750 config/caddy
 chmod 0700 config/caddy/secrets
+chmod 0750 config/caddy/certs
 chmod 0750 data/caddy
 chmod 0750 data/caddy/store
 
-# Step 3: write the root .env with the shared STACK_DOMAIN. Keep the other lines.
-write_env_file "$stack_domain"
+# Step 3: write the root .env with the shared STACK_DOMAIN and the TLS answers.
+# Keep the other lines.
+write_env_file "$stack_domain" "$tls_mode" "$tls_email" "$tls_cert_layout"
+
+# Step 3b: copy the TLS certificates into config/caddy/certs, if any were asked for.
+# The files are copied, not printed. Prints paths only.
+if [ "${#cert_copies[@]}" -gt 0 ]; then
+  for entry in "${cert_copies[@]}"; do
+    vhost="${entry%%|*}"
+    rest="${entry#*|}"
+    src_fc="${rest%%|*}"
+    src_key="${rest##*|}"
+    install_cert_copy "$src_fc" "config/caddy/certs/$vhost/fullchain.pem" 0644
+    install_cert_copy "$src_key" "config/caddy/certs/$vhost/privkey.pem" 0600
+  done
+fi
 
 # Step 4: write the consul-template configuration.
 # The token flows as a file, never inline: consul-template supports token_file.
@@ -433,11 +687,29 @@ kept)
   echo "  config/caddy/secrets/consul-token (kept)"
   ;;
 esac
-echo "caddy vhost: http://consul.$stack_domain -> all consul nodes (:8500)"
-echo "note: HTTP only for now. TLS is intentionally absent for this issue."
-echo "note: .env written with STACK_DOMAIN=$stack_domain"
+echo "caddy vhosts: https://consul.$stack_domain (all consul nodes, :8500), https://lldap.$stack_domain"
+case "$tls_mode" in
+internal)
+  echo "TLS mode: internal. caddy issues certificates from its internal CA."
+  echo "note: import the root CA on each client: data/caddy/store/caddy/pki/authorities/local/root.crt"
+  echo "note: trust this root on each client."
+  ;;
+letsencrypt)
+  echo "TLS mode: letsencrypt. ACME contact: $tls_email."
+  echo "note: requires a public DNS name and ports 80 and 443 reachable. Not usable for .lan."
+  ;;
+existing)
+  if [ "$tls_cert_layout" = "wildcard" ]; then
+    echo "TLS mode: existing (wildcard). Certificates are in config/caddy/certs/wildcard (fullchain.pem, privkey.pem)."
+  else
+    echo "TLS mode: existing (per-vhost). Certificates are in config/caddy/certs/<vhost> (fullchain.pem, privkey.pem)."
+  fi
+  ;;
+esac
+echo "note: .env written with STACK_DOMAIN=$stack_domain and CADDY_TLS_MODE=$tls_mode"
 echo "note: consul-template renders state/caddy/Caddyfile.tpl into /etc/caddy/Caddyfile (inside the caddy container)"
 echo "note: caddy reloads the file itself when it changes (caddy run --watch)"
+echo "note: the caddy service publishes ports 80 and 443."
 if [ "$use_local_consul" -eq 1 ]; then
   echo "note: this repo's consul uses default_policy=deny. To render, create an anonymous read policy, or re-run and answer N with 127.0.0.1 and a token."
   if [ -f config/caddy/secrets/consul-token ]; then

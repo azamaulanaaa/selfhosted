@@ -39,7 +39,9 @@ check_compose_fragment() {
   echo "smoke: checking the compose fragment"
   assert_line "$COMPOSE_FRAGMENT" 'CONSUL_ENABLED=${CONSUL_ENABLED:-0}' 'The compose fragment lacks the Consul flag.'
   assert_line "$COMPOSE_FRAGMENT" 'LITEFS_ENABLED=${LITEFS_ENABLED:-0}' 'The compose fragment lacks the LiteFS flag.'
-  assert_line "$COMPOSE_FRAGMENT" '${PUBLIC_IP:-127.0.0.1}:3890:3890/tcp' 'The compose fragment lacks the LDAP port.'
+  assert_line "$COMPOSE_FRAGMENT" 'target: 3890' 'The compose fragment lacks the LDAP target port.'
+  assert_line "$COMPOSE_FRAGMENT" 'published: 3890' 'The compose fragment lacks the LDAP published port.'
+  assert_line "$COMPOSE_FRAGMENT" 'host_ip: ${PUBLIC_IP:-127.0.0.1}' 'The compose fragment lacks the explicit LDAP interface.'
   assert_line "$COMPOSE_FRAGMENT" './data/lldap/store/db:/data:rw' 'The compose fragment lacks the standalone database mount.'
   assert_line "$COMPOSE_FRAGMENT" './data/lldap/store/litefs:/var/lib/litefs:rw' 'The compose fragment lacks the LiteFS data mount.'
   assert_line "$COMPOSE_FRAGMENT" './config/consul/secrets:/etc/consul/secrets:ro' 'The compose fragment lacks the Consul secrets mount.'

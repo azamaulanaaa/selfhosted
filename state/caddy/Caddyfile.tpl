@@ -1,8 +1,15 @@
 # Rendered by consul-template. Do not edit.
-# HTTP only for now; TLS is out of scope for this issue.
-# The vhost labels come from the STACK_DOMAIN variable of the consul-template
-# process (compose sets it from the root .env). Caddy never decides them.
-# consul-template rewrites this file; caddy reloads itself on change (--watch).
+# HTTPS is served on both vhosts. The TLS mode comes from CADDY_TLS_MODE in the
+# root .env (compose substitutes it into the caddy container):
+#   internal     caddy's internal CA (tls internal)
+#   letsencrypt  ACME with CADDY_TLS_EMAIL as contact (tls <email>)
+#   existing     bring-your-own certs from /etc/caddy/certs (mounted from
+#                config/caddy/certs). Layout comes from CADDY_TLS_CERT_LAYOUT:
+#                wildcard (one pair for all vhosts) or per-vhost (one pair each).
+# Any other value: no tls directive is rendered and caddy falls back to
+# automatic HTTPS. The vhost labels come from STACK_DOMAIN. Caddy never
+# decides them. consul-template rewrites this file; caddy reloads itself on
+# change (--watch).
 
 {{ define "smart_proxy" }}
   {{ $name := index . 0 }}
@@ -60,8 +67,33 @@
   {{ end }}
 {{ end }}
 
+# Emit the TLS directive for one vhost. Argument: the vhost name.
+{{ define "tls_for" }}
+{{- $mode := env "CADDY_TLS_MODE" -}}
+{{- $layout := env "CADDY_TLS_CERT_LAYOUT" -}}
+{{- if eq $mode "internal" }}
+	tls internal
+{{- else if eq $mode "letsencrypt" }}
+{{- $email := env "CADDY_TLS_EMAIL" -}}
+{{- if $email }}
+	tls {{ $email }}
+{{- else }}
+	# CADDY_TLS_EMAIL not set; caddy falls back to automatic HTTPS
+{{- end }}
+{{- else if eq $mode "existing" }}
+{{- if eq $layout "wildcard" }}
+	tls /etc/caddy/certs/wildcard/fullchain.pem /etc/caddy/certs/wildcard/privkey.pem
+{{- else }}
+	tls /etc/caddy/certs/{{ . }}/fullchain.pem /etc/caddy/certs/{{ . }}/privkey.pem
+{{- end }}
+{{- else }}
+	# TLS mode not configured (CADDY_TLS_MODE unset or unknown); caddy falls back to automatic HTTPS
+{{- end }}
+{{ end }}
+
 # The consul web UI. Renders once a DC exists with at least one server registered.
-http://consul.{{ env "STACK_DOMAIN" }} {
+https://consul.{{ env "STACK_DOMAIN" }} {
+{{ template "tls_for" "consul" }}
 	reverse_proxy {{ range service "consul" }}{{ .Address }}:8500 {{ end }} {
 	}
 }
@@ -69,7 +101,8 @@ http://consul.{{ env "STACK_DOMAIN" }} {
 # The LLDAP UI. Rendered only when an lldap primary is elected:
 #   - key lldap/litefs exists in the consul KV with {"advertise-url": ...}.
 # Until a primary is elected the vhost renders with no handlers and caddy
-# answers an empty 200 for lldap.<STACK_DOMAIN>.
-http://lldap.{{ env "STACK_DOMAIN" }} {
+# answers an empty 200.
+https://lldap.{{ env "STACK_DOMAIN" }} {
+{{ template "tls_for" "lldap" }}
 	{{ template "smart_proxy" (sprig_list "lldap" "http://lldap:17170" "[]") }}
 }

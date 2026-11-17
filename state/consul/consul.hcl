@@ -1,4 +1,5 @@
 # Consul server configuration. Committed desired state.
+# The wizard renders this file to config/consul/consul.hcl.
 # Local wizard answers live in config/consul/local.hcl.
 # Secrets live in config/consul/secrets/agent.hcl.
 server = true

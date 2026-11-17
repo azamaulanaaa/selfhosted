@@ -161,6 +161,10 @@ node_name_answer_invalid() {
 # Blank lines and lines that start with # are ignored when the file is read.
 readonly PEERS_FILE="config/consul/peers.txt"
 readonly JOIN_FILE="config/consul/join.hcl"
+# The wizard renders the server config to this file.
+# The wizard reads the committed template and never writes to state/.
+readonly BASE_CONFIG_FILE="state/consul/consul.hcl"
+readonly RENDERED_CONFIG_FILE="config/consul/consul.hcl"
 # The shared gossip key lives in the backed-up secrets tree. Copy this file to every cluster node.
 readonly GOSSIP_KEY_FILE="config/consul/secrets/gossip.key"
 
@@ -233,6 +237,34 @@ render_join() {
   } >"$JOIN_FILE"
   chmod 0640 "$JOIN_FILE"
   grant_read_access "$JOIN_FILE" 0640
+}
+
+# Render the Consul server config from the committed template.
+# The template holds the production form. The wizard never writes to state/.
+render_consul_hcl() {
+  {
+    printf '# Rendered by setup.sh from %s. Do not edit.\n' "$BASE_CONFIG_FILE"
+    cat -- "$BASE_CONFIG_FILE"
+  } >"$RENDERED_CONFIG_FILE"
+  chmod 0640 "$RENDERED_CONFIG_FILE"
+  grant_read_access "$RENDERED_CONFIG_FILE" 0640
+}
+
+# Print the exact commands that create a read-only policy and token for caddy.
+# The wizard does not run the Consul CLI and does not invent a token.
+# The operator runs these commands when the Consul CLI is available and the stack is up.
+print_acl_commands() {
+  echo "Consul denies requests without a token."
+  echo "The caddy service requires a read-only token."
+  echo "The wizard does not create this token."
+  echo "Run these commands when the Consul CLI is available:"
+  cat <<'EOF'
+  export CONSUL_HTTP_ADDR=http://127.0.0.1:8500
+  export CONSUL_HTTP_TOKEN="$(grep -E '^[[:space:]]*initial_management' config/consul/secrets/agent.hcl | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+  consul acl policy create -name 'caddy-read' -description 'Read-only access for caddy' -rules 'key "" { policy = "read" }'
+  consul acl token create -description 'caddy read-only token' -policy-name 'caddy-read'
+EOF
+  echo "Store the printed token in caddy's own secret tree with the caddy wizard."
 }
 
 # Validate a list of IPs. Print one error per invalid IP. Return 1 when at least one IP is invalid.
@@ -739,6 +771,9 @@ chmod 0640 config/consul/local.hcl
 # The container reads this file as uid 100 and gid 1000. The mode stays 0640 on success.
 grant_read_access config/consul/local.hcl 0640
 
+# Step 5b: render the server config from the committed template.
+render_consul_hcl
+
 # Step 6: enforce the directory modes on every run.
 chmod 0700 config/consul/secrets
 chmod 0750 config/consul
@@ -758,6 +793,7 @@ peers_configured="$(peer_count)"
 # Step 9: print the summary.
 echo "Configured the consul wizard files:"
 echo "  config/consul/local.hcl"
+echo "  config/consul/consul.hcl"
 echo "  config/consul/secrets/gossip.key ($gossip_key_state)"
 case "$secret_state" in
 created)
@@ -788,3 +824,5 @@ if [ "$peers_configured" -gt 0 ]; then
 fi
 echo "Next step: docker compose up -d consul"
 echo "Back up config/consul/secrets and data/consul/store. These are the backup-critical paths. See docs/layout.md."
+echo ""
+print_acl_commands

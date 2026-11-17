@@ -1,0 +1,39 @@
+services:
+  # Reverse proxy for the consul and LLDAP web UIs. Serves consul.<STACK_DOMAIN>
+  # and lldap.<STACK_DOMAIN> over HTTP. HTTP only for now; TLS is out of scope
+  # for this issue. The image is built locally: it embeds consul-template (see
+  # state/caddy/Dockerfile). consul-template renders /etc/caddy/Caddyfile from
+  # state/caddy/Caddyfile.tpl on the fly and caddy reloads itself when the file
+  # changes (caddy run --watch).
+  caddy:
+    image: caddy-consul:local
+    build:
+      context: ./state/caddy
+      dockerfile: Dockerfile
+    container_name: caddy
+    volumes:
+      - ./state/caddy/Caddyfile.tpl:/etc/consul-template/templates/Caddyfile.tpl:ro
+      - ./config/caddy/consul-template.hcl:/etc/consul-template/config.hcl:ro
+      - ./config/caddy/secrets:/etc/consul-template/secrets:ro
+      - ./data/caddy/store:/data:rw
+    environment:
+      # Not a secret. The template uses it to build the vhost labels at render time.
+      - STACK_DOMAIN=${STACK_DOMAIN:-lan}
+      # Not a secret. The lldap vhost compares it against the LiteFS lease to
+      # split reads (local) from writes (the current primary). Falls back to
+      # 127.0.0.1 when PUBLIC_IP is not set in the root .env.
+      - IP_ADDR=${PUBLIC_IP:-127.0.0.1}
+    ports:
+      # HTTP only. TLS comes with a later issue.
+      - '0.0.0.0:80:80/tcp'
+    restart: unless-stopped
+    healthcheck:
+      # busybox wget is in the image. An unmatched host gets an empty 200 from
+      # caddy, so this proves the proxy serves HTTP without depending on consul.
+      test: [ "CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/" ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    # Local image: always build, never pull (caddy-consul:local is not published).
+    pull_policy: build

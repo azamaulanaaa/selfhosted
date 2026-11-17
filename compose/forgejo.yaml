@@ -2,8 +2,9 @@
 # The root compose.yaml owns the project name. This file is an included fragment.
 services:
   # Forgejo serves the stack at forgejo.<STACK_DOMAIN>. Caddy proxies the HTTPS
-  # vhost in integrated mode. LiteFS and Consul start only when both capability
-  # flags are 1. In standalone mode Forgejo starts with no peer.
+  # vhost in integrated mode. Port 3000 is published on PUBLIC_IP so a
+  # standalone node answers without a proxy and so git peers can replicate.
+  # LiteFS and Consul start only when both capability flags are 1.
   forgejo:
     image: forgejo-litefs:local
     build:
@@ -41,6 +42,9 @@ services:
     env_file:
       # Wizard-generated. Holds FORGEJO_* answers and *_FILE paths only.
       - ./config/forgejo/forgejo.env
+    ports:
+      # Standalone access and git peer replication use this port.
+      - "${PUBLIC_IP:-127.0.0.1}:3000:3000"
     cap_add:
       # LiteFS mounts a FUSE filesystem through /dev/fuse. cap_add SYS_ADMIN
       # allows FUSE mounts. devices exposes /dev/fuse. No blanket privileges.

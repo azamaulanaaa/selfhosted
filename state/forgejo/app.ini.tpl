@@ -11,9 +11,9 @@ RUN_MODE = prod
 
 [server]
 PROTOCOL = http
-DOMAIN = {{ env "STACK_DOMAIN" }}
+DOMAIN = {{ or (env "STACK_DOMAIN") "sh.lan" }}
 {{ if eq (env "CONSUL_ENABLED") "1" }}
-ROOT_URL = https://forgejo.{{ env "STACK_DOMAIN" }}/
+ROOT_URL = https://forgejo.{{ or (env "STACK_DOMAIN") "sh.lan" }}/
 {{ else }}
 ROOT_URL = http://{{ env "PUBLIC_IP" }}:3000/
 {{ end }}

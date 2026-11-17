@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - 'feature/**'
   pull_request:
   workflow_dispatch:
   schedule:
@@ -48,7 +49,7 @@ jobs:
             install_args: cocogitto
             script: scripts/check-commits.sh
           - name: markdown
-            install_args: "node markdownlint-cli2"
+            install_args: "node npm:markdownlint-cli2"
             script: scripts/check-markdown.sh
           - name: hadolint
             install_args: hadolint
@@ -82,7 +83,6 @@ jobs:
           version: "2026.11.8"
           install_args: ${{ matrix.install_args }}
       - name: Trust the checkout directory
-        if: matrix.name == 'commits'
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Run the check
         run: ${{ matrix.script }}
@@ -116,6 +116,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Trust the checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install gitleaks
         run: mise install gitleaks
       - name: Scan the repository for secrets
@@ -132,6 +134,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Trust the checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install editorconfig-checker
         run: mise install editorconfig-checker
       - name: Check the files against EditorConfig rules

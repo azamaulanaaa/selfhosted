@@ -1,9 +1,13 @@
 # syntax=docker/dockerfile:1
-# Tinyauth wrapped with LiteFS.
-# LiteFS replicates the SQLite database and the OIDC key files that Tinyauth
-# keeps in /data. A single node is the LiteFS primary. Only the primary can
+# Tinyauth wrapped with LiteFS in integrated mode.
+# LiteFS replicates only the SQLite database that Tinyauth keeps in /data.
+# The OIDC key files live in the secrets tree at /etc/tinyauth/secrets/oidc.
+# LiteFS does not replicate the OIDC key files. Copy the same keys to every
+# node before you start a second node.
+# In integrated mode a single node is the LiteFS primary. Only the primary can
 # write the database. Leader election uses a Consul lease. The entrypoint
 # creates the Consul policy and token that LiteFS uses for the lease.
+# In standalone mode the app runs directly on local SQLite with no peer.
 # This image contains no secrets.
 
 FROM ghcr.io/tinyauthapp/tinyauth:v5.2.0

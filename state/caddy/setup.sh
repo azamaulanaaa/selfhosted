@@ -91,6 +91,19 @@ read_capability_flag() {
   esac
 }
 
+# Print one vhost name per discovered service. Each service with a web UI
+# ships a compose fragment. The caddy fragment is the proxy, not a vhost.
+discover_vhosts() {
+  local fragment service
+  for fragment in compose/*.yaml; do
+    [ -f "$fragment" ] || continue
+    service="$(basename -- "$fragment" .yaml)"
+    if [ "$service" != "caddy" ]; then
+      printf '%s\n' "$service"
+    fi
+  done
+}
+
 # Resolve the default stack domain. Set stack_domain and stack_domain_source.
 # The order is: STACK_DOMAIN from the environment, then the STACK_DOMAIN line in
 # the root .env, then sh.lan.
@@ -501,8 +514,14 @@ else
   esac
 fi
 
-# The caddy stack serves these vhosts today. Update this list when a vhost is added.
-readonly TLS_VHOSTS="consul lldap tinyauth"
+# Build the vhost list from the compose fragments. Keep a safe fallback for
+# standalone checkouts that hold only the caddy fragment.
+discovered_vhosts="$(discover_vhosts | tr '\n' ' ')"
+TLS_VHOSTS="${discovered_vhosts% }"
+if [ -z "$TLS_VHOSTS" ]; then
+  TLS_VHOSTS="consul lldap tinyauth"
+fi
+readonly TLS_VHOSTS
 
 # Build the printable vhost list and the certificate example from TLS_VHOSTS.
 TLS_VHOSTS_LIST=""

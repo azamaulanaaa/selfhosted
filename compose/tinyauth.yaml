@@ -46,6 +46,11 @@ services:
         published: 20202
         host_ip: "${PUBLIC_IP}"
         protocol: tcp
+      # Application port. A remote primary proxies write requests here.
+      - target: 3000
+        published: 3000
+        host_ip: "${PUBLIC_IP:-127.0.0.1}"
+        protocol: tcp
     restart: unless-stopped
     healthcheck:
       # Unauthenticated endpoint. Busybox wget is in the base image.

@@ -3,6 +3,8 @@
 # Safe to run again: it rewrites lldap_config.toml and keeps the secret files.
 # The wizard generates a missing secret file. It never prints secret values.
 # It prints paths only.
+# The canonical LDAP password path is config/ldap/secrets/user-pass. Other
+# services read that file. The wizard also writes the legacy path for lldap.
 #
 # Usage:
 #   setup.sh lldap                          Run the LLDAP wizard.
@@ -26,6 +28,11 @@ readonly REPO_ROOT
 readonly CONFIG_DIR="config/lldap"
 readonly SECRETS_DIR="config/lldap/secrets"
 readonly CONFIG_FILE="config/lldap/lldap_config.toml"
+
+# The canonical password file is shared with other services.
+# Keep the legacy lldap file so older deployments keep working.
+readonly LDAP_SECRETS_DIR="config/ldap/secrets"
+readonly CANONICAL_USER_PASS_FILE="${LDAP_SECRETS_DIR}/user-pass"
 
 # The wizard writes each secret to one file with mode 600.
 # LLDAP reads these files through its _FILE environment variables.
@@ -343,16 +350,21 @@ fi
 # Step 4: create the config directories with strict modes.
 # The runtime creates the data directory. The wizard never writes data/.
 mkdir -p "$SECRETS_DIR"
+mkdir -p "$LDAP_SECRETS_DIR"
 chmod 0700 "$CONFIG_DIR"
 chmod 0700 "$SECRETS_DIR"
+chmod 0700 "$LDAP_SECRETS_DIR"
 
 # Step 5: reuse the existing secrets. Generate fresh secrets for anything missing.
-# LLDAP reads jwt_secret, key_seed, and ldap_user_pass from files.
+# The canonical password file wins when both password files hold a value.
 secret_state="kept"
 reused=0
 jwt_secret="$(read_secret_file "$JWT_SECRET_FILE")"
 key_seed="$(read_secret_file "$KEY_SEED_FILE")"
-ldap_user_pass="$(read_secret_file "$USER_PASS_FILE")"
+ldap_user_pass="$(read_secret_file "$CANONICAL_USER_PASS_FILE")"
+if [ -z "$ldap_user_pass" ]; then
+  ldap_user_pass="$(read_secret_file "$USER_PASS_FILE")"
+fi
 if [ -z "$jwt_secret" ]; then
   jwt_secret="$(openssl rand -hex 32)"
 else
@@ -377,8 +389,10 @@ else
 fi
 
 # Write each secret to a separate file. Never write a secret into the config file.
+# Write the password to the canonical path and to the legacy lldap path.
 write_secret_file "$JWT_SECRET_FILE" "$jwt_secret"
 write_secret_file "$KEY_SEED_FILE" "$key_seed"
+write_secret_file "$CANONICAL_USER_PASS_FILE" "$ldap_user_pass"
 write_secret_file "$USER_PASS_FILE" "$ldap_user_pass"
 
 # Step 6: write the config file. It holds no secrets.
@@ -404,6 +418,7 @@ chmod 0600 "$CONFIG_FILE"
 echo "Configured the lldap configuration:"
 echo "  $CONFIG_FILE"
 echo "  $SECRETS_DIR (secrets $secret_state)"
+echo "LDAP password: $CANONICAL_USER_PASS_FILE (mode 0600)"
 echo "HTTP URL: $HTTP_URL"
 echo "Base DN: $base_dn"
 echo "Admin username: $admin_user"

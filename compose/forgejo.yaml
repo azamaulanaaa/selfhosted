@@ -44,13 +44,11 @@ services:
       - ./config/forgejo/forgejo.env
     ports:
       # Standalone access and git peer replication use this port.
-      - "${PUBLIC_IP:-127.0.0.1}:3000:3000"
-    cap_add:
-      # LiteFS mounts a FUSE filesystem through /dev/fuse. cap_add SYS_ADMIN
-      # allows FUSE mounts. devices exposes /dev/fuse. No blanket privileges.
-      - SYS_ADMIN
-    devices:
-      - /dev/fuse
+      # The long syntax binds the port to PUBLIC_IP only.
+      - target: 3000
+        published: 3000
+        host_ip: ${PUBLIC_IP:-127.0.0.1}
+        protocol: tcp
     restart: unless-stopped
     healthcheck:
       # Unauthenticated endpoint. curl is in the base image.
@@ -59,6 +57,12 @@ services:
       timeout: 3s
       retries: 5
       start_period: 40s
+    # LiteFS mounts a FUSE filesystem through /dev/fuse. cap_add SYS_ADMIN
+    # allows FUSE mounts. devices exposes /dev/fuse. No blanket privileges.
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
     # Built locally. Never pull it from a registry.
     pull_policy: build
 
@@ -66,18 +70,21 @@ services:
   # Git replication already uses port 3000. This port carries LiteFS LTX data.
   forgejo-peer-port:
     image: forgejo-litefs:local
-    build:
-      context: ./state/forgejo
     container_name: forgejo-peer-port
     depends_on:
       - forgejo
+    ports:
+      # The peer shares the Forgejo network namespace. No build is needed.
+      # The long syntax binds the port to PUBLIC_IP only.
+      - target: 20202
+        published: 20202
+        host_ip: ${PUBLIC_IP:-127.0.0.1}
+        protocol: tcp
     network_mode: "service:forgejo"
     entrypoint:
       - /bin/sh
       - -c
       - sleep infinity
-    ports:
-      - "${PUBLIC_IP:-127.0.0.1}:20202:20202"
     restart: unless-stopped
     profiles:
       - peer

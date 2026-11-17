@@ -3,7 +3,8 @@
 # Safe to run again: it rewrites consul-template.hcl. It never prints secret
 # values. It prints paths only.
 #
-# One container serves consul.<STACK_DOMAIN> and lldap.<STACK_DOMAIN> over HTTPS: the
+# One container serves consul.<STACK_DOMAIN>, lldap.<STACK_DOMAIN> and
+# tinyauth.<STACK_DOMAIN> over HTTPS: the
 # caddy image (built locally from state/caddy/Dockerfile) embeds
 # consul-template. consul-template renders /etc/caddy/Caddyfile from
 # state/caddy/Caddyfile.tpl, and caddy reloads itself on change (caddy run
@@ -39,7 +40,7 @@
 #                                                              config/caddy/certs/wildcard
 #                             wildcard:<fullchain>:<key>          copy that pair into
 #                                                              config/caddy/certs/wildcard
-#                             consul:<fullchain>:<key>,lldap:<fullchain>:<key>
+#                             consul:<fullchain>:<key>,lldap:<fullchain>:<key>,tinyauth:<fullchain>:<key>
 #                                                              copy per-vhost pairs into
 #                                                              config/caddy/certs/<vhost>
 #                           When unset, the existing certs under config/caddy/certs are
@@ -460,7 +461,21 @@ else
 fi
 
 # The caddy stack serves these vhosts today. Update this list when a vhost is added.
-readonly TLS_VHOSTS="consul lldap"
+readonly TLS_VHOSTS="consul lldap tinyauth"
+
+# Build the printable vhost list and the certificate example from TLS_VHOSTS.
+TLS_VHOSTS_LIST=""
+TLS_CERTS_EXAMPLE=""
+for vhost in $TLS_VHOSTS; do
+  if [ -n "$TLS_VHOSTS_LIST" ]; then
+    TLS_VHOSTS_LIST+=", "
+    TLS_CERTS_EXAMPLE+=","
+  fi
+  TLS_VHOSTS_LIST+="$vhost"
+  TLS_CERTS_EXAMPLE+="$vhost:<fullchain>:<key>"
+done
+readonly TLS_VHOSTS_LIST
+readonly TLS_CERTS_EXAMPLE
 
 tls_email=""
 if [ "$tls_mode" = "letsencrypt" ]; then
@@ -687,7 +702,7 @@ kept)
   echo "  config/caddy/secrets/consul-token (kept)"
   ;;
 esac
-echo "caddy vhosts: https://consul.$stack_domain (all consul nodes, :8500), https://lldap.$stack_domain"
+echo "caddy vhosts: https://consul.$stack_domain (all consul nodes, :8500), https://lldap.$stack_domain, https://tinyauth.$stack_domain"
 case "$tls_mode" in
 internal)
   echo "TLS mode: internal. caddy issues certificates from its internal CA."

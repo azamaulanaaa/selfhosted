@@ -170,6 +170,50 @@ contains its fragment and its `state/<service>/` tree. Fragments do not
 reference each other. All cross-service references work through the
 shared Docker network.
 
+## Standalone and integrated modes
+
+This section defines the shared contract for every service. Each service
+follows these rules. The root `.env` file holds the shared values. See
+`.env.example` for the keys and their default values.
+
+### Capability flags
+
+Four capability flags control optional peers and features:
+
+- `CONSUL_ENABLED`
+- `LITEFS_ENABLED`
+- `OIDC_ENABLED`
+- `TLS_ENABLED`
+
+Each flag defaults to `0`. A service with every flag at `0` is in standalone
+mode. That service must start, serve, and stop with no peer.
+
+### Stack domain
+
+`STACK_DOMAIN` is the canonical stack domain. Services read it from the root
+`.env` file. It defaults to `sh.lan`. No service may use the `lan` domain.
+
+### Shared secrets
+
+Services read the Consul management token at container start. The token is
+`initial_management` in `config/consul/secrets/agent.hcl`. A service must not
+copy this token into its own secret tree at wizard time.
+
+Services read the LDAP password at container start. The password is in
+`config/ldap/secrets/user-pass`. The lldap wizard writes that file.
+
+### Assembler ownership
+
+The assembler owns the root `compose.yaml`. `scripts/compose-assemble.sh`
+generates the file. A service adds one fragment under `compose/`. A service
+never edits the root `compose.yaml` or `scripts/compose-assemble.sh`.
+
+### Integrated mode
+
+To use integrated mode, set the capability flags to `1` in the root `.env`.
+Then run `setup.sh` once. The assembler regenerates `compose.yaml` from the
+fragments.
+
 ## Out of scope
 
 This contract covers placement only.

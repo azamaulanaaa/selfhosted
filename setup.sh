@@ -194,11 +194,14 @@ fi
 mapfile -t services < <(list_known_services)
 if [ "${#services[@]}" -eq 0 ]; then
   echo "No services found in state/."
-  exit 1
+  exit 0
 fi
 
 # Create the root .env when it is missing. compose requires it.
 if [ ! -e .env ]; then : >.env && chmod 0640 .env; fi
+
+# Regenerate the stack assembler from the current service fragments.
+bash "$REPO_ROOT/scripts/compose-assemble.sh"
 
 # Step 2: select the services to enable.
 enabled=()

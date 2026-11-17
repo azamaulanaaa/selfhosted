@@ -1,17 +1,17 @@
 #!/bin/sh
-# Boot the LLDAP server behind LiteFS.
-# LiteFS mounts the SQLite database file at /data.
-# LiteFS elects a single primary through a Consul lease.
-# Only the primary can write the database.
-# Consul ACLs protect the lease, therefore this script also creates
-# the Consul policy and token that LiteFS uses for the lease.
+# Boot the LLDAP server in standalone mode or integrated mode.
+# Standalone mode starts LLDAP directly. It needs no LiteFS, no Consul, and no FUSE mount.
+# Integrated mode runs LLDAP behind LiteFS. LiteFS mounts the database at /data.
+# LiteFS elects a single primary through a Consul lease. Only the primary writes the database.
+# Consul ACLs protect the lease. This script reads the management token at start.
 # The script never prints secret values. It prints paths only.
 set -eu
 
 # These variables point at the image paths. The defaults match the base image.
 # Override a variable to use a different path.
 LLDAP_CONFIG_FILE="${LLDAP_CONFIG_FILE:-/etc/lldap/lldap_config.toml}"
-CONSUL_MANAGEMENT_TOKEN_FILE="${CONSUL_MANAGEMENT_TOKEN_FILE:-/etc/lldap/secrets/consul-management-token}"
+LLDAP_DATA_DIR="${LLDAP_DATA_DIR:-/data}"
+CONSUL_AGENT_HCL_FILE="${CONSUL_AGENT_HCL_FILE:-/etc/consul/secrets/agent.hcl}"
 LITEFS_YML="${LITEFS_YML:-/run/litefs.yml}"
 LITEFS_MOUNT_DIR="${LITEFS_MOUNT_DIR:-/data}"
 LITEFS_DATA_DIR="${LITEFS_DATA_DIR:-/var/lib/litefs}"
@@ -24,10 +24,19 @@ RUNTIME_TOKEN_DIR="$(dirname -- "$RUNTIME_TOKEN_FILE")"
 PUBLIC_IP="${PUBLIC_IP:-}"
 CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-http://consul:8500}"
 STACK_DOMAIN="${STACK_DOMAIN:-sh.lan}"
+CONSUL_ENABLED="${CONSUL_ENABLED:-0}"
+LITEFS_ENABLED="${LITEFS_ENABLED:-0}"
 
-readonly LLDAP_CONFIG_FILE CONSUL_MANAGEMENT_TOKEN_FILE LITEFS_YML
+readonly LLDAP_CONFIG_FILE LLDAP_DATA_DIR CONSUL_AGENT_HCL_FILE LITEFS_YML
 readonly LITEFS_MOUNT_DIR LITEFS_DATA_DIR PUBLIC_IP CONSUL_HTTP_ADDR STACK_DOMAIN
-readonly RUNTIME_TOKEN_FILE RUNTIME_TOKEN_DIR
+readonly RUNTIME_TOKEN_FILE RUNTIME_TOKEN_DIR CONSUL_ENABLED LITEFS_ENABLED
+
+# Use integrated mode only when both peers are enabled.
+# Any other flag combination selects standalone mode.
+integrated_mode=0
+if [ "$CONSUL_ENABLED" = "1" ] && [ "$LITEFS_ENABLED" = "1" ]; then
+  integrated_mode=1
+fi
 
 readonly POLICY_NAME="lldap-litefs"
 # The rules grant write access to the lease key and to the session.
@@ -44,13 +53,15 @@ readonly EXEC_UID EXEC_GID
 log() { echo "lldap-litefs: $1" >&2; }
 err() { echo "lldap-litefs: error: $1" >&2; }
 
-# Read the Consul management token from this service's secret file.
+# Read initial_management from the Consul agent secret file.
 # Print the token on stdout. Return 1 when the file is missing.
 read_management_token() {
-  if [ ! -r "$CONSUL_MANAGEMENT_TOKEN_FILE" ]; then
+  if [ ! -r "$CONSUL_AGENT_HCL_FILE" ]; then
     return 1
   fi
-  tr -d '[:space:]' <"$CONSUL_MANAGEMENT_TOKEN_FILE"
+  {
+    grep -E '^[[:space:]]*initial_management' "$CONSUL_AGENT_HCL_FILE" 2>/dev/null || true
+  } | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
 # Print the value of one string field from a flat JSON response.
@@ -79,14 +90,14 @@ is_token_chars() {
 # Return 1 with a message on stderr when any step fails.
 create_litefs_token() {
   mgmt_token="$(read_management_token)" || {
-    err "The Consul management token is missing."
-    err "Create the file $CONSUL_MANAGEMENT_TOKEN_FILE."
-    err "Use a token that can write ACL policies and tokens."
+    err "Cannot read the Consul agent secret file."
+    err "Create the file $CONSUL_AGENT_HCL_FILE."
+    err "The file must hold initial_management."
     return 1
   }
   if [ -z "$mgmt_token" ]; then
-    err "The Consul management token file is empty."
-    err "Create the file $CONSUL_MANAGEMENT_TOKEN_FILE."
+    err "The Consul agent secret file has no management token."
+    err "Add initial_management to $CONSUL_AGENT_HCL_FILE."
     return 1
   fi
   if ! is_token_chars "$mgmt_token"; then
@@ -185,14 +196,27 @@ check_litefs_token() {
 # Boot sequence
 # ---------------------------------------------------------------------------
 
-if [ -z "$PUBLIC_IP" ]; then
-  err "PUBLIC_IP is not set. Set it in the root .env or export it before starting the container."
-  exit 1
-fi
-
 if [ ! -r "$LLDAP_CONFIG_FILE" ]; then
   err "LLDAP configuration not readable at $LLDAP_CONFIG_FILE."
   err "Generate it first: bash setup.sh lldap"
+  exit 1
+fi
+
+# Standalone mode needs no peer. Prepare the database directory and start LLDAP.
+if [ "$integrated_mode" -eq 0 ]; then
+  mkdir -p "$LLDAP_DATA_DIR"
+  if [ "$(id -u)" -eq 0 ] && ! chown "${EXEC_UID}:${EXEC_GID}" "$LLDAP_DATA_DIR" 2>/dev/null; then
+    log "cannot change the owner of $LLDAP_DATA_DIR. Check the directory permissions."
+  fi
+  chmod 0700 "$LLDAP_DATA_DIR"
+  log "starting lldap in standalone mode"
+  exec gosu "${EXEC_UID}:${EXEC_GID}" /app/lldap run --config-file "$LLDAP_CONFIG_FILE"
+fi
+
+log "starting lldap in integrated mode with litefs and consul"
+
+if [ -z "$PUBLIC_IP" ]; then
+  err "PUBLIC_IP is not set. Set it in the root .env or export it before starting the container."
   exit 1
 fi
 

@@ -1,36 +1,27 @@
-# Guide
+# Selfhosting
 
-![Checks](https://github.com/azamaulanaaa/init/actions/workflows/ci.yml/badge.svg)
+![Checks](https://github.com/azamaulanaaa/selfhosting/actions/workflows/ci.yml/badge.svg)
 
-The sections below show how to install the hooks, run the checks,
-commit, and release a version.
+This repository contains the checks, hooks, CI, release flow, and smolvm
+sandbox for the selfhosting stack. The sections below show how to install
+the hooks, run the checks, commit, and release a version.
 
-## Customize this template
-
-Replace these values before you use this template:
-
-- The default branch name `main` in `cog.toml` and `ci.yml`. Use your
-  default branch name.
-- The copyright holder in `LICENSE` and `README.md`. Use your name.
+To add the checks and tools to an existing repository, see
+[Add the checks and tools](docs/adopt.md).
 
 ## Requirements
 
 You need `git` and `make`.
 
-`make ci` runs the checks inside a smolvm microVM when `smolvm` is on
-`PATH` and the host accelerator is available: `/dev/kvm` on Linux,
-`kern.hv_support=1` on macOS with Apple Silicon. Without them, it
-prints a warning and runs the checks on the host. The microVM runs
-offline and mounts the repository read-only at `/workspace`. Run
-`make smolvm-verify` to check the isolation. See the
-[smolvm documentation](docs/smolvm.md).
+The checks need these tools on `PATH`: `cog`, `dclint`, `dockerfmt`,
+`editorconfig-checker`, `gitleaks`, `hadolint`, `jactionlint`,
+`markdownlint-cli2`, `shellcheck`, `shfmt`, and `zizmor`.
 
-The checks need `cog`, `dclint`, `dockerfmt`, `editorconfig-checker`,
-`gitleaks`, `hadolint`, `jactionlint`, `markdownlint-cli2`, `shellcheck`,
-`shfmt`, and `zizmor`. If you use [`mise`](https://mise.jdx.dev/), run
-`mise install` to install these tools. Then activate `mise` in your shell so
-the installed tools are on
-`PATH`. The `mise` documentation describes the command for each shell.
+If you use [`mise`](https://mise.jdx.dev/), run `mise install`. Then
+activate `mise` in your shell so the tools are on `PATH`.
+
+The sandbox needs `smolvm` and a working host accelerator. See
+[Compatibility and limits](#compatibility-and-limits).
 
 ## Setup
 
@@ -41,7 +32,7 @@ make hooks
 ```
 
 The target sets `core.hooksPath` to `.githook`. The target also makes
-the three hook files executable.
+the two hook files executable.
 
 ## Checks
 
@@ -50,8 +41,13 @@ each `scripts/check-*.sh` file in name order. The run stops when a check
 fails. On a host with smolvm and a working accelerator, the checks run
 inside a smolvm microVM. The microVM is offline and mounts the
 repository read-only at `/workspace`. Without them, `make ci` prints a
-warning and runs the checks on the host. See the
-[smolvm documentation](docs/smolvm.md).
+warning and runs the checks on the host. Set `SMOLVM_ENABLED=1` to
+require smolvm. The checks then stop with exit code 3 when smolvm
+cannot run. Set `SMOLVM_ADDR` to run
+the checks on a remote server. The server has no authentication by
+default. Put it behind an authenticated TLS proxy. Set
+`SMOLVM_SERVE_TOKEN` to send a bearer token. The scripts do not print
+the token. See the [smolvm documentation](docs/smolvm.md).
 
 Run these commands to check one area at a time:
 
@@ -93,12 +89,38 @@ ready. `make smolvm-verify` checks that the isolation holds from
 inside the guest and from the host. `make smolvm` runs the checks
 inside a smolvm microVM against the live working tree.
 `make smolvm-pack` builds the cached pack that the sandbox runs
-from. `make smolvm-clean` removes the cached packs and deletes
-dangling `smolvm-build-*` and `smolvm-run-*` machines.
+from. It refuses to run while `SMOLVM_ADDR` is set.
+`make smolvm-clean` removes the cached packs and deletes the dangling
+machines of this checkout. Every resource name has an owner:
+`smolvm-build-<owner>-<hash>`, `smolvm-run-<owner>-*`, and
+`smolvm-remote-<owner>-*`. With a remote address it also deletes
+`smolvm-ci-<owner>-<key>.qcow2` cache bases on the server. In local mode
+the owner is the first 12 hex characters of the SHA-256 of the canonical
+checkout path. Set `SMOLVM_OWNER` to use a name instead. A shared server
+requires `SMOLVM_OWNER`. Use one unique value for each repository. An
+empty value stops a remote command before any API call. The value uses
+lowercase letters, digits, hyphen, and underscore. It starts with a
+letter or a digit. It has at most 16 characters. The target prints the
+plan and asks one time. Use `--dry-run` to print the plan only, or
+`--yes` to skip the prompt. Set `SMOLVM_CLEAN_ASSUME_YES=1` to skip the
+prompt too. A non-interactive run without a skip flag stops with an
+error. Machines and bases of another owner stay. When `SMOLVM_OWNER` is
+unset, a moved checkout gets a new token. Its old resources become
+foreign and are reported, not deleted.
 `make smolvm-exec ARGS='...'` runs one command inside the sandbox.
-The [smolvm documentation](docs/smolvm.md) describes the
-requirements, the cache key, the verify step, and the
-`SMOLVM_ENABLED` variable.
+Set `SMOLVM_ADDR` to run the checks on a remote `smolvm serve` server.
+Set `SMOLVM_OWNER` to a unique name for this repository. The remote
+path needs `curl` and `tar`. It has no host fallback. It sends the git
+metadata with the working tree so the checks can read the history.
+`make smolvm-pack` refuses to run while `SMOLVM_ADDR` is set. Unset the
+variable before you build a local pack.
+
+Set `SMOLVM_CPUS` and `SMOLVM_MEMORY_MB` to change the CPU count and
+memory of the machine. The defaults are 1 CPU and 512 MiB. Each value
+must be a positive integer.
+
+The [smolvm documentation](docs/smolvm.md) describes the environment
+variables, the cache key, and the verify step.
 
 ## Format
 
@@ -131,11 +153,13 @@ GitHub Actions runs the same checks on pull requests and pushes to
 
 ## Git hooks
 
-`make hooks` installs three hooks:
+`make hooks` installs two hooks:
 
-- `.githook/commit-msg` checks the commit message with `cog verify`.
 - `.githook/pre-commit` runs `scripts/ci.sh` before each commit.
 - `.githook/pre-push` runs `scripts/ci.sh` before each push.
+
+The commit history check does not use a hook. `make check-commits` and
+the CI workflow run `scripts/check-commits.sh`.
 
 Do not use `--no-verify` to skip a hook. A failed hook shows a problem.
 Fix the problem. Then commit or push again.
@@ -163,37 +187,93 @@ branch only. Run this command:
 make release
 ```
 
-The target runs `cog bump --auto`. It updates `CHANGELOG.md`. It creates
-a version commit. It also creates a tag with the `v` prefix, for example
-`v1.2.3`.
+`make release` runs `cog bump --auto` in a smolvm microVM when smolvm
+is available. The repository mount stays read-only. The guest clones
+the repository to a writable temporary directory. It runs the bump
+there. It returns the changelog, one version commit, and the tag as a
+git bundle. The host validates the bundle and applies it. The host then
+applies the changelog, the version commit, and the tag.
 
-Run this command to see the next version:
+Auto mode prints a warning and runs `cog bump --auto` on the host when
+smolvm or the accelerator is unavailable. The host path can change the
+repository directly. Set `SMOLVM_ENABLED=0` to force the host path.
+Set `SMOLVM_ENABLED=1` to require the sandbox. The run then exits 3 when
+no sandbox is available. Set `SMOLVM_ADDR` to use a remote `smolvm
+serve` server. See the [smolvm documentation](docs/smolvm.md).
+
+The host applies the bundle only after it validates the bundle. The
+checks cover the tag, the parent commit, the changed path, and the author
+and committer email. A failure does not apply the release. Concurrent
+work stays.
+
+Pass release arguments with `ARGS`. For example:
+
+```bash
+make release ARGS='--dry-run'
+```
+
+`--auto` is the default selector. When `ARGS` holds `--auto`,
+`--version`, `--major`, `--minor`, or `--patch`, the release does not add
+`--auto`.
+
+Run this command to see the next version on the host:
 
 ```bash
 cog bump --dry-run --auto
 ```
 
-The command changes nothing.
+The command changes nothing. A sandbox release with `--dry-run` also
+changes nothing and exits 0.
 
 The first release needs an explicit version. Run one of these commands:
 
 ```bash
-cog bump --version 1.0.0
-cog bump --version 0.1.0
+make release ARGS='--version 1.0.0'
+make release ARGS='--version 0.1.0'
 ```
 
 Use `1.0.0` when the public interface is stable. Use `0.1.0` when the
-interface can change.
+interface can change. The flags `--major`, `--minor`, and `--patch` also
+replace `--auto`.
+
+## Compatibility and limits
+
+The local sandbox ran on Linux x86_64 with KVM and smolvm 1.35.1. The
+remote session flow, a streamed stdin, and a local-directory upload ran
+against `smolvm serve` v1.35.4. The streamed exec path ran against
+v1.33.0. Check each version against your server before you rely on a
+feature.
+
+The remote release path ran on `smolvm serve` v1.35.5 with the cache
+disk off.
+
+These paths are not verified:
+
+- The full `make ci` run over HTTP. Live remote runs used
+  `make smolvm-exec`.
+- The local sandbox release path. No live `smolvm machine run` release
+  has run.
+- The release pack build and cache reuse path. The remote release ran
+  with `SMOLVM_SERVE_CACHE=0`.
+- A successful cache publish and a warm init. The tested Windows server
+  attached a seed base but refused every publish.
+- macOS on Apple Silicon. The detection exists, but the path is
+  untested.
+- The isolation check on a KVM host. `make smolvm-verify` has not
+  printed `result=isolation_held` there yet.
+
+See the [smolvm documentation](docs/smolvm.md) for the full list.
 
 ## Repository layout
 
 - `.github/workflows/ci.yml` defines the check workflow for GitHub
   Actions.
-- `.githook/` contains the three Git hooks.
+- `.githook/` contains the two Git hooks.
 - `scripts/` contains the check scripts, the format scripts, the
-  `ci.sh` entry point, and the `smolvm.sh`, `smolvm-clean.sh`, and
-  `smolvm-exec.sh` helpers.
-- `smol/` contains the smolvm base machine and the pack build script.
+  `ci.sh` entry point, the release scripts, and the `smolvm.sh`,
+  `smolvm-clean.sh`, `smolvm-exec.sh`, and `smolvm-serve.sh` helpers.
+- `smol/` contains the smolvm base machine, the shared `init.sh`
+  provisioning script, and the pack build script.
 - `docs/` contains the check, the release, and the smolvm documents.
 - `cog.toml` contains the `Cocogitto` settings for commits, changelog,
   and tags.
@@ -208,11 +288,11 @@ interface can change.
   to add a check.
 - The [release workflow](docs/release.md) describes the commit format
   and the release steps.
-- The [smolvm](docs/smolvm.md) describes the smolvm microVM,
-  the pack cache, and the verified flow.
+- The [smolvm](docs/smolvm.md) describes the sandbox settings,
+  the pack cache, and the known limits.
 
 ## License
 
 This project uses the MIT License. See [`LICENSE`](LICENSE).
 
-Copyright (c) 2026 Aza Maulana.
+Copyright (c) 2026 Selfhosting maintainers.

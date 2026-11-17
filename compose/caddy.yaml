@@ -1,11 +1,11 @@
 services:
-  # Reverse proxy for the consul and LLDAP web UIs. Serves consul.<STACK_DOMAIN>
-  # and lldap.<STACK_DOMAIN> over HTTPS. The TLS mode is asked by the caddy wizard
-  # and stored in the root .env (CADDY_TLS_MODE); this service forwards it into the
-  # container. The image is built locally: it embeds consul-template (see
-  # state/caddy/Dockerfile). consul-template renders /etc/caddy/Caddyfile from
-  # state/caddy/Caddyfile.tpl on the fly and caddy reloads itself when the file
-  # changes (caddy run --watch).
+  # Reverse proxy for the consul, LLDAP and tinyauth web UIs. Serves
+  # consul.<STACK_DOMAIN>, lldap.<STACK_DOMAIN> and tinyauth.<STACK_DOMAIN> over
+  # HTTPS. The TLS mode is asked by the caddy wizard and stored in the root .env
+  # (CADDY_TLS_MODE); this service forwards it into the container. The image is
+  # built locally: it embeds consul-template (see state/caddy/Dockerfile).
+  # consul-template renders /etc/caddy/Caddyfile from state/caddy/Caddyfile.tpl on
+  # the fly and caddy reloads itself when the file changes (caddy run --watch).
   caddy:
     image: caddy-consul:local
     build:

@@ -1,5 +1,5 @@
 # Rendered by consul-template. Do not edit.
-# HTTPS is served on both vhosts. The TLS mode comes from CADDY_TLS_MODE in the
+# HTTPS is served on all vhosts. The TLS mode comes from CADDY_TLS_MODE in the
 # root .env (compose substitutes it into the caddy container):
 #   internal     caddy's internal CA (tls internal)
 #   letsencrypt  ACME with CADDY_TLS_EMAIL as contact (tls <email>)
@@ -105,4 +105,13 @@ https://consul.{{ env "STACK_DOMAIN" }} {
 https://lldap.{{ env "STACK_DOMAIN" }} {
 {{ template "tls_for" "lldap" }}
 	{{ template "smart_proxy" (sprig_list "lldap" "http://lldap:17170" "[]") }}
+}
+
+# The tinyauth OIDC provider. Rendered only when a tinyauth primary is elected:
+#   - key tinyauth/litefs exists in the consul KV with {"advertise-url": ...}.
+# Until a primary is elected the vhost renders with no handlers and caddy
+# answers an empty 200.
+https://tinyauth.{{ env "STACK_DOMAIN" }} {
+{{ template "tls_for" "tinyauth" }}
+	{{ template "smart_proxy" (sprig_list "tinyauth" "http://tinyauth:3000" "[]") }}
 }

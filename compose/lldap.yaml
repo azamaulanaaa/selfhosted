@@ -39,11 +39,14 @@ services:
       - LLDAP_KEY_SEED_FILE=/etc/lldap/secrets/key_seed
       - LLDAP_LDAP_USER_PASS_FILE=/etc/lldap/secrets/ldap_user_pass
     ports:
-      # HTTP UI and API. Trusted LAN only. Goes through caddy.
-      - '0.0.0.0:17170:17170/tcp'
       # LDAP port for standalone clients. Bound to PUBLIC_IP, which defaults
       # to 127.0.0.1. Set PUBLIC_IP to a trusted LAN address to expose it.
-      - '${PUBLIC_IP:-127.0.0.1}:3890:3890/tcp'
+      - target: 3890
+        published: 3890
+        host_ip: ${PUBLIC_IP:-127.0.0.1}
+        protocol: tcp
+      # HTTP UI and API. Trusted LAN only. Goes through caddy.
+      - '0.0.0.0:17170:17170/tcp'
     restart: unless-stopped
     healthcheck:
       # Unauthenticated endpoint. The login page returns 200.

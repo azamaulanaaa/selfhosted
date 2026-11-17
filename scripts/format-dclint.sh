@@ -18,6 +18,7 @@ mapfile -d '' -t files < <(
   git ls-files -z --cached --others --exclude-standard -- \
     ':(glob)**/compose.yml' ':(glob)**/compose.yaml' \
     ':(glob)**/compose.*.yml' ':(glob)**/compose.*.yaml' \
+    ':(glob)**/compose/*.yml' ':(glob)**/compose/*.yaml' \
     ':(glob)**/docker-compose.yml' ':(glob)**/docker-compose.yaml' \
     ':(glob)**/docker-compose.*.yml' ':(glob)**/docker-compose.*.yaml'
 )

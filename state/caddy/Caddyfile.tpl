@@ -21,7 +21,7 @@
 
   {{ $path := printf "%s/litefs" $name }}
   {{ $my_addr := env "IP_ADDR" }}
-  {{ $upstream := $my_addr }}
+  {{ $upstream := $my_addr }}{{ $parts := split ":" $local_addr }}{{ $upstream_port := index $parts (subtract 1 (len $parts)) }}
 
   {{ if keyExists $path }}
     {{ $value := key $path }}
@@ -39,7 +39,7 @@
       }
 
       handle @writes {
-        reverse_proxy http://{{ $upstream }}:17170 {
+        reverse_proxy http://{{ $upstream }}:{{ $upstream_port }} {
           header_up Host {host}
         }
       }
@@ -52,7 +52,7 @@
         }
 
         handle @redirect_paths {
-          reverse_proxy http://{{ $upstream }}:17170 {
+          reverse_proxy http://{{ $upstream }}:{{ $upstream_port }} {
             header_up Host {host}
           }
         }

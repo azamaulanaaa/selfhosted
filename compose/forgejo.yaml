@@ -61,3 +61,23 @@ services:
       start_period: 40s
     # Built locally. Never pull it from a registry.
     pull_policy: build
+
+  # Opt-in LiteFS peer port. Enable it with --profile peer on a second node.
+  # Git replication already uses port 3000. This port carries LiteFS LTX data.
+  forgejo-peer-port:
+    image: forgejo-litefs:local
+    build:
+      context: ./state/forgejo
+    container_name: forgejo-peer-port
+    depends_on:
+      - forgejo
+    network_mode: "service:forgejo"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - sleep infinity
+    ports:
+      - "${PUBLIC_IP:-127.0.0.1}:20202:20202"
+    restart: unless-stopped
+    profiles:
+      - peer

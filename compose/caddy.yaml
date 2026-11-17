@@ -1,3 +1,5 @@
+# dclint disable require-project-name-field
+# The root compose.yaml owns the project name. This file is an included fragment.
 services:
   # Reverse proxy for the consul, LLDAP and tinyauth web UIs. Serves
   # consul.<STACK_DOMAIN>, lldap.<STACK_DOMAIN> and tinyauth.<STACK_DOMAIN> over
@@ -48,5 +50,8 @@ services:
       timeout: 3s
       retries: 5
       start_period: 30s
+    # The entrypoint creates the store as root. This uid matches the store owner
+    # and the owner of the ACME files in it.
+    user: "0:0"
     # Local image: always build, never pull (caddy-consul:local is not published).
     pull_policy: build

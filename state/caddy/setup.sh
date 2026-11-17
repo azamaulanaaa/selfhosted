@@ -187,6 +187,15 @@ install_cert_copy() {
   echo "wrote: $dst"
 }
 
+# Print a migration hint for vhosts that lack a per-vhost certificate pair.
+# The first argument lists the missing vhosts, separated by spaces.
+tls_migration_hint() {
+  local missing="$1"
+  echo "hint: Add a certificate pair for each missing vhost: $missing." >&2
+  echo "hint: Copy fullchain.pem and privkey.pem into config/caddy/certs/<vhost>/ for each vhost." >&2
+  echo "hint: Or set CADDY_TLS_CERTS=wildcard to use one wildcard pair for all vhosts." >&2
+}
+
 usage_clean() {
   echo "usage: setup.sh caddy clean [--data] [--yes]" >&2
 }
@@ -545,9 +554,11 @@ if [ "$tls_mode" = "existing" ]; then
     certs_spec="${CADDY_TLS_CERTS:-}"
     if [ -z "$certs_spec" ]; then
       keep_ok=1
+      missing_vhosts=""
       for vhost in $TLS_VHOSTS; do
         if ! [ -r "config/caddy/certs/$vhost/fullchain.pem" ] || ! [ -r "config/caddy/certs/$vhost/privkey.pem" ]; then
           keep_ok=0
+          missing_vhosts="$missing_vhosts$vhost "
         fi
       done
       if [ -r config/caddy/certs/wildcard/fullchain.pem ] && [ -r config/caddy/certs/wildcard/privkey.pem ]; then
@@ -557,6 +568,8 @@ if [ "$tls_mode" = "existing" ]; then
       else
         echo "error: CADDY_TLS_CERTS is required when CADDY_TLS_MODE=existing and no certs are present." >&2
         echo "error: Use 'wildcard', 'wildcard:<fullchain>:<key>', or '$TLS_CERTS_EXAMPLE'." >&2
+        echo "error: Missing per-vhost certificates: ${missing_vhosts% }." >&2
+        tls_migration_hint "${missing_vhosts% }"
         exit 1
       fi
     else
@@ -617,6 +630,7 @@ if [ "$tls_mode" = "existing" ]; then
           done
           if [ "$found" -eq 0 ]; then
             echo "error: CADDY_TLS_CERTS per-vhost needs a pair for every vhost: $TLS_CERTS_EXAMPLE." >&2
+            tls_migration_hint "$vhost"
             exit 1
           fi
         done
@@ -630,16 +644,14 @@ if [ "$tls_mode" = "existing" ]; then
   fi
 fi
 
-# Step 2: create the directory layout with strict modes.
+# Step 2: create the config directories with strict modes.
+# The wizard never writes data/. The caddy entrypoint creates the store at run time.
 mkdir -p config/caddy
 mkdir -p config/caddy/secrets
 mkdir -p config/caddy/certs
-mkdir -p data/caddy/store
 chmod 0750 config/caddy
 chmod 0700 config/caddy/secrets
 chmod 0750 config/caddy/certs
-chmod 0750 data/caddy
-chmod 0750 data/caddy/store
 
 # Step 3: write the root .env with the shared STACK_DOMAIN and the TLS answers.
 # Keep the other lines.
@@ -653,7 +665,7 @@ if [ "${#cert_copies[@]}" -gt 0 ]; then
     rest="${entry#*|}"
     src_fc="${rest%%|*}"
     src_key="${rest##*|}"
-    install_cert_copy "$src_fc" "config/caddy/certs/$vhost/fullchain.pem" 0644
+    install_cert_copy "$src_fc" "config/caddy/certs/$vhost/fullchain.pem" 0640
     install_cert_copy "$src_key" "config/caddy/certs/$vhost/privkey.pem" 0600
   done
 fi

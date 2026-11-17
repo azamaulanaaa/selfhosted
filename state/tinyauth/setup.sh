@@ -560,6 +560,28 @@ fi
 mkdir -p "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
 chmod 0700 "$CONFIG_DIR" "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
 
+# Create the OIDC signing keys. Do not rely on the app to create them at boot.
+# A re-run keeps the existing keys. The app runs as uid 1000 and needs write
+# access on the key files, so set the owner and the mode on every run.
+private_key="$OIDC_SECRETS_DIR/private.pem"
+public_key="$OIDC_SECRETS_DIR/public.pem"
+if [ ! -s "$private_key" ]; then
+  (
+    umask 077
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$private_key" 2>/dev/null
+  )
+  echo "Created the OIDC private key at $private_key."
+fi
+if [ ! -s "$public_key" ]; then
+  (
+    umask 077
+    openssl pkey -in "$private_key" -pubout -out "$public_key" 2>/dev/null
+  )
+  echo "Created the OIDC public key at $public_key."
+fi
+chmod 0600 "$private_key" "$public_key"
+chown 1000:1000 "$private_key" "$public_key" 2>/dev/null || true
+
 # The Consul management token stays in the shared consul secrets tree.
 # The entrypoint reads initial_management at container start.
 # This wizard never copies the token into the tinyauth secrets tree.

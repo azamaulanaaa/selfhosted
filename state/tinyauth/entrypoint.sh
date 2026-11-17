@@ -1,7 +1,10 @@
 #!/bin/sh
 # Boot the Tinyauth server behind LiteFS.
 # LiteFS mounts the data directory at /data. Tinyauth stores its SQLite
-# database and its OIDC keys in that directory.
+# database in that directory. LiteFS replicates the SQLite database only.
+# LiteFS does not replicate the OIDC key files. The key files live in the
+# backed-up secrets tree at /etc/tinyauth/secrets/oidc. Copy the same key files
+# to every node before you start a second node.
 # LiteFS elects a single primary through a Consul lease.
 # Only the primary can write the database.
 # Consul ACLs protect the lease, therefore this script also creates
@@ -47,8 +50,8 @@ err() { echo "tinyauth-litefs: error: $1" >&2; }
 # compose loads that file before this script starts.
 : "${TINYAUTH_APPURL=https://tinyauth.${STACK_DOMAIN}}"
 : "${TINYAUTH_DATABASE_PATH=/data/tinyauth.db}"
-: "${TINYAUTH_OIDC_PRIVATEKEYPATH=/data/oidc/private.pem}"
-: "${TINYAUTH_OIDC_PUBLICKEYPATH=/data/oidc/public.pem}"
+: "${TINYAUTH_OIDC_PRIVATEKEYPATH=/etc/tinyauth/secrets/oidc/private.pem}"
+: "${TINYAUTH_OIDC_PUBLICKEYPATH=/etc/tinyauth/secrets/oidc/public.pem}"
 export TINYAUTH_APPURL TINYAUTH_DATABASE_PATH
 export TINYAUTH_OIDC_PRIVATEKEYPATH TINYAUTH_OIDC_PUBLICKEYPATH
 

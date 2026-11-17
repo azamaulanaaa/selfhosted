@@ -1,9 +1,11 @@
 services:
-  # Tinyauth, wrapped with LiteFS. LiteFS replicates the SQLite database and
-  # the OIDC keys between nodes through consul. A single node is the LiteFS
-  # primary. Only the primary can write the database. Consul ACLs protect the
-  # litefs lease (key "tinyauth/litefs"). The entrypoint creates the token.
-  # Caddy proxies tinyauth:3000 on the shared network at
+  # Tinyauth, wrapped with LiteFS. LiteFS replicates the SQLite database only.
+  # LiteFS does not replicate the OIDC key files. The key files live in the
+  # backed-up secrets tree at /etc/tinyauth/secrets/oidc. Copy the same key
+  # files to every node before you start a second node. A single node is the
+  # LiteFS primary. Only the primary can write the database. Consul ACLs
+  # protect the litefs lease (key "tinyauth/litefs"). The entrypoint creates
+  # the token. Caddy proxies tinyauth:3000 on the shared network at
   # tinyauth.<STACK_DOMAIN>. Port 20202 is published for LiteFS peers.
   # The LDAP port is not published either.
   tinyauth:
@@ -13,8 +15,10 @@ services:
     # The image is built locally. Never pull it from a registry.
     container_name: tinyauth
     volumes:
-      # LiteFS and Consul tokens. The entrypoint creates the LiteFS token at
-      # boot and reuses it. The wizard writes the Consul management token.
+      # LiteFS token, Consul token and OIDC key files. The entrypoint creates
+      # the LiteFS token at boot and reuses it. The wizard writes the Consul
+      # management token. The OIDC keys live in the backed-up secrets tree;
+      # copy the same key files to every node before you start a second node.
       # The directory needs write access so the entrypoint can store the token.
       - ./config/tinyauth/secrets:/etc/tinyauth/secrets:rw
       # LiteFS internal data (LTX files). Back this up.

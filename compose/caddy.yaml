@@ -26,7 +26,7 @@ services:
       - ./data/caddy/store:/data:rw
     environment:
       # Not a secret. The template uses it to build the vhost labels at render time.
-      - STACK_DOMAIN=${STACK_DOMAIN:-lan}
+      - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
       # Capability flags. At 0, caddy uses the static standalone Caddyfile.
       # At CONSUL_ENABLED=1, caddy uses consul-template.
       - CONSUL_ENABLED=${CONSUL_ENABLED:-0}

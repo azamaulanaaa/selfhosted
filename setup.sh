@@ -200,6 +200,9 @@ fi
 # Create the root .env when it is missing. compose requires it.
 if [ ! -e .env ]; then : >.env && chmod 0640 .env; fi
 
+# Regenerate the stack assembler from the current service fragments.
+bash "$REPO_ROOT/scripts/compose-assemble.sh"
+
 # Step 2: select the services to enable.
 enabled=()
 if [ -t 0 ]; then

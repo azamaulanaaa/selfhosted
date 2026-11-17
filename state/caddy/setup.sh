@@ -519,7 +519,7 @@ fi
 discovered_vhosts="$(discover_vhosts | tr '\n' ' ')"
 TLS_VHOSTS="${discovered_vhosts% }"
 if [ -z "$TLS_VHOSTS" ]; then
-  TLS_VHOSTS="consul lldap tinyauth"
+  TLS_VHOSTS="consul lldap tinyauth forgejo"
 fi
 readonly TLS_VHOSTS
 
@@ -760,7 +760,7 @@ else
   echo "note: the entrypoint reads initial_management from config/consul/secrets/agent.hcl."
   echo "note: mount that file into the caddy container before you start it."
 fi
-echo "caddy vhosts: https://consul.$stack_domain (all consul nodes, :8500), https://lldap.$stack_domain, https://tinyauth.$stack_domain"
+echo "caddy vhosts: https://consul.$stack_domain (all consul nodes, :8500), https://lldap.$stack_domain, https://tinyauth.$stack_domain, https://forgejo.$stack_domain"
 case "$tls_mode" in
 internal)
   echo "TLS mode: internal. caddy issues certificates from its internal CA."

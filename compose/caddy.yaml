@@ -1,9 +1,10 @@
 # dclint disable require-project-name-field
 # The root compose.yaml owns the project name. This file is an included fragment.
 services:
-  # Reverse proxy for the consul, LLDAP and tinyauth web UIs. Serves
-  # consul.<STACK_DOMAIN>, lldap.<STACK_DOMAIN> and tinyauth.<STACK_DOMAIN> over
-  # HTTPS. The TLS mode is asked by the caddy wizard and stored in the root .env
+  # Reverse proxy for the consul, LLDAP, tinyauth and forgejo web UIs. Serves
+  # consul.<STACK_DOMAIN>, lldap.<STACK_DOMAIN>, tinyauth.<STACK_DOMAIN> and
+  # forgejo.<STACK_DOMAIN> over HTTPS. The TLS mode is asked by the caddy wizard
+  # and stored in the root .env
   # (CADDY_TLS_MODE); this service forwards it into the container. The image is
   # built locally: it embeds consul-template (see state/caddy/Dockerfile).
   # consul-template renders /etc/caddy/Caddyfile from state/caddy/Caddyfile.tpl on

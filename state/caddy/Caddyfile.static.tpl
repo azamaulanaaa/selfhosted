@@ -22,3 +22,8 @@ https://tinyauth.__STACK_DOMAIN__ {
 	tls internal
 	reverse_proxy tinyauth:3000
 }
+
+https://forgejo.__STACK_DOMAIN__ {
+	tls internal
+	reverse_proxy forgejo:3000
+}

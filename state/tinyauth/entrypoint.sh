@@ -1,32 +1,45 @@
 #!/bin/sh
-# Boot the Tinyauth server behind LiteFS.
-# LiteFS mounts the data directory at /data. Tinyauth stores its SQLite
-# database in that directory. LiteFS replicates the SQLite database only.
-# LiteFS does not replicate the OIDC key files. The key files live in the
-# backed-up secrets tree at /etc/tinyauth/secrets/oidc. Copy the same key files
-# to every node before you start a second node.
-# LiteFS elects a single primary through a Consul lease.
-# Only the primary can write the database.
-# Consul ACLs protect the lease, therefore this script also creates
-# the Consul policy and token that LiteFS uses for the lease.
+# Boot the Tinyauth server.
+# In integrated mode, LiteFS wraps the app and replicates the SQLite database.
+# Integrated mode needs a Consul lease and a FUSE mount.
+# In standalone mode, the app runs directly on a local SQLite database.
+# Standalone mode needs no peer, no consul, no FUSE, and no LiteFS.
 # The script never prints secret values. It prints paths only.
 set -eu
 
 # These variables point at the runtime paths. The defaults match the image.
 # The tests override them with a scratch tree.
 TINYAUTH_SECRETS_DIR="${TINYAUTH_SECRETS_DIR:-/etc/tinyauth/secrets}"
-CONSUL_MANAGEMENT_FILE="${CONSUL_MANAGEMENT_FILE:-${TINYAUTH_SECRETS_DIR}/consul-management-token}"
+CONSUL_SECRETS_DIR="${CONSUL_SECRETS_DIR:-/etc/tinyauth/consul-secrets}"
+CONSUL_AGENT_HCL_FILE="${CONSUL_SECRETS_DIR}/agent.hcl"
 LITEFS_YML="${LITEFS_YML:-/run/litefs.yml}"
 LITEFS_MOUNT_DIR="${LITEFS_MOUNT_DIR:-/data}"
 LITEFS_DATA_DIR="${LITEFS_DATA_DIR:-/var/lib/litefs}"
+STANDALONE_RENDER_FILE="${STANDALONE_RENDER_FILE:-/run/tinyauth-standalone.env}"
+TINYAUTH_RENDER_ONLY="${TINYAUTH_RENDER_ONLY:-0}"
 
 # Environment that the operator sets.
 PUBLIC_IP="${PUBLIC_IP:-}"
 CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-http://consul:8500}"
 STACK_DOMAIN="${STACK_DOMAIN:-sh.lan}"
 
-readonly TINYAUTH_SECRETS_DIR CONSUL_MANAGEMENT_FILE LITEFS_YML
-readonly LITEFS_MOUNT_DIR LITEFS_DATA_DIR PUBLIC_IP CONSUL_HTTP_ADDR STACK_DOMAIN
+# Capability flags. A value of 1 enables the matching feature.
+CONSUL_ENABLED="${CONSUL_ENABLED:-0}"
+LITEFS_ENABLED="${LITEFS_ENABLED:-0}"
+OIDC_ENABLED="${OIDC_ENABLED:-0}"
+TLS_ENABLED="${TLS_ENABLED:-0}"
+
+readonly TINYAUTH_SECRETS_DIR CONSUL_SECRETS_DIR CONSUL_AGENT_HCL_FILE LITEFS_YML
+readonly LITEFS_MOUNT_DIR LITEFS_DATA_DIR STANDALONE_RENDER_FILE TINYAUTH_RENDER_ONLY
+readonly PUBLIC_IP CONSUL_HTTP_ADDR STACK_DOMAIN
+readonly CONSUL_ENABLED LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
+
+# Integrated mode needs both the consul and the LiteFS capability.
+integrated=0
+if [ "$CONSUL_ENABLED" = "1" ] && [ "$LITEFS_ENABLED" = "1" ]; then
+  integrated=1
+fi
+readonly integrated
 
 readonly TOKEN_FILE="${TINYAUTH_SECRETS_DIR}/litefs-token"
 readonly POLICY_NAME="tinyauth-litefs"
@@ -36,32 +49,34 @@ readonly POLICY_RULES_JSON='key \"tinyauth/litefs\" { policy = \"write\" } sessi
 # The base image creates the tinyauth user with uid 1000 and gid 1000.
 # The base image keeps the binary in /tinyauth. It does not set USER, so the
 # container starts as root. gosu drops root before the app starts.
-# The app writes to /data, which the base image chowns to uid 1000.
 EXEC_UID=1000
 EXEC_GID=1000
 EXEC_BINARY=/tinyauth/tinyauth
 readonly EXEC_UID EXEC_GID EXEC_BINARY
 
-log() { echo "tinyauth-litefs: $1" >&2; }
-err() { echo "tinyauth-litefs: error: $1" >&2; }
+log() { echo "tinyauth: $1" >&2; }
+err() { echo "tinyauth: error: $1" >&2; }
 
-# Apply the persisted defaults that Tinyauth needs when the wizard did not
-# set them. The wizard writes these keys to config/tinyauth/tinyauth.env.
-# compose loads that file before this script starts.
+# Apply the defaults that Tinyauth needs. The wizard writes these keys to
+# config/tinyauth/tinyauth.env. Compose loads that file before this script.
+# A standalone instance without OIDC uses a local issuer.
 : "${TINYAUTH_APPURL=https://tinyauth.${STACK_DOMAIN}}"
+if [ "$OIDC_ENABLED" = "0" ]; then
+  TINYAUTH_APPURL="http://127.0.0.1:3000"
+fi
 : "${TINYAUTH_DATABASE_PATH=/data/tinyauth.db}"
 : "${TINYAUTH_OIDC_PRIVATEKEYPATH=/etc/tinyauth/secrets/oidc/private.pem}"
 : "${TINYAUTH_OIDC_PUBLICKEYPATH=/etc/tinyauth/secrets/oidc/public.pem}"
 export TINYAUTH_APPURL TINYAUTH_DATABASE_PATH
 export TINYAUTH_OIDC_PRIVATEKEYPATH TINYAUTH_OIDC_PUBLICKEYPATH
 
-# Read the Consul management token from this service's secrets tree.
-# Print the token on stdout. Return 1 when the file is missing.
+# Read the consul management token from the shared secret at container start.
+# The token is initial_management in the consul agent configuration.
+# Print the token on stdout. Return 1 when the file or the key is missing.
 read_consul_management() {
-  if [ ! -r "$CONSUL_MANAGEMENT_FILE" ]; then
-    return 1
-  fi
-  cat "$CONSUL_MANAGEMENT_FILE"
+  [ -r "$CONSUL_AGENT_HCL_FILE" ] || return 1
+  { grep -E '^[[:space:]]*initial_management[[:space:]]*=' "$CONSUL_AGENT_HCL_FILE" || true; } |
+    head -n1 | cut -d'"' -f2
 }
 
 # Print the value of one string field from a flat JSON response.
@@ -84,24 +99,23 @@ is_token_chars() {
   esac
 }
 
-# Create or reuse the Consul policy and token for the LiteFS lease.
+# Create or reuse the consul policy and token for the LiteFS lease.
 # The policy grants write access to the lease key and to the session.
 # The function prints the token on stdout.
 # Return 1 with a message on stderr when any step fails.
 create_litefs_token() {
   mgmt_token="$(read_consul_management)" || {
-    err "the consul management token at $CONSUL_MANAGEMENT_FILE is missing."
-    err "Run the tinyauth wizard: bash setup.sh tinyauth"
-    err "For a remote consul, write a management token to $CONSUL_MANAGEMENT_FILE."
+    err "the consul management token is missing at $CONSUL_AGENT_HCL_FILE."
+    err "Run the consul wizard to create the file."
     err "You may write a prepared litefs token to ${TINYAUTH_SECRETS_DIR}/litefs-token."
     return 1
   }
   if [ -z "$mgmt_token" ]; then
-    err "the consul management token at $CONSUL_MANAGEMENT_FILE is empty."
+    err "the consul management token at $CONSUL_AGENT_HCL_FILE is empty."
     return 1
   fi
   if ! is_token_chars "$mgmt_token"; then
-    err "the consul management token at $CONSUL_MANAGEMENT_FILE has unexpected characters."
+    err "the consul management token at $CONSUL_AGENT_HCL_FILE has unexpected characters."
     return 1
   fi
 
@@ -192,71 +206,15 @@ check_litefs_token() {
   esac
 }
 
-# ---------------------------------------------------------------------------
-# Boot sequence
-# ---------------------------------------------------------------------------
-
-if [ -z "$PUBLIC_IP" ]; then
-  err "PUBLIC_IP is not set. Set it in the root .env or export it before starting the container."
-  exit 1
-fi
-
-case "$TINYAUTH_APPURL" in
-https://*) ;;
-*)
-  err "TINYAUTH_APPURL must start with https://. The OIDC issuer requires HTTPS."
-  exit 1
-  ;;
-esac
-
-if ! curl -fsS -o /dev/null "$CONSUL_HTTP_ADDR/v1/status/leader" 2>/dev/null; then
-  err "consul is not reachable at $CONSUL_HTTP_ADDR."
-  err "Start consul first: docker compose up -d consul"
-  exit 1
-fi
-
-# Resolve the LiteFS token. Reuse a stored token when it is still valid.
-if [ -s "$TOKEN_FILE" ]; then
-  token="$(cat "$TOKEN_FILE")"
-  if ! is_token_chars "$token"; then
-    err "the stored litefs token at $TOKEN_FILE has unexpected characters."
-    err "Delete the file and restart the container to create a new token."
-    exit 1
-  fi
-  if check_litefs_token "$token"; then
-    log "reusing the litefs token from $TOKEN_FILE"
-  else
-    err "the stored litefs token at $TOKEN_FILE was rejected by consul."
-    err "Delete the file and restart the container to create a new token."
-    exit 1
-  fi
-else
-  log "creating the consul policy and token for the litefs lease"
-  token="$(create_litefs_token)"
-  if [ -z "$token" ]; then
-    err "no litefs token was created."
-    exit 1
-  fi
-  if ! check_litefs_token "$token"; then
-    err "the new litefs token does not work. Check the consul ACLs."
-    exit 1
-  fi
-  write_token_file "$token"
-  log "stored the litefs token at $TOKEN_FILE"
-fi
-
-# Create the backed-up store and set its mode here at runtime.
-# The wizard never writes data/. Root owns the directory because litefs writes
-# its LTX files as root before gosu drops privileges for the app.
-mkdir -p "$LITEFS_DATA_DIR"
-chmod 0700 "$LITEFS_DATA_DIR"
-mkdir -p "$LITEFS_MOUNT_DIR"
-
-# Generate the LiteFS configuration. Values come from the container
-# environment. The file must not contain secrets. The token travels through
+# Render the LiteFS configuration. Values come from the container environment.
+# The file must not contain secrets. The token travels through
 # the CONSUL_HTTP_TOKEN_FILE environment variable instead.
-umask 077
-cat >"$LITEFS_YML" <<EOF
+render_integrated_config() {
+  mkdir -p "$LITEFS_DATA_DIR"
+  chmod 0700 "$LITEFS_DATA_DIR"
+  mkdir -p "$LITEFS_MOUNT_DIR"
+  umask 077
+  cat >"$LITEFS_YML" <<EOF
 # Generated by state/tinyauth/entrypoint.sh at container start.
 # Do not edit. The file is recreated on every start.
 fuse:
@@ -282,45 +240,159 @@ lease:
 tracing:
   enabled: false
 EOF
-chmod 0600 "$LITEFS_YML"
+  chmod 0600 "$LITEFS_YML"
+  log "rendered the litefs config at $LITEFS_YML"
+}
 
-log "starting litefs on $LITEFS_MOUNT_DIR (advertise-url http://$PUBLIC_IP:20202)"
-log "litefs internal data lives at $LITEFS_DATA_DIR (back this up)"
-log "the app data is created on the elected primary at first boot"
+# Render the standalone app configuration. Tinyauth reads its settings from
+# environment variables. This file records the values for verification.
+render_standalone_config() {
+  mkdir -p "$LITEFS_MOUNT_DIR"
+  chown "${EXEC_UID}:${EXEC_GID}" "$LITEFS_MOUNT_DIR" 2>/dev/null || true
+  umask 077
+  cat >"$STANDALONE_RENDER_FILE" <<EOF
+# Generated by state/tinyauth/entrypoint.sh at container start.
+# Do not edit. The file is recreated on every start.
+TINYAUTH_APPURL=$TINYAUTH_APPURL
+TINYAUTH_DATABASE_PATH=$TINYAUTH_DATABASE_PATH
+TINYAUTH_OIDC_PRIVATEKEYPATH=$TINYAUTH_OIDC_PRIVATEKEYPATH
+TINYAUTH_OIDC_PUBLICKEYPATH=$TINYAUTH_OIDC_PUBLICKEYPATH
+CONSUL_ENABLED=$CONSUL_ENABLED
+LITEFS_ENABLED=$LITEFS_ENABLED
+OIDC_ENABLED=$OIDC_ENABLED
+TLS_ENABLED=$TLS_ENABLED
+EOF
+  chmod 0600 "$STANDALONE_RENDER_FILE"
+  log "rendered the standalone config at $STANDALONE_RENDER_FILE"
+}
 
-CONSUL_HTTP_TOKEN_FILE="$TOKEN_FILE" litefs mount -config "$LITEFS_YML" &
-litefs_pid=$!
-
-# Forward signals to litefs. Docker stops the container with SIGTERM.
-# After litefs exits, exit with its status code.
-trap 'kill -TERM "$litefs_pid" 2>/dev/null || true; wait "$litefs_pid"; exit $?' TERM INT
-
-# Wait for the FUSE mount to appear.
-mount_found=0
-i=0
-while [ "$i" -lt 30 ]; do
-  if ! kill -0 "$litefs_pid" 2>/dev/null; then
-    err "litefs exited before the mount appeared."
+# Start LiteFS and wait for its FUSE mount. LiteFS starts the app.
+start_integrated() {
+  if ! curl -fsS -o /dev/null "$CONSUL_HTTP_ADDR/v1/status/leader" 2>/dev/null; then
+    err "consul is not reachable at $CONSUL_HTTP_ADDR."
+    err "Start consul first: docker compose up -d consul"
     exit 1
   fi
-  if grep -E "[[:space:]]${LITEFS_MOUNT_DIR}[[:space:]]fuse" /proc/mounts >/dev/null 2>&1; then
-    mount_found=1
-    break
-  fi
-  i=$((i + 1))
-  sleep 1
-done
 
-if [ "$mount_found" -ne 1 ]; then
-  err "the litefs mount did not appear at $LITEFS_MOUNT_DIR after 30 seconds."
-  kill -TERM "$litefs_pid" 2>/dev/null || true
+  # Resolve the LiteFS token. Reuse a stored token when it is still valid.
+  if [ -s "$TOKEN_FILE" ]; then
+    token="$(cat "$TOKEN_FILE")"
+    if ! is_token_chars "$token"; then
+      err "the stored litefs token at $TOKEN_FILE has unexpected characters."
+      err "Delete the file and restart the container to create a new token."
+      exit 1
+    fi
+    if check_litefs_token "$token"; then
+      log "reusing the litefs token from $TOKEN_FILE"
+    else
+      err "the stored litefs token at $TOKEN_FILE was rejected by consul."
+      err "Delete the file and restart the container to create a new token."
+      exit 1
+    fi
+  else
+    log "creating the consul policy and token for the litefs lease"
+    token="$(create_litefs_token)"
+    if [ -z "$token" ]; then
+      err "no litefs token was created."
+      exit 1
+    fi
+    if ! check_litefs_token "$token"; then
+      err "the new litefs token does not work. Check the consul ACLs."
+      exit 1
+    fi
+    write_token_file "$token"
+    log "stored the litefs token at $TOKEN_FILE"
+  fi
+
+  log "starting litefs on $LITEFS_MOUNT_DIR (advertise-url http://$PUBLIC_IP:20202)"
+  log "litefs internal data lives at $LITEFS_DATA_DIR (back this up)"
+  log "the app data is created on the elected primary at first boot"
+
+  CONSUL_HTTP_TOKEN_FILE="$TOKEN_FILE" litefs mount -config "$LITEFS_YML" &
+  litefs_pid=$!
+
+  # Forward signals to litefs. Docker stops the container with SIGTERM.
+  # After litefs exits, exit with its status code.
+  trap 'kill -TERM "$litefs_pid" 2>/dev/null || true; wait "$litefs_pid"; exit $?' TERM INT
+
+  # Wait for the FUSE mount to appear.
+  mount_found=0
+  i=0
+  while [ "$i" -lt 30 ]; do
+    if ! kill -0 "$litefs_pid" 2>/dev/null; then
+      err "litefs exited before the mount appeared."
+      exit 1
+    fi
+    if grep -E "[[:space:]]${LITEFS_MOUNT_DIR}[[:space:]]fuse" /proc/mounts >/dev/null 2>&1; then
+      mount_found=1
+      break
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+
+  if [ "$mount_found" -ne 1 ]; then
+    err "the litefs mount did not appear at $LITEFS_MOUNT_DIR after 30 seconds."
+    kill -TERM "$litefs_pid" 2>/dev/null || true
+    exit 1
+  fi
+
+  log "litefs mounted at $LITEFS_MOUNT_DIR"
+  log "waiting for the litefs-managed Tinyauth process to exit"
+
+  status=0
+  wait "$litefs_pid" || status=$?
+  log "litefs exited with code $status"
+  exit "$status"
+}
+
+# Start the app directly on local SQLite. No peer process is required.
+start_standalone() {
+  log "starting tinyauth on local SQLite at $TINYAUTH_DATABASE_PATH"
+  log "standalone mode needs no peer, consul, FUSE, or litefs."
+
+  gosu "${EXEC_UID}:${EXEC_GID}" "${EXEC_BINARY}" &
+  app_pid=$!
+  trap 'kill -TERM "$app_pid" 2>/dev/null || true; wait "$app_pid"; exit $?' TERM INT
+
+  status=0
+  wait "$app_pid" || status=$?
+  log "tinyauth exited with code $status"
+  exit "$status"
+}
+
+# ---------------------------------------------------------------------------
+# Boot sequence
+# ---------------------------------------------------------------------------
+
+if [ "$integrated" -eq 1 ] && [ -z "$PUBLIC_IP" ]; then
+  err "PUBLIC_IP is not set. Set it in the root .env file."
   exit 1
 fi
 
-log "litefs mounted at $LITEFS_MOUNT_DIR"
-log "waiting for the litefs-managed Tinyauth process to exit"
+if [ "$OIDC_ENABLED" = "1" ]; then
+  case "$TINYAUTH_APPURL" in
+  https://*) ;;
+  *)
+    err "TINYAUTH_APPURL must start with https://. The OIDC issuer requires HTTPS."
+    exit 1
+    ;;
+  esac
+fi
 
-wait "$litefs_pid"
-status=$?
-log "litefs exited with code $status"
-exit "$status"
+if [ "$integrated" -eq 1 ]; then
+  render_integrated_config
+else
+  render_standalone_config
+fi
+
+if [ "$TINYAUTH_RENDER_ONLY" = "1" ]; then
+  log "render-only mode. No process was started."
+  exit 0
+fi
+
+if [ "$integrated" -eq 1 ]; then
+  start_integrated
+else
+  start_standalone
+fi

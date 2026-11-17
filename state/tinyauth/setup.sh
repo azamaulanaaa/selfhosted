@@ -9,21 +9,27 @@
 #                                              With --data also remove the tinyauth data.
 #                                              Ask for confirmation unless --yes is given.
 #
+# Capability flags come from the root .env file. Each flag defaults to 0.
+# Integrated mode needs CONSUL_ENABLED=1 and LITEFS_ENABLED=1.
+# Standalone mode needs no flag at 1 and no peer.
+# The Consul management token stays in config/consul/secrets/agent.hcl. The
+# entrypoint reads it at container start. The wizard never copies the token.
+# The LDAP password is in config/ldap/secrets/user-pass. The wizard reads it
+# to create the observer. The entrypoint reads it at container start.
+#
 # Non-interactive environment variables:
 #   STACK_DOMAIN            Stack domain. The issuer becomes https://tinyauth.<domain>.
 #                           Read from the environment, then the root .env, then sh.lan.
 #   TINYAUTH_LDAP_LOCAL     yes to use the LLDAP service in this repo. Default: yes.
 #   TINYAUTH_LDAP_ADDRESS   LDAP URL. Required when TINYAUTH_LDAP_LOCAL=no.
 #                           Interactive default for local LLDAP: ldap://lldap:3890.
-#   TINYAUTH_LDAP_BASEDN    LDAP base DN. Read from config/lldap/lldap_config.toml when
-#                           that file exists, else required for non-interactive runs.
+#   TINYAUTH_LDAP_BASEDN    LDAP base DN. Read from the environment. For local LLDAP
+#                           the default is dc=home,dc=lan.
 #   TINYAUTH_OBSERVER_AUTO  yes to create the observer in LLDAP automatically. Default: yes.
 #                           Falls back to manual instructions when the local admin
 #                           password, the API, or docker is not available.
 #   TINYAUTH_LDAP_BINDDN    Observer bind DN for manual mode.
 #   TINYAUTH_LDAP_BINDPASSWORD  Observer bind password for manual mode.
-#   TINYAUTH_CONSUL_MANAGEMENT  Consul management token to copy into this service's
-#                               secrets tree. Default: read from the local consul config.
 #   LLDAP_HTTP_URL          LLDAP HTTP base URL for the GraphQL API.
 #                           Default: http://localhost:17170.
 #   LLDAP_ADMIN_USER        LLDAP admin username for auto-create. Default: admin.
@@ -42,9 +48,7 @@ readonly SECRETS_DIR="config/tinyauth/secrets"
 readonly OIDC_SECRETS_DIR="config/tinyauth/secrets/oidc"
 readonly ENV_FILE="config/tinyauth/tinyauth.env"
 readonly LDAP_SECRET_FILE="config/tinyauth/secrets/ldap-observer"
-readonly LLDAP_CONFIG_FILE="config/lldap/lldap_config.toml"
-readonly CONSUL_AGENT_HCL_HOST="config/consul/secrets/agent.hcl"
-readonly CONSUL_MANAGEMENT_FILE="config/tinyauth/secrets/consul-management-token"
+readonly LDAP_PASSWORD_FILE="config/ldap/secrets/user-pass"
 
 readonly DEFAULT_LDAP_ADDRESS="ldap://lldap:3890"
 readonly DEFAULT_BASE_DN="dc=home,dc=lan"
@@ -120,6 +124,23 @@ resolve_stack_domain() {
   stack_domain_source="default"
 }
 
+# Resolve the four capability flags from the environment and the root .env.
+# An environment value wins. A missing key defaults to 0.
+resolve_capability_flags() {
+  local flag
+  for flag in CONSUL_ENABLED LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED; do
+    local value="${!flag:-}"
+    if [ -z "$value" ] && [ -f .env ]; then
+      value="$(read_env_value "$flag" .env)"
+    fi
+    case "${value:-0}" in
+    1) printf -v "$flag" '%s' 1 ;;
+    *) printf -v "$flag" '%s' 0 ;;
+    esac
+  done
+  readonly CONSUL_ENABLED LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
+}
+
 # Print an STE error for an invalid stack domain and exit 1.
 stack_domain_invalid() {
   echo "error: '$stack_domain' is not a valid stack domain. Use letters, digits, dots, and hyphens." >&2
@@ -135,20 +156,11 @@ stack_domain_invalid() {
   exit 1
 }
 
-# Read the Consul initial management token from the local consul config.
-# Print nothing when the file or the key is missing.
-read_consul_management() {
-  [ -r "$CONSUL_AGENT_HCL_HOST" ] || return 0
-  { grep -E '^[[:space:]]*initial_management[[:space:]]*=' "$CONSUL_AGENT_HCL_HOST" || true; } |
-    head -n1 | cut -d'"' -f2
-}
-
-# Print the value of one key from the local LLDAP config file.
-# The wizard writes that file with a double-quoted value on one line.
-read_lldap_config_value() {
-  local key="$1"
-  [ -f "$LLDAP_CONFIG_FILE" ] || return 0
-  { grep -E "^${key} = " "$LLDAP_CONFIG_FILE" || true; } | head -n1 | cut -d'"' -f2
+# Print the LDAP admin password from the shared secrets tree.
+# Print nothing when the file is missing.
+read_ldap_admin_password() {
+  [ -r "$LDAP_PASSWORD_FILE" ] || return 0
+  cat "$LDAP_PASSWORD_FILE"
 }
 
 # Resolve a removal target and make sure it stays inside the base directory.
@@ -425,12 +437,26 @@ if ! command -v openssl >/dev/null 2>&1; then
   exit 1
 fi
 
-# Step 2: resolve and validate the stack domain before writing anything.
+# Step 2: resolve and validate the stack domain and the capability flags.
 resolve_stack_domain
 if ! is_valid_stack_domain "$stack_domain"; then
   stack_domain_invalid
 fi
-readonly ISSUER="https://tinyauth.${stack_domain}"
+resolve_capability_flags
+if [ "$CONSUL_ENABLED" = "1" ] && [ "$LITEFS_ENABLED" = "1" ]; then
+  integrated=1
+else
+  integrated=0
+fi
+readonly integrated
+
+# A standalone instance without OIDC uses a local issuer.
+if [ "$OIDC_ENABLED" = "1" ]; then
+  ISSUER="https://tinyauth.${stack_domain}"
+else
+  ISSUER="http://127.0.0.1:3000"
+fi
+readonly ISSUER
 readonly DISCOVERY_URL="${ISSUER}/.well-known/openid-configuration"
 
 # Step 3: resolve the LDAP source and the base DN.
@@ -461,12 +487,15 @@ else
 fi
 
 if [ "$local_ldap" -eq 1 ]; then
-  base_dn="$(read_lldap_config_value ldap_base_dn)"
+  base_dn="${TINYAUTH_LDAP_BASEDN:-}"
   if [ -t 0 ] && [ -z "$base_dn" ]; then
     if ! read -r -p "LDAP base DN? [$DEFAULT_BASE_DN] " answer; then
       answer=""
     fi
     base_dn="${answer:-$DEFAULT_BASE_DN}"
+  fi
+  if [ -z "$base_dn" ]; then
+    base_dn="$DEFAULT_BASE_DN"
   fi
 else
   if [ -t 0 ]; then
@@ -531,23 +560,9 @@ fi
 mkdir -p "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
 chmod 0700 "$CONFIG_DIR" "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
 
-# Keep a dedicated copy of the Consul management token in this service's
-# secrets tree. The entrypoint uses it to bootstrap the litefs token.
-# A re-run keeps an existing file.
-if [ ! -s "$CONSUL_MANAGEMENT_FILE" ]; then
-  consul_management="$(read_consul_management)"
-  if [ -n "${TINYAUTH_CONSUL_MANAGEMENT:-}" ]; then
-    consul_management="$TINYAUTH_CONSUL_MANAGEMENT"
-  fi
-  if [ -n "$consul_management" ]; then
-    write_secret_file "$CONSUL_MANAGEMENT_FILE" "$consul_management"
-    echo "Copied the consul management token to $CONSUL_MANAGEMENT_FILE."
-  else
-    echo "warning: the consul management token is missing." >&2
-    echo "hint: write a management token to $CONSUL_MANAGEMENT_FILE," >&2
-    echo "hint: or write a prepared litefs token to config/tinyauth/secrets/litefs-token." >&2
-  fi
-fi
+# The Consul management token stays in the shared consul secrets tree.
+# The entrypoint reads initial_management at container start.
+# This wizard never copies the token into the tinyauth secrets tree.
 
 observer_dn=""
 observer_password=""
@@ -561,52 +576,57 @@ else
   observer_dn="uid=${OBSERVER_USER},ou=people,${base_dn}"
   observer_password="$(openssl rand -hex 24)"
 
-  admin_pass="$(read_lldap_config_value ldap_user_pass)"
-  admin_user="${LLDAP_ADMIN_USER:-$DEFAULT_ADMIN_USER}"
-  LLDAP_HTTP_URL="${LLDAP_HTTP_URL:-$DEFAULT_LLDAP_HTTP_URL}"
-  export LLDAP_HTTP_URL
+  if [ "$integrated" -eq 1 ]; then
+    admin_pass="$(read_ldap_admin_password)"
+    admin_user="${LLDAP_ADMIN_USER:-$DEFAULT_ADMIN_USER}"
+    LLDAP_HTTP_URL="${LLDAP_HTTP_URL:-$DEFAULT_LLDAP_HTTP_URL}"
+    export LLDAP_HTTP_URL
 
-  auto_ok=0
-  if [ "$observer_auto" -eq 1 ] && [ -n "$admin_pass" ]; then
-    if auto_create_observer "$admin_user" "$admin_pass" "$base_dn"; then
-      auto_ok=1
+    auto_ok=0
+    if [ "$observer_auto" -eq 1 ] && [ -n "$admin_pass" ]; then
+      if auto_create_observer "$admin_user" "$admin_pass" "$base_dn"; then
+        auto_ok=1
+      fi
     fi
-  fi
 
-  if [ "$auto_ok" -eq 1 ]; then
-    echo "Created the observer user in LLDAP."
-    echo "Added the observer user to the $OBSERVER_GROUP group."
-    echo "Set the observer password with the LLDAP password helper."
-  else
-    if [ "$observer_auto" -eq 1 ]; then
-      echo "warning: Automatic observer creation did not finish." >&2
-    fi
-    print_manual_observer_steps
-    if [ -t 0 ]; then
-      if ! read -r -p "Observer bind DN? [$observer_dn] " answer; then
-        answer=""
-      fi
-      observer_dn="${answer:-$observer_dn}"
-      if ! read -r -s -p "Observer password? " answer; then
-        echo >&2
-        echo "error: No observer password was entered." >&2
-        exit 1
-      fi
-      echo >&2
-      [ -n "$answer" ] || {
-        echo "error: No observer password was entered." >&2
-        exit 1
-      }
-      observer_password="$answer"
+    if [ "$auto_ok" -eq 1 ]; then
+      echo "Created the observer user in LLDAP."
+      echo "Added the observer user to the $OBSERVER_GROUP group."
+      echo "Set the observer password with the LLDAP password helper."
     else
-      observer_dn="${TINYAUTH_LDAP_BINDDN:-$observer_dn}"
-      observer_password="${TINYAUTH_LDAP_BINDPASSWORD:-}"
-      if [ -z "$observer_password" ]; then
-        echo "error: TINYAUTH_LDAP_BINDPASSWORD is not set." >&2
-        echo "error: Set it or run the wizard on a terminal." >&2
-        exit 1
+      if [ "$observer_auto" -eq 1 ]; then
+        echo "warning: Automatic observer creation did not finish." >&2
+      fi
+      print_manual_observer_steps
+      if [ -t 0 ]; then
+        if ! read -r -p "Observer bind DN? [$observer_dn] " answer; then
+          answer=""
+        fi
+        observer_dn="${answer:-$observer_dn}"
+        if ! read -r -s -p "Observer password? " answer; then
+          echo >&2
+          echo "error: No observer password was entered." >&2
+          exit 1
+        fi
+        echo >&2
+        [ -n "$answer" ] || {
+          echo "error: No observer password was entered." >&2
+          exit 1
+        }
+        observer_password="$answer"
+      else
+        observer_dn="${TINYAUTH_LDAP_BINDDN:-$observer_dn}"
+        observer_password="${TINYAUTH_LDAP_BINDPASSWORD:-}"
+        if [ -z "$observer_password" ]; then
+          echo "error: TINYAUTH_LDAP_BINDPASSWORD is not set." >&2
+          echo "error: Set it or run the wizard on a terminal." >&2
+          exit 1
+        fi
       fi
     fi
+  else
+    echo "Standalone mode. Skipped the observer creation in LLDAP."
+    echo "hint: register $OBSERVER_USER in your LDAP server when you enable LDAP."
   fi
   write_secret_file "$LDAP_SECRET_FILE" "$observer_password"
 fi
@@ -774,12 +794,20 @@ echo "  $LDAP_SECRET_FILE (observer secret $observer_state)"
 echo "  $OIDC_SECRETS_DIR (OIDC keys and client secrets, mode 0600)"
 echo "Issuer: $ISSUER"
 echo "Discovery URL: $DISCOVERY_URL"
+echo "OIDC enabled: $OIDC_ENABLED"
+echo "TLS enabled: $TLS_ENABLED"
 echo "LDAP address: $ldap_address"
 echo "Base DN: $base_dn"
-echo "hint: LiteFS elects a primary through a consul lease (key tinyauth/litefs)."
-echo "hint: only the litefs primary can write the database."
-echo "hint: LiteFS replicates only the SQLite database."
+if [ "$integrated" -eq 1 ]; then
+  echo "Mode: integrated. LiteFS and consul are enabled."
+  echo "hint: LiteFS elects a primary through a consul lease (key tinyauth/litefs)."
+  echo "hint: only the litefs primary can write the database."
+  echo "hint: LiteFS replicates only the SQLite database."
+  echo "hint: copy the same OIDC key files to every node before you start a second node."
+else
+  echo "Mode: standalone. No peer, consul, or LiteFS is required."
+  echo "hint: the app writes to a local SQLite database."
+fi
 echo "hint: the OIDC key files live in the backed-up secrets tree at $OIDC_SECRETS_DIR (mounted at /etc/tinyauth/secrets/oidc)."
-echo "hint: copy the same key files to every node before you start a second node."
 echo "Next step: docker compose up -d tinyauth"
 echo "hint: the caddy service owns the virtual host for tinyauth.$stack_domain."

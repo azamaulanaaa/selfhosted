@@ -1,13 +1,15 @@
 services:
-  # Tinyauth, wrapped with LiteFS. LiteFS replicates the SQLite database only.
-  # LiteFS does not replicate the OIDC key files. The key files live in the
-  # backed-up secrets tree at /etc/tinyauth/secrets/oidc. Copy the same key
-  # files to every node before you start a second node. A single node is the
-  # LiteFS primary. Only the primary can write the database. Consul ACLs
-  # protect the litefs lease (key "tinyauth/litefs"). The entrypoint creates
-  # the token. Caddy proxies tinyauth:3000 on the shared network at
+  # Tinyauth serves on port 3000. In integrated mode, LiteFS wraps the app and
+  # replicates the SQLite database only. LiteFS does not replicate the OIDC
+  # key files. The keys live in the backed-up secrets tree at
+  # /etc/tinyauth/secrets/oidc. Copy the same keys to every node before you
+  # start a second node. A single node is the LiteFS primary. Only the primary
+  # can write the database. Consul ACLs protect the litefs lease (key
+  # "tinyauth/litefs"). The entrypoint creates the token. In standalone mode,
+  # the app runs directly on local SQLite with no peer, consul, or FUSE.
+  # Caddy proxies tinyauth:3000 on the shared network at
   # tinyauth.<STACK_DOMAIN>. Port 20202 is published for LiteFS peers.
-  # The LDAP port is not published either.
+  # The LDAP port is not published.
   tinyauth:
     image: tinyauth-litefs:local
     build:
@@ -15,18 +17,26 @@ services:
     # The image is built locally. Never pull it from a registry.
     container_name: tinyauth
     volumes:
-      # LiteFS token, Consul token and OIDC key files. The entrypoint creates
-      # the LiteFS token at boot and reuses it. The wizard writes the Consul
-      # management token. The OIDC keys live in the backed-up secrets tree;
-      # copy the same key files to every node before you start a second node.
-      # The directory needs write access so the entrypoint can store the token.
+      # LiteFS token and OIDC key files. The entrypoint creates the LiteFS
+      # token at boot and reuses it. The wizard creates the OIDC keys in the
+      # backed-up secrets tree. Copy the same keys to every node before you
+      # start a second node. The directory needs write access so the
+      # entrypoint can store the token.
       - ./config/tinyauth/secrets:/etc/tinyauth/secrets:rw
+      # The consul management token stays in the shared consul secrets tree.
+      # The entrypoint reads initial_management from agent.hcl at container start.
+      - ./config/consul/secrets:/etc/tinyauth/consul-secrets:ro
       # LiteFS internal data (LTX files). Back this up.
       - ./data/tinyauth/store:/var/lib/litefs:rw
     environment:
       - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
       - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
       - CONSUL_HTTP_ADDR=${CONSUL_HTTP_ADDR:-http://consul:8500}
+      # Capability flags. Every flag at 0 gives standalone mode with no peer.
+      - CONSUL_ENABLED=${CONSUL_ENABLED:-0}
+      - LITEFS_ENABLED=${LITEFS_ENABLED:-0}
+      - OIDC_ENABLED=${OIDC_ENABLED:-0}
+      - TLS_ENABLED=${TLS_ENABLED:-0}
     env_file:
       # Wizard-generated. Holds TINYAUTH_* keys and *_FILE paths only.
       - ./config/tinyauth/tinyauth.env

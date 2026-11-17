@@ -7,12 +7,12 @@ if ! command -v git >/dev/null 2>&1; then
   exit 1
 fi
 
+cd "$(git rev-parse --show-toplevel)"
+
 if ! command -v markdownlint-cli2 >/dev/null 2>&1; then
   echo "error: markdownlint-cli2 is not on PATH. Install markdownlint-cli2 first." >&2
   exit 1
 fi
-
-cd "$(git rev-parse --show-toplevel)"
 
 # The changelog is generated, so the check skips it.
 mapfile -d '' -t files < <(

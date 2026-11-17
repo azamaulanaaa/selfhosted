@@ -10,16 +10,16 @@ help: ## Show this help.
 ci: ## Run every check.
 	scripts/ci.sh
 
-smolvm: ## Run the checks inside a smolvm microVM, or on the host as a fallback.
+smolvm: ## Run the checks inside a smolvm microVM, local or remote.
 	scripts/smolvm.sh
 
 smolvm-pack: ## Build the cached smolvm pack for the microVM.
 	smol/pack-build.sh
 
-smolvm-clean: ## Remove the cached smolvm packs and delete dangling smolvm machines.
-	scripts/smolvm-clean.sh
+smolvm-clean: ## Remove this checkout's smolvm cache and machines after confirmation (ARGS='...').
+	scripts/smolvm-clean.sh $(ARGS)
 
-smolvm-exec: ## Run an arbitrary command inside the microVM (ARGS='...').
+smolvm-exec: ## Run a command inside the microVM, local or remote (ARGS='...').
 	@scripts/smolvm-exec.sh "$(ARGS)"
 
 smolvm-preflight: ## Probe whether this host is ready for the smolvm microVM.
@@ -78,7 +78,7 @@ format-dclint: ## Fix the Docker Compose files with dclint.
 
 hooks: ## Install the git hooks in .githook.
 	git config core.hooksPath .githook
-	chmod +x .githook/commit-msg .githook/pre-commit .githook/pre-push
+	chmod +x .githook/pre-commit .githook/pre-push
 
-release: ## Bump the version and update the changelog.
-	cog bump --auto
+release: ## Bump the version and update the changelog in the sandbox when smolvm is available.
+	scripts/release.sh $(ARGS)

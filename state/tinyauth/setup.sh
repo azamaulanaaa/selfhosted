@@ -600,6 +600,10 @@ else
 
   if [ "$integrated" -eq 1 ]; then
     admin_pass="$(read_ldap_admin_password)"
+    if [ -z "$admin_pass" ] && [ "$observer_auto" -eq 1 ]; then
+      echo "warning: the LDAP password at $LDAP_PASSWORD_FILE is missing." >&2
+      echo "hint: run the lldap wizard to write the password file." >&2
+    fi
     admin_user="${LLDAP_ADMIN_USER:-$DEFAULT_ADMIN_USER}"
     LLDAP_HTTP_URL="${LLDAP_HTTP_URL:-$DEFAULT_LLDAP_HTTP_URL}"
     export LLDAP_HTTP_URL

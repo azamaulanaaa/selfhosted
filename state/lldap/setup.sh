@@ -14,7 +14,7 @@
 #
 # Non-interactive environment variables:
 #   LLDAP_BASE_DN     LDAP base DN. Required when stdin is not a TTY.
-#                     Interactive default: dc=home,dc=lan.
+#                     Interactive default: dc=sh,dc=lan.
 #   LLDAP_ADMIN_USER  Admin username. Default: admin.
 #   STACK_DOMAIN      Stack domain. The HTTP URL becomes http://lldap.<domain>.
 #                     Read from the environment, then from the root .env, then
@@ -41,7 +41,7 @@ readonly KEY_SEED_FILE="${SECRETS_DIR}/key_seed"
 readonly USER_PASS_FILE="${SECRETS_DIR}/ldap_user_pass"
 
 readonly DB_PATH="sqlite:///data/lldap.sqlite?mode=rwc"
-readonly DEFAULT_BASE_DN="dc=home,dc=lan"
+readonly DEFAULT_BASE_DN="dc=sh,dc=lan"
 readonly DEFAULT_ADMIN_USER="admin"
 readonly DEFAULT_STACK_DOMAIN="sh.lan"
 

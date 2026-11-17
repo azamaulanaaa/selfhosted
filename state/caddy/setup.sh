@@ -544,13 +544,19 @@ if [ "$tls_mode" = "existing" ]; then
   else
     certs_spec="${CADDY_TLS_CERTS:-}"
     if [ -z "$certs_spec" ]; then
+      keep_ok=1
+      for vhost in $TLS_VHOSTS; do
+        if ! [ -r "config/caddy/certs/$vhost/fullchain.pem" ] || ! [ -r "config/caddy/certs/$vhost/privkey.pem" ]; then
+          keep_ok=0
+        fi
+      done
       if [ -r config/caddy/certs/wildcard/fullchain.pem ] && [ -r config/caddy/certs/wildcard/privkey.pem ]; then
         tls_cert_layout="wildcard"
-      elif [ -r config/caddy/certs/consul/fullchain.pem ] && [ -r config/caddy/certs/consul/privkey.pem ] && [ -r config/caddy/certs/lldap/fullchain.pem ] && [ -r config/caddy/certs/lldap/privkey.pem ]; then
+      elif [ "$keep_ok" -eq 1 ]; then
         tls_cert_layout="per-vhost"
       else
         echo "error: CADDY_TLS_CERTS is required when CADDY_TLS_MODE=existing and no certs are present." >&2
-        echo "error: Use 'wildcard', 'wildcard:<fullchain>:<key>', or 'consul:<fullchain>:<key>,lldap:<fullchain>:<key>'." >&2
+        echo "error: Use 'wildcard', 'wildcard:<fullchain>:<key>', or '$TLS_CERTS_EXAMPLE'." >&2
         exit 1
       fi
     else
@@ -573,10 +579,8 @@ if [ "$tls_mode" = "existing" ]; then
         tls_cert_layout="wildcard"
         cert_copies+=("wildcard|$wildcard_fc|$wildcard_key")
         ;;
-      consul:* | lldap:* | *:*)
+      *:*)
         tls_cert_layout="per-vhost"
-        seen_consul=0
-        seen_lldap=0
         old_ifs="$IFS"
         IFS=','
         # Split the pairs on commas.
@@ -587,30 +591,38 @@ if [ "$tls_mode" = "existing" ]; then
           pair_rest="${pair#*:}"
           fc_path="${pair_rest%%:*}"
           key_path="${pair_rest##*:}"
-          case "$vhost" in
-          consul | lldap) ;;
-          *)
-            echo "error: CADDY_TLS_CERTS contains the unknown vhost '$vhost'. Use consul and lldap." >&2
+          vhost_ok=0
+          for allowed in $TLS_VHOSTS; do
+            if [ "$vhost" = "$allowed" ]; then
+              vhost_ok=1
+            fi
+          done
+          if [ "$vhost_ok" -eq 0 ]; then
+            echo "error: CADDY_TLS_CERTS contains the unknown vhost '$vhost'. Use $TLS_VHOSTS_LIST." >&2
             exit 1
-            ;;
-          esac
+          fi
           if [ -z "$fc_path" ] || [ -z "$key_path" ] || [ "$fc_path" = "$pair_rest" ] || [ ! -r "$fc_path" ] || [ ! -r "$key_path" ]; then
             echo "error: CADDY_TLS_CERTS entry '$pair' needs two readable paths." >&2
             exit 1
           fi
           cert_copies+=("$vhost|$fc_path|$key_path")
-          case "$vhost" in
-          consul) seen_consul=1 ;;
-          lldap) seen_lldap=1 ;;
-          esac
         done
-        if [ "$seen_consul" -eq 0 ] || [ "$seen_lldap" -eq 0 ]; then
-          echo "error: CADDY_TLS_CERTS per-vhost needs both consul:<fullchain>:<key> and lldap:<fullchain>:<key>." >&2
-          exit 1
-        fi
+        for vhost in $TLS_VHOSTS; do
+          found=0
+          for entry in "${cert_copies[@]}"; do
+            if [ "${entry%%|*}" = "$vhost" ]; then
+              found=1
+              break
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "error: CADDY_TLS_CERTS per-vhost needs a pair for every vhost: $TLS_CERTS_EXAMPLE." >&2
+            exit 1
+          fi
+        done
         ;;
       *)
-        echo "error: CADDY_TLS_CERTS must be 'wildcard', 'wildcard:<fullchain>:<key>', or 'consul:<fullchain>:<key>,lldap:<fullchain>:<key>'." >&2
+        echo "error: CADDY_TLS_CERTS must be 'wildcard', 'wildcard:<fullchain>:<key>', or '$TLS_CERTS_EXAMPLE'." >&2
         exit 1
         ;;
       esac

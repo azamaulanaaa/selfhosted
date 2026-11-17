@@ -1,0 +1,4 @@
+# The build context is state/caddy. Only entrypoint.sh is copied into the image.
+# Ignore everything else: the build must never see local state or secrets.
+*
+!entrypoint.sh

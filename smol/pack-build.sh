@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 # Build the cached smolvm pack for the checks.
 # The pack holds the debian base image, mise, and the tools from
-# mise.toml. The repository is mounted at run time. It is not baked in.
+# mise.toml. smol/init.sh provisions the guest. The repository is
+# mounted at run time. It is not baked in. The build refuses to run
+# when SMOLVM_ADDR is set.
+# CPU and memory come from SMOLVM_CPUS and SMOLVM_MEMORY_MB.
 # Exit 0 without a pack when smolvm or the host accelerator is not available.
 set -euo pipefail
+
+if [[ -n "${SMOLVM_ADDR:-}" ]]; then
+  echo "error: smolvm-pack does not run when you set SMOLVM_ADDR. Unset the variable to build a local pack." >&2
+  exit 1
+fi
 
 if ! command -v git >/dev/null 2>&1; then
   echo "error: git is not on PATH. Install git first." >&2
@@ -11,6 +19,12 @@ if ! command -v git >/dev/null 2>&1; then
 fi
 
 cd "$(git rev-parse --show-toplevel)"
+
+# shellcheck source=scripts/smolvm-resources.sh
+source scripts/smolvm-resources.sh
+if ! smolvm_resources_resolve; then
+  exit 1
+fi
 
 print_warning() {
   cat >&2 <<'EOF'
@@ -57,7 +71,7 @@ fi
 
 hash="${1:-}"
 if [[ -z "$hash" ]]; then
-  hash="$(sha256sum mise.toml smol/*.smolfile | sha256sum | cut -d' ' -f1)"
+  hash="$(smolvm_resources_hash_lines | sha256sum | cut -d' ' -f1)"
 fi
 
 pack_dir=".cache/smolvm"
@@ -70,7 +84,9 @@ fi
 
 mkdir -p "$pack_dir"
 
-build_name="smolvm-build-${hash:0:16}"
+owner="$(smolvm_resources_owner_resolve "$PWD" 0)" || exit 1
+build_name="smolvm-build-${owner}-${hash:0:16}"
+smolfile_dir=""
 
 # Delete with --force --cascade, as the smolvm makefile does. Without
 # these flags, the delete can fail silently and leave the machine
@@ -80,6 +96,10 @@ cleanup_build() {
   smolvm machine stop --name "$build_name" >/dev/null 2>&1 || true
   smolvm machine delete --name "$build_name" --force --cascade >/dev/null 2>&1 || true
   rm -f "${pack_dir}/ci-${hash}" "${pack_dir}/ci-${hash}.smolmachine"
+  if [[ -n "$smolfile_dir" ]]; then
+    rm -rf -- "$smolfile_dir"
+    smolfile_dir=""
+  fi
 }
 trap cleanup_build EXIT
 
@@ -94,66 +114,25 @@ guest_df() {
 # Remove a leftover build machine from an earlier failed run.
 smolvm machine delete --name "$build_name" --force --cascade >/dev/null 2>&1 || true
 
+# Render the smolfile with the selected CPU and memory values.
+# The base file holds placeholders that smolvm cannot read from the
+# environment. The rendered file lives in a temporary directory.
+smolfile_dir="$(mktemp -d "${TMPDIR:-/tmp}/smolvm-smolfile.XXXXXX")"
+smolvm_resources_render_smolfile "${smolfile_dir}/base.smolfile"
+
 # Create the build machine with the repository mounted at /workspace.
 # The mount is read-only. The build only reads mise.toml.
-smolvm machine create --name "$build_name" --smolfile smol/base.smolfile \
+smolvm machine create --name "$build_name" --smolfile "${smolfile_dir}/base.smolfile" \
   -v "$PWD":/workspace:ro
+rm -rf -- "$smolfile_dir"
+smolfile_dir=""
 smolvm machine start --name "$build_name"
 
-# Run each provisioning step on its own. A failed step stops the build.
-# A failed step prints the guest disk usage before the script exits.
-smolvm machine exec --name "$build_name" -- bash -lc \
-  'export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends bash ca-certificates curl git && rm -rf /var/lib/apt/lists/*' ||
-  {
-    rc=$?
-    guest_df
-    exit "$rc"
-  }
-smolvm machine exec --name "$build_name" -- bash -lc \
-  'curl --fail --location --silent --show-error https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh' ||
-  {
-    rc=$?
-    guest_df
-    exit "$rc"
-  }
-smolvm machine exec --name "$build_name" -- bash -lc \
-  'cd /workspace && mise install' ||
-  {
-    rc=$?
-    guest_df
-    exit "$rc"
-  }
-# Delete the mise download cache. The cache is dead weight in the pack.
-# The install is done at this point. Installed tools are not removed.
-smolvm machine exec --name "$build_name" -- bash -lc \
-  'mise cache clear' ||
-  {
-    rc=$?
-    guest_df
-    exit "$rc"
-  }
-smolvm machine exec --name "$build_name" -- bash -lc \
-  'git config --global --add safe.directory /workspace' ||
-  {
-    rc=$?
-    guest_df
-    exit "$rc"
-  }
-# Add the mise shims to the login shell PATH and link the shims into
-# /usr/local/bin. The login shell covers bash -lc. The links cover
-# every other shell shape.
-# The commands expand on the guest, not on this host.
-# shellcheck disable=SC2016
-smolvm machine exec --name "$build_name" -- bash -lc \
-  'shim_dir="$HOME/.local/share/mise/shims"; mkdir -p /etc/profile.d; printf "export PATH=\"%s:\$PATH\"\n" "$shim_dir" > /etc/profile.d/mise.sh' ||
-  {
-    rc=$?
-    guest_df
-    exit "$rc"
-  }
-# shellcheck disable=SC2016
-smolvm machine exec --name "$build_name" -- bash -lc \
-  'shim_dir="$HOME/.local/share/mise/shims"; for shim in "$shim_dir"/*; do [ -e "$shim" ] || continue; ln -sf "$shim" "/usr/local/bin/$(basename "$shim")"; done' ||
+# Provision the guest with the shared init script.
+# The script holds every provisioning step for the local pack build and
+# the remote run. A failed step prints the guest disk usage before the
+# build exits.
+smolvm machine exec --name "$build_name" -- bash /workspace/smol/init.sh ||
   {
     rc=$?
     guest_df
@@ -167,7 +146,8 @@ smolvm machine stop --name "$build_name"
 # <output>.smolmachine is created automatically. --single-file does
 # not bypass the output validation, so it is not passed. An -o value
 # that ends in .smolmachine is rejected.
-smolvm pack create --from-vm "$build_name" --cpus 1 --mem 512 \
+smolvm pack create --from-vm "$build_name" \
+  --cpus "$SMOLVM_CPUS_VALUE" --mem "$SMOLVM_MEMORY_MB_VALUE" \
   -o "${pack_dir}/ci-${hash}"
 
 # Disarm the trap first. The pack is never discarded by the trap,

@@ -1,8 +1,7 @@
-# Rendered by consul-template from state/forgejo/app.ini.tpl. Do not edit.
-# The wizard writes the answers to config/forgejo/forgejo.env. compose loads
-# that file into the container. consul-template reads the env values with the
-# env function and reads the two secret files with the file function.
-# No provider name is fixed here. The operator chooses it in the wizard.
+# Rendered from state/forgejo/app.ini.tpl. Do not edit.
+# consul-template renders this file in integrated mode. state/forgejo/render.sh
+# renders it in standalone mode. The renderer reads non-secret values from the
+# environment and reads secrets from 0600 files through their *_FILE paths.
 # Forgejo reads app.ini at startup. A restart is required after a re-render.
 
 [DEFAULT]
@@ -12,8 +11,12 @@ RUN_MODE = prod
 
 [server]
 PROTOCOL = http
-DOMAIN = {{ env "STACK_DOMAIN" }}
-ROOT_URL = https://forgejo.{{ env "STACK_DOMAIN" }}/
+DOMAIN = {{ or (env "STACK_DOMAIN") "sh.lan" }}
+{{ if eq (env "CONSUL_ENABLED") "1" }}
+ROOT_URL = https://forgejo.{{ or (env "STACK_DOMAIN") "sh.lan" }}/
+{{ else }}
+ROOT_URL = http://{{ env "PUBLIC_IP" }}:3000/
+{{ end }}
 HTTP_ADDR = 0.0.0.0
 HTTP_PORT = 3000
 OFFLINE_MODE = true
@@ -30,11 +33,11 @@ SCRIPT_TYPE = bash
 INSTALL_LOCK = true
 SECRET_KEY = {{ file "/etc/forgejo/secrets/secret-key" | trimSpace }}
 
+{{ if eq (env "OIDC_ENABLED") "1" }}
 [oauth2]
 ENABLED = true
 
 [oauth2.client]
-# A generic OpenID Connect client. No service name is hardcoded.
 NAME = {{ or (env "FORGEJO_OIDC_PROVIDER_NAME") "oidc" }}
 PROVIDER = openidConnect
 CLIENT_ID = {{ env "FORGEJO_OIDC_CLIENT_ID" }}
@@ -42,3 +45,7 @@ CLIENT_SECRET = {{ file "/etc/forgejo/secrets/oidc-client-secret" | trimSpace }}
 OPENID_CONNECT_URL = {{ env "FORGEJO_OIDC_ISSUER_URL" }}
 ENABLE_AUTO_REGISTRATION = {{ or (env "FORGEJO_OIDC_AUTO_REGISTER") "false" }}
 OPENID_CONNECT_SCOPES = openid,profile,email
+{{ else }}
+[oauth2]
+ENABLED = false
+{{ end }}

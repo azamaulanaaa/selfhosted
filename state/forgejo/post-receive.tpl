@@ -1,10 +1,11 @@
 {{ "#!/bin/sh" }}
-# Rendered by consul-template from state/forgejo/post-receive.tpl. Do not edit.
+# Rendered from state/forgejo/post-receive.tpl. Do not edit.
 # Forgejo wraps this hook with its own post-receive dispatcher. This script is
-# executed for every push on every repository. It pushes the updated repository
-# to each peer that publishes an advertise URL under forgejo/peers in Consul KV.
-# consul-template re-renders this file when the peer list changes.
-# Authentication uses the git credential helper of the Forgejo user.
+# executed for every push on every repository. In integrated mode the peer
+# block below pushes the updated repository to the other peers that publish an
+# advertise URL under forgejo/peers in Consul KV. consul-template re-renders
+# this file when the peer list changes. In standalone mode the peer block is
+# removed and the hook does nothing.
 
 set -u
 
@@ -14,6 +15,7 @@ repo_name=${repo_name%.git}
 owner=${repo_path%/*}
 owner=${owner##*/}
 
+# BEGIN CONSUL PEER BLOCK
 {{ $local_ip := env "PUBLIC_IP" }}
 {{ $git_port := or (env "FORGEJO_PEER_GIT_PORT") "3000" }}
 {{ range tree "forgejo/peers" }}
@@ -29,5 +31,6 @@ git push --mirror "http://{{ $peer_ip }}:{{ $git_port }}/${owner}/${repo_name}.g
 {{ end }}
 {{ end }}
 {{ end }}
+# END CONSUL PEER BLOCK
 
 exit 0

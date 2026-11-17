@@ -74,6 +74,8 @@ WORKDIR /srv
 RUN mkdir -p /etc/consul-template/templates /run/forgejo
 
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
+# The standalone renderer does not need a Consul agent.
+COPY --chmod=0755 render.sh /usr/local/bin/render.sh
 
 # The base image sets CMD to its own s6 supervisor. Clear it so that the base
 # CMD is not passed as arguments to this entrypoint.

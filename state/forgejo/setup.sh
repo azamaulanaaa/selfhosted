@@ -14,6 +14,9 @@
 # Non-interactive environment variables:
 #   STACK_DOMAIN              Base domain for the stack. Read from the environment,
 #                             then the root .env, then sh.lan.
+#   OIDC_ENABLED              Set to 1 to require OIDC answers. Default 0.
+#   CONSUL_ENABLED            Set to 1 with LITEFS_ENABLED for integrated mode.
+#   LITEFS_ENABLED            Set to 1 with CONSUL_ENABLED for integrated mode.
 #   FORGEJO_APP_NAME          Display name for the forge. Default: Forgejo.
 #   FORGEJO_USE_LOCAL_CONSUL  1 to use this repo's consul service, 0 for a remote one.
 #                             Default 1.
@@ -49,6 +52,42 @@ readonly DEFAULT_STACK_DOMAIN="sh.lan"
 readonly DEFAULT_APP_NAME="Forgejo"
 readonly DEFAULT_OIDC_PROVIDER="oidc"
 readonly DEFAULT_PEER_GIT_PORT="3000"
+
+# Print one value from the root .env file. Print nothing when the key is absent.
+read_root_env_value() {
+  local key="$1" value
+  [ -f .env ] || return 0
+  value="$({ grep -E "^${key}=" .env || true; } | tail -n1 | cut -d= -f2-)"
+  value="${value%\"}"
+  value="${value#\"}"
+  value="${value%\'}"
+  value="${value#\'}"
+  printf '%s' "$value"
+}
+
+# Print 1 when a capability flag is on. Print 0 otherwise.
+resolve_flag() {
+  local key="$1" value
+  value="$(printenv "$key" 2>/dev/null || true)"
+  if [ -z "$value" ]; then
+    value="$(read_root_env_value "$key")"
+  fi
+  case "$value" in
+  1) printf '1' ;;
+  *) printf '0' ;;
+  esac
+}
+
+consul_enabled="$(resolve_flag CONSUL_ENABLED)"
+litefs_enabled="$(resolve_flag LITEFS_ENABLED)"
+oidc_enabled="$(resolve_flag OIDC_ENABLED)"
+readonly consul_enabled litefs_enabled oidc_enabled
+
+use_litefs=0
+if [ "$consul_enabled" -eq 1 ] && [ "$litefs_enabled" -eq 1 ]; then
+  use_litefs=1
+fi
+readonly use_litefs
 
 # Print the STACK_DOMAIN value from the root .env file.
 read_env_stack_domain() {
@@ -394,36 +433,38 @@ if [ -t 0 ]; then
   fi
   app_name="${name_answer:-$app_name}"
 
-  if ! read -r -p "OIDC issuer URL? " issuer_url; then
-    issuer_url=""
-  fi
-  if ! read -r -p "OIDC client ID? " client_id; then
-    client_id=""
-  fi
-  if ! read -r -s -p "OIDC client secret? " secret_answer; then
-    secret_answer=""
-  fi
-  echo >&2
-  if [ -n "$secret_answer" ]; then
-    client_secret="$secret_answer"
-  fi
+  if [ "$oidc_enabled" -eq 1 ]; then
+    if ! read -r -p "OIDC issuer URL? " issuer_url; then
+      issuer_url=""
+    fi
+    if ! read -r -p "OIDC client ID? " client_id; then
+      client_id=""
+    fi
+    if ! read -r -s -p "OIDC client secret? " secret_answer; then
+      secret_answer=""
+    fi
+    echo >&2
+    if [ -n "$secret_answer" ]; then
+      client_secret="$secret_answer"
+    fi
 
-  if ! read -r -p "Name shown for the OIDC provider? [$provider_name] " provider_answer; then
-    provider_answer=""
-  fi
-  provider_name="${provider_answer:-$provider_name}"
+    if ! read -r -p "Name shown for the OIDC provider? [$provider_name] " provider_answer; then
+      provider_answer=""
+    fi
+    provider_name="${provider_answer:-$provider_name}"
 
-  if ! read -r -p "Create accounts for new OIDC users? [y/N] " auto_answer; then
-    auto_answer=""
+    if ! read -r -p "Create accounts for new OIDC users? [y/N] " auto_answer; then
+      auto_answer=""
+    fi
+    case "${auto_answer:-N}" in
+    [Yy] | [Yy][Ee][Ss]) auto_register="yes" ;;
+    [Nn] | [Nn][Oo] | "") auto_register="no" ;;
+    *)
+      echo "error: Answer Y or N." >&2
+      exit 1
+      ;;
+    esac
   fi
-  case "${auto_answer:-N}" in
-  [Yy] | [Yy][Ee][Ss]) auto_register="yes" ;;
-  [Nn] | [Nn][Oo] | "") auto_register="no" ;;
-  *)
-    echo "error: Answer Y or N." >&2
-    exit 1
-    ;;
-  esac
 
   if ! read -r -p "Port used by peer git pushes? [$peer_git_port] " port_answer; then
     port_answer=""
@@ -478,25 +519,27 @@ else
 fi
 
 # Step 4: validate every answer before any file is written.
-if [ -z "$issuer_url" ]; then
-  echo "error: The OIDC issuer URL is not set." >&2
-  echo "error: Set FORGEJO_OIDC_ISSUER_URL or run the wizard on a terminal." >&2
-  exit 1
-fi
-if ! is_valid_issuer_url "$issuer_url"; then
-  echo "error: '$issuer_url' is not a valid OIDC issuer URL." >&2
-  echo "error: Use an HTTPS URL such as https://auth.example.com." >&2
-  exit 1
-fi
-if [ -z "$client_id" ]; then
-  echo "error: The OIDC client ID is not set." >&2
-  echo "error: Set FORGEJO_OIDC_CLIENT_ID or run the wizard on a terminal." >&2
-  exit 1
-fi
-if ! is_valid_client_id "$client_id"; then
-  echo "error: '$client_id' is not a valid OIDC client ID." >&2
-  echo "error: Use letters, digits, dots, underscores, and hyphens." >&2
-  exit 1
+if [ "$oidc_enabled" -eq 1 ]; then
+  if [ -z "$issuer_url" ]; then
+    echo "error: The OIDC issuer URL is not set." >&2
+    echo "error: Set FORGEJO_OIDC_ISSUER_URL or run the wizard on a terminal." >&2
+    exit 1
+  fi
+  if ! is_valid_issuer_url "$issuer_url"; then
+    echo "error: '$issuer_url' is not a valid OIDC issuer URL." >&2
+    echo "error: Use an HTTPS URL such as https://auth.example.com." >&2
+    exit 1
+  fi
+  if [ -z "$client_id" ]; then
+    echo "error: The OIDC client ID is not set." >&2
+    echo "error: Set FORGEJO_OIDC_CLIENT_ID or run the wizard on a terminal." >&2
+    exit 1
+  fi
+  if ! is_valid_client_id "$client_id"; then
+    echo "error: '$client_id' is not a valid OIDC client ID." >&2
+    echo "error: Use letters, digits, dots, underscores, and hyphens." >&2
+    exit 1
+  fi
 fi
 if [ -z "$provider_name" ] || ! is_valid_provider_name "$provider_name"; then
   echo "error: '$provider_name' is not a valid provider name." >&2
@@ -527,24 +570,27 @@ chmod 0700 "$STORE_DIR"
 
 # Step 6: write the secrets. Existing files are kept unless rotation or a new
 # value was asked for. Never print the values.
-oidc_state="kept"
-if [ -z "$client_secret" ]; then
-  if [ ! -s "$OIDC_SECRET_FILE" ]; then
-    echo "error: The OIDC client secret is not set." >&2
-    echo "error: Set FORGEJO_OIDC_CLIENT_SECRET or run the wizard on a terminal." >&2
-    exit 1
-  fi
-else
-  if [ ! -s "$OIDC_SECRET_FILE" ] || [ "$rotate" = "1" ]; then
-    if [ -s "$OIDC_SECRET_FILE" ]; then
-      oidc_state="rotated"
-    else
-      oidc_state="created"
+oidc_state="disabled"
+if [ "$oidc_enabled" -eq 1 ]; then
+  oidc_state="kept"
+  if [ -z "$client_secret" ]; then
+    if [ ! -s "$OIDC_SECRET_FILE" ]; then
+      echo "error: The OIDC client secret is not set." >&2
+      echo "error: Set FORGEJO_OIDC_CLIENT_SECRET or run the wizard on a terminal." >&2
+      exit 1
     fi
-    write_secret_file "$OIDC_SECRET_FILE" "$client_secret"
+  else
+    if [ ! -s "$OIDC_SECRET_FILE" ] || [ "$rotate" = "1" ]; then
+      if [ -s "$OIDC_SECRET_FILE" ]; then
+        oidc_state="rotated"
+      else
+        oidc_state="created"
+      fi
+      write_secret_file "$OIDC_SECRET_FILE" "$client_secret"
+    fi
   fi
+  chmod 0600 "$OIDC_SECRET_FILE"
 fi
-chmod 0600 "$OIDC_SECRET_FILE"
 
 secret_key_state="kept"
 if [ ! -s "$FORGEJO_SECRET_FILE" ] || [ "$rotate" = "1" ]; then
@@ -635,12 +681,14 @@ fi
   printf '# Generated by state/forgejo/setup.sh.\n'
   printf '# Do not commit this file. Secrets stay in 0600 files under secrets/.\n'
   printf 'FORGEJO_APP_NAME=%s\n' "$app_name"
-  printf 'FORGEJO_OIDC_ISSUER_URL=%s\n' "$issuer_url"
-  printf 'FORGEJO_OIDC_CLIENT_ID=%s\n' "$client_id"
-  printf 'FORGEJO_OIDC_PROVIDER_NAME=%s\n' "$provider_name"
-  printf 'FORGEJO_OIDC_AUTO_REGISTER=%s\n' "$auto_register"
+  if [ "$oidc_enabled" -eq 1 ]; then
+    printf 'FORGEJO_OIDC_ISSUER_URL=%s\n' "$issuer_url"
+    printf 'FORGEJO_OIDC_CLIENT_ID=%s\n' "$client_id"
+    printf 'FORGEJO_OIDC_PROVIDER_NAME=%s\n' "$provider_name"
+    printf 'FORGEJO_OIDC_AUTO_REGISTER=%s\n' "$auto_register"
+    printf 'FORGEJO_OIDC_CLIENT_SECRET_FILE=/etc/forgejo/secrets/oidc-client-secret\n'
+  fi
   printf 'FORGEJO_PEER_GIT_PORT=%s\n' "$peer_git_port"
-  printf 'FORGEJO_OIDC_CLIENT_SECRET_FILE=/etc/forgejo/secrets/oidc-client-secret\n'
   printf 'FORGEJO_SECRET_KEY_FILE=/etc/forgejo/secrets/secret-key\n'
 } >>"$tmp_env"
 chmod 0640 "$tmp_env"
@@ -648,23 +696,34 @@ mv "$tmp_env" "$ENV_FILE"
 
 # Step 9: print the summary. Never print secret values.
 echo "Configured the forgejo wizard files:"
-echo "  $CT_FILE"
 echo "  $ENV_FILE"
-echo "  $OIDC_SECRET_FILE (OIDC secret $oidc_state)"
 echo "  $FORGEJO_SECRET_FILE (Forgejo secret key $secret_key_state)"
+if [ "$oidc_enabled" -eq 1 ]; then
+  echo "  $OIDC_SECRET_FILE (OIDC secret $oidc_state)"
+  echo "  $CT_FILE"
+  echo "OIDC issuer: $issuer_url"
+  echo "OIDC client ID: $client_id"
+  echo "OIDC provider name: $provider_name"
+else
+  echo "OIDC is off. Forgejo uses built-in authentication."
+fi
 case "$token_state" in
 written) echo "  $CONSUL_TOKEN_FILE (written)" ;;
 kept) echo "  $CONSUL_TOKEN_FILE (kept)" ;;
 esac
-echo "OIDC issuer: $issuer_url"
-echo "OIDC client ID: $client_id"
-echo "OIDC provider name: $provider_name"
 echo "Peer git port: $peer_git_port"
 echo "Base domain: $stack_domain"
+if [ "$use_litefs" -eq 1 ]; then
+  echo "Mode: integrated with LiteFS and Consul."
+else
+  echo "Mode: standalone with local SQLite."
+fi
 if [ "$use_local_consul" -eq 1 ] && [ -f "$CONSUL_TOKEN_FILE" ]; then
   echo "warning: $CONSUL_TOKEN_FILE exists but the new configuration does not use it." >&2
 fi
-echo "hint: LiteFS elects a primary through a consul lease (key forgejo/litefs)."
-echo "hint: consul-template renders app.ini and the post-receive hook inside the container."
-echo "hint: the git hook launcher is installed in every repository by the entrypoint."
+if [ "$use_litefs" -eq 1 ]; then
+  echo "hint: LiteFS elects a primary through a consul lease (key forgejo/litefs)."
+  echo "hint: consul-template renders app.ini and the post-receive hook inside the container."
+  echo "hint: the git hook launcher is installed in every repository by the entrypoint."
+fi
 echo "Next step: docker compose up -d forgejo"

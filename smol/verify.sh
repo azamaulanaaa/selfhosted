@@ -30,6 +30,10 @@ fi
 
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
+# shellcheck source=scripts/smolvm-resources.sh
+source scripts/smolvm-resources.sh
+smolvm_resources_resolve || exit 2
+
 # Detect whether this host can run a smolvm machine.
 # Linux needs a readable /dev/kvm.
 # macOS on Apple Silicon uses the built-in hypervisor; kern.hv_support must be 1.
@@ -76,7 +80,7 @@ if ! command -v sha256sum >/dev/null 2>&1; then
   exit 1
 fi
 
-hash="$(sha256sum mise.toml smol/*.smolfile | sha256sum | cut -d' ' -f1)"
+hash="$(smolvm_resources_hash_lines | sha256sum | cut -d' ' -f1)"
 pack=".cache/smolvm/ci-${hash}.smolmachine"
 
 # Build the pack when it is missing, as the real run does.

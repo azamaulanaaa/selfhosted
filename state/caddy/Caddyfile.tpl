@@ -115,3 +115,11 @@ https://tinyauth.{{ env "STACK_DOMAIN" }} {
 {{ template "tls_for" "tinyauth" }}
 	{{ template "smart_proxy" (sprig_list "tinyauth" "http://tinyauth:3000" "[]") }}
 }
+
+# The forgejo code forge. It has a static upstream and no LiteFS primary.
+https://forgejo.{{ env "STACK_DOMAIN" }} {
+{{ template "tls_for" "forgejo" }}
+	reverse_proxy http://forgejo:3000 {
+		header_up Host {host}
+	}
+}

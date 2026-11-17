@@ -21,15 +21,59 @@ start the check pipeline. The `pre-commit` and `pre-push` hooks run
 call `mise`.
 
 `scripts/ci.sh` can hand the run to the smolvm microVM. After the
-`git` preflight, when `SMOLVM_ENABLED` is not `0` and `smolvm` is on
-`PATH` and the host accelerator is available (`/dev/kvm` on Linux,
-`kern.hv_support=1` on macOS with Apple Silicon), it runs
-`scripts/smolvm.sh` and the checks go to a microVM. Otherwise it
-prints a warning to stderr and runs the checks on the host. Set
-`SMOLVM_ENABLED=0` to force the host path. The microVM runs offline
-and mounts the repository read-only at
+`git` preflight it reads `SMOLVM_ENABLED`. The value `0` forces the
+host path. The script prints no warning. The value `1` enforces smolvm.
+The checks must run in a local microVM or on a remote server.
+
+When enforced mode finds no usable smolvm and no remote address,
+`scripts/ci.sh` prints an error on stderr and exits 3. The checks do
+not run on the host. An unset variable or any other value selects auto
+mode. With `smolvm` on `PATH` and a working accelerator (`/dev/kvm` on
+Linux, `kern.hv_support=1` on macOS with Apple Silicon), it runs
+`scripts/smolvm.sh`. Otherwise it prints a warning and runs the
+checks on the host.
+
+The microVM runs offline and mounts the repository read-only at
 `/workspace`. `make smolvm-verify` checks that the isolation holds.
 The [smolvm document](smolvm.md) describes this path.
+
+Set `SMOLVM_CPUS` to change the CPU count of the microVM. Set
+`SMOLVM_MEMORY_MB` to change its memory in MiB. The defaults are 1 CPU
+and 512 MiB. Each value must be a positive integer. The local machine
+and the remote machine both use the values. The scripts stop when a
+value is not valid. See the [smolvm document](smolvm.md).
+
+Set `SMOLVM_ADDR` to send the checks to a remote `smolvm serve`
+endpoint. `scripts/ci.sh` then calls `scripts/smolvm.sh`, which uses HTTP.
+The checks run in a machine on that server. The working tree is uploaded
+for each run with a portable copy of the git metadata. The client
+resolves a worktree pointer on the host before upload. The checks need
+the git history. The upload leaves out `.cache`, so no data comes from
+the local pack cache. No host fallback exists in that mode. The
+[smolvm document](smolvm.md) describes the remote flow and its security
+boundary.
+
+Remote mode starts from `SMOLVM_SERVE_IMAGE`, which defaults to
+`debian:stable-slim`. The `smol/init.sh` script installs the tools on
+every run. Remote mode uses no pack cache. `make smolvm-pack` refuses to
+run while `SMOLVM_ADDR` is set. Unset the variable to build a local
+pack.
+
+Each checkout gets an owner name. In local mode the owner is the first
+12 hex characters of the SHA-256 of the canonical checkout path. Set
+`SMOLVM_OWNER` to use a name instead. Remote mode requires
+`SMOLVM_OWNER`. An empty value stops the command before any API call.
+The value uses lowercase letters, digits, hyphen, and underscore. It
+starts with a letter or a digit. It has at most 16 characters. Use one
+unique value for each repository. Resource names carry the owner:
+`smolvm-build-<owner>-<hash>`, `smolvm-run-<owner>-*`,
+`smolvm-remote-<owner>-*`, and `smolvm-ci-<owner>-<key>.qcow2`. With a
+remote address, `make smolvm-clean` deletes only resources with this
+owner. It prints the plan and asks one time. `--dry-run` prints the plan
+only. `--yes`, `-y`, or `SMOLVM_CLEAN_ASSUME_YES=1` skips the prompt. A
+non-interactive run without a skip flag stops with an error. When
+`SMOLVM_OWNER` is unset, a moved checkout gets a new token. Its old
+resources become foreign and are reported, not deleted.
 
 `make hooks` sets the hook path and makes the hooks executable.
 `scripts/check-mise.sh` uses `mise` only to check `mise.toml`. It skips
@@ -45,27 +89,34 @@ These commands and files form the pipeline:
 - `make ci` runs `scripts/ci.sh`.
 - `scripts/smolvm.sh` runs the checks inside a smolvm microVM against
   the live working tree. `make smolvm` calls it. The microVM is
-  offline and the repository mount is read-only.
+  offline and the repository mount is read-only. With a remote address
+  it uses the `smolvm serve` REST API and a machine on that server.
 - `smol/verify.sh` verifies the isolation from inside the guest and
   from the host. `make smolvm-verify` calls it.
 - `smol/pack-build.sh` builds the cached pack that the microVM runs
-  from. `make smolvm-pack` calls it. `make smolvm-clean` removes
-  the cached packs and deletes dangling `smolvm-build-*` and
-  `smolvm-run-*` machines. `make smolvm-exec` runs one command
+  from. `smol/init.sh` holds the provisioning steps for that build and
+  for the remote run. `make smolvm-pack` calls the build script and
+  refuses to run with `SMOLVM_ADDR` set. `make smolvm-clean` removes the
+  cached packs and deletes the dangling `smolvm-build-<owner>-*` and
+  `smolvm-run-<owner>-*` machines of this checkout. With a remote
+  address it also deletes the `smolvm-remote-<owner>-*` machines and
+  the `smolvm-ci-<owner>-<key>.qcow2` cache bases. The target prints
+  the plan and asks one time. `make smolvm-exec` runs one command
   inside the microVM.
 - `scripts/format.sh` runs every `scripts/format-*.sh` in name order. It
   stops when a formatter fails.
 - `make format` runs `scripts/format.sh`.
-- `.githook/commit-msg` runs `cog verify` on the commit message. A bad
-  message stops the commit.
 - `.githook/pre-commit` runs `scripts/ci.sh` before each commit.
 - `.githook/pre-push` runs `scripts/ci.sh` before each push.
 - `make hooks` sets `core.hooksPath` to `.githook`. It makes the hooks
   executable.
+- The CI workflow and `make check-commits` run
+  `scripts/check-commits.sh`. That script checks the commit history
+  with `cog check`.
 
 The `pre-commit` and `pre-push` hooks call `scripts/ci.sh` directly.
-The `commit-msg` hook calls `cog verify`. No hook calls `mise`. If a
-required tool is missing from `PATH`, the hook fails.
+No hook calls `mise`. If a required tool is missing from `PATH`, the
+hook fails.
 
 `scripts/ci.sh` prints `run: <script>` before each check. It prints
 `all checks passed (N scripts)` after the last check. A failed check
@@ -85,8 +136,11 @@ optional. Run `make help` to list the available targets.
 `make ci` runs the checks inside a smolvm microVM when `smolvm` is on
 `PATH` and the host accelerator is available (`/dev/kvm` on Linux,
 `kern.hv_support=1` on macOS with Apple Silicon). Without them it
-prints a warning to stderr and runs the checks on the host. The
-[smolvm document](smolvm.md) lists the requirements.
+prints a warning to stderr and runs the checks on the host. Set
+`SMOLVM_ENABLED=1` to require smolvm. The run then fails with exit
+code 3 instead of using the host. Set `SMOLVM_ADDR` to use a
+remote server instead. The remote path needs `curl` and `tar` on
+`PATH`. The [smolvm document](smolvm.md) lists the requirements.
 
 ### Run all checks
 
@@ -382,6 +436,14 @@ A check script follows these rules:
 - Write short output. Print a result line. Print the tool output when a
   check fails.
 - Exit non-zero when a check fails.
+
+## Compatibility and limits
+
+Live remote runs verified the API calls and remote exec against
+`smolvm serve` v1.35.4 and v1.33.0. The full `make ci` run over HTTP is
+not verified yet. Live remote runs used `make smolvm-exec`, which uses
+the same remote flow with one guest command. Check the remote path on
+your server before you rely on it for a full check run.
 
 ## Troubleshooting
 

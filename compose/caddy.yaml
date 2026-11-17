@@ -1,9 +1,10 @@
 # dclint disable require-project-name-field
 # The root compose.yaml owns the project name. This file is an included fragment.
 services:
-  # Reverse proxy for the consul, LLDAP and tinyauth web UIs. Serves
-  # consul.<STACK_DOMAIN>, lldap.<STACK_DOMAIN> and tinyauth.<STACK_DOMAIN> over
-  # HTTPS. The TLS mode is asked by the caddy wizard and stored in the root .env
+  # Reverse proxy for the consul, LLDAP, tinyauth and forgejo web UIs. Serves
+  # consul.<STACK_DOMAIN>, lldap.<STACK_DOMAIN>, tinyauth.<STACK_DOMAIN> and
+  # forgejo.<STACK_DOMAIN> over HTTPS. The TLS mode is asked by the caddy wizard
+  # and stored in the root .env
   # (CADDY_TLS_MODE); this service forwards it into the container. The image is
   # built locally: it embeds consul-template (see state/caddy/Dockerfile).
   # consul-template renders /etc/caddy/Caddyfile from state/caddy/Caddyfile.tpl on
@@ -16,13 +17,22 @@ services:
     container_name: caddy
     volumes:
       - ./state/caddy/Caddyfile.tpl:/etc/consul-template/templates/Caddyfile.tpl:ro
+      - ./state/caddy/Caddyfile.static.tpl:/etc/consul-template/templates/Caddyfile.static.tpl:ro
       - ./config/caddy/consul-template.hcl:/etc/consul-template/config.hcl:ro
       - ./config/caddy/secrets:/etc/consul-template/secrets:ro
       - ./config/caddy/certs:/etc/caddy/certs:ro
+      # Read at container start. The wizard never copies this token.
+      - ./config/consul/secrets/agent.hcl:/etc/caddy/consul-agent.hcl:ro
       - ./data/caddy/store:/data:rw
     environment:
       # Not a secret. The template uses it to build the vhost labels at render time.
-      - STACK_DOMAIN=${STACK_DOMAIN:-lan}
+      - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
+      # Capability flags. At 0, caddy uses the static standalone Caddyfile.
+      # At CONSUL_ENABLED=1, caddy uses consul-template.
+      - CONSUL_ENABLED=${CONSUL_ENABLED:-0}
+      - LITEFS_ENABLED=${LITEFS_ENABLED:-0}
+      - OIDC_ENABLED=${OIDC_ENABLED:-0}
+      - TLS_ENABLED=${TLS_ENABLED:-0}
       # Not a secret. The lldap vhost compares it against the LiteFS lease to
       # split reads (local) from writes (the current primary). Falls back to
       # 127.0.0.1 when PUBLIC_IP is not set in the root .env.

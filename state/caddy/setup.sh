@@ -3,13 +3,19 @@
 # Safe to run again: it rewrites consul-template.hcl. It never prints secret
 # values. It prints paths only.
 #
-# One container serves consul.<STACK_DOMAIN>, lldap.<STACK_DOMAIN> and
-# tinyauth.<STACK_DOMAIN> over HTTPS: the
-# caddy image (built locally from state/caddy/Dockerfile) embeds
-# consul-template. consul-template renders /etc/caddy/Caddyfile from
-# state/caddy/Caddyfile.tpl, and caddy reloads itself on change (caddy run
-# --watch). There is no sidecar service.
-# TLS mode is asked on every run. There is no default.
+# One container serves the stack vhosts over HTTPS. The caddy image is
+# built locally from state/caddy/Dockerfile. It embeds consul-template.
+#
+# Two modes exist. With CONSUL_ENABLED=0 the entrypoint renders a static
+# Caddyfile from state/caddy/Caddyfile.static.tpl. No peer is required.
+# With CONSUL_ENABLED=1 consul-template renders /etc/caddy/Caddyfile from
+# state/caddy/Caddyfile.tpl and caddy reloads on change (caddy run --watch).
+# There is no sidecar service.
+#
+# The wizard never writes a consul token. The entrypoint reads
+# initial_management from config/consul/secrets/agent.hcl at container start.
+# In integrated mode the TLS mode is asked on every run. There is no default.
+# Standalone mode uses the internal CA.
 #
 # The root dispatcher (setup.sh) calls this script. It can also run standalone.
 #
@@ -27,10 +33,11 @@
 #   CADDY_CONSUL_HOST       Consul IP or hostname (remote only). Required when
 #                           CADDY_USE_LOCAL_CONSUL=0.
 #   CADDY_CONSUL_PORT       Consul HTTP port (remote only). Default 8500.
-#   CADDY_CONSUL_TOKEN      Consul ACL token (remote only). When non-empty it is
-#                           written to config/caddy/secrets/consul-token.
-#                           When empty, an existing token file is kept; when the file
-#                           does not exist, an anonymous token is used.
+#   CONSUL_ENABLED          Capability flag. Default 0. Read from the root .env
+#                           when not set in the process environment.
+#   LITEFS_ENABLED          Capability flag. Default 0.
+#   OIDC_ENABLED            Capability flag. Default 0.
+#   TLS_ENABLED             Capability flag. Default 0.
 #   CADDY_TLS_MODE          TLS mode: internal, letsencrypt, or existing.
 #                           There is no default. Non-interactive runs must set it.
 #   CADDY_TLS_EMAIL         ACME contact email. Required when CADDY_TLS_MODE=letsencrypt.
@@ -63,6 +70,38 @@ read_env_stack_domain() {
   fi
   { grep -E '^STACK_DOMAIN=' .env || true; } | tail -n1 | cut -d= -f2- |
     sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\\1/" -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
+}
+
+# Print a capability flag. The process environment wins over the root .env
+# file. Print 0 when the value is absent or is not 0 or 1.
+read_capability_flag() {
+  local key="$1"
+  local value
+  value="$(printenv "$key" 2>/dev/null || true)"
+  if [ -z "$value" ] && [ -f .env ]; then
+    value="$({ grep -E "^${key}=" .env || true; } | tail -n1 | cut -d= -f2-)"
+  fi
+  case "$value" in
+  0 | 1)
+    printf '%s\n' "$value"
+    ;;
+  *)
+    printf '0\n'
+    ;;
+  esac
+}
+
+# Print one vhost name per discovered service. Each service with a web UI
+# ships a compose fragment. The caddy fragment is the proxy, not a vhost.
+discover_vhosts() {
+  local fragment service
+  for fragment in compose/*.yaml; do
+    [ -f "$fragment" ] || continue
+    service="$(basename -- "$fragment" .yaml)"
+    if [ "$service" != "caddy" ]; then
+      printf '%s\n' "$service"
+    fi
+  done
 }
 
 # Resolve the default stack domain. Set stack_domain and stack_domain_source.
@@ -362,24 +401,24 @@ if [ -t 0 ]; then
     fi
   fi
 else
-  case "${CADDY_USE_LOCAL_CONSUL:-1}" in
-  0 | 1)
-    ;;
-  *)
-    echo "error: CADDY_USE_LOCAL_CONSUL must be 0 or 1." >&2
-    exit 1
-    ;;
-  esac
   if ! is_valid_domain "$stack_domain"; then
     stack_domain_default_invalid
   fi
 fi
 
+# Step 1b: resolve the capability flags. The process environment wins over
+# the root .env file. Each flag defaults to 0.
+consul_enabled="$(read_capability_flag CONSUL_ENABLED)"
+litefs_enabled="$(read_capability_flag LITEFS_ENABLED)"
+oidc_enabled="$(read_capability_flag OIDC_ENABLED)"
+tls_enabled="$(read_capability_flag TLS_ENABLED)"
+
 use_local_consul=1
 consul_host="127.0.0.1"
 consul_port="8500"
-consul_token=""
-if [ -t 0 ]; then
+if [ "$consul_enabled" -eq 0 ]; then
+  echo "info: Standalone mode. Caddy does not use consul." >&2
+elif [ -t 0 ]; then
   if ! read -r -p "Use this repo's consul service for consul-template? [Y/n] " local_answer; then
     local_answer=""
   fi
@@ -412,12 +451,16 @@ if [ -t 0 ]; then
       echo "error: '$consul_port' is not a valid port. Use 1 to 65535." >&2
       exit 1
     fi
-    if ! read -r -p "Consul ACL token? (empty for anonymous) " token_answer; then
-      token_answer=""
-    fi
-    consul_token="$token_answer"
   fi
 else
+  case "${CADDY_USE_LOCAL_CONSUL:-1}" in
+  0 | 1)
+    ;;
+  *)
+    echo "error: CADDY_USE_LOCAL_CONSUL must be 0 or 1." >&2
+    exit 1
+    ;;
+  esac
   case "${CADDY_USE_LOCAL_CONSUL:-1}" in
   1)
     use_local_consul=1
@@ -426,7 +469,6 @@ else
     use_local_consul=0
     consul_host="${CADDY_CONSUL_HOST:-}"
     consul_port="${CADDY_CONSUL_PORT:-8500}"
-    consul_token="${CADDY_CONSUL_TOKEN:-}"
     if [ -z "$consul_host" ]; then
       echo "error: CADDY_CONSUL_HOST is required when CADDY_USE_LOCAL_CONSUL=0." >&2
       exit 1
@@ -443,10 +485,13 @@ else
   esac
 fi
 
-# Step 1b: collect the TLS answers. The mode is always asked. There is no default.
+# Step 1b: collect the TLS answers. Standalone mode uses the internal CA.
+# Integrated mode always asks the mode. There is no default.
 # Collect everything, then create the files. Invalid answers exit before any writes.
 tls_mode=""
-if [ -t 0 ]; then
+if [ "$consul_enabled" -eq 0 ]; then
+  tls_mode="internal"
+elif [ -t 0 ]; then
   if ! read -r -p "TLS mode (internal, letsencrypt, existing)? " tls_answer; then
     tls_answer=""
   fi
@@ -469,8 +514,14 @@ else
   esac
 fi
 
-# The caddy stack serves these vhosts today. Update this list when a vhost is added.
-readonly TLS_VHOSTS="consul lldap tinyauth"
+# Build the vhost list from the compose fragments. Keep a safe fallback for
+# standalone checkouts that hold only the caddy fragment.
+discovered_vhosts="$(discover_vhosts | tr '\n' ' ')"
+TLS_VHOSTS="${discovered_vhosts% }"
+if [ -z "$TLS_VHOSTS" ]; then
+  TLS_VHOSTS="consul lldap tinyauth forgejo"
+fi
+readonly TLS_VHOSTS
 
 # Build the printable vhost list and the certificate example from TLS_VHOSTS.
 TLS_VHOSTS_LIST=""
@@ -671,26 +722,13 @@ if [ "${#cert_copies[@]}" -gt 0 ]; then
 fi
 
 # Step 4: write the consul-template configuration.
-# The token flows as a file, never inline: consul-template supports token_file.
-# The caddy container runs as root, so root-owned 0600 is readable inside it.
-# When anonymous is chosen the token_file line is omitted; the container then
-# talks to consul without a token.
-token_state="anonymous"
+# The entrypoint reads the management token from
+# config/consul/secrets/agent.hcl at container start. The wizard never writes
+# a consul token. The entrypoint creates a scoped caddy token at run time.
 if [ "$use_local_consul" -eq 1 ]; then
   consul_address="http://consul:8500"
 else
   consul_address="http://$consul_host:$consul_port"
-  if [ -n "$consul_token" ]; then
-    (
-      umask 077
-      printf '%s\n' "$consul_token" >config/caddy/secrets/consul-token
-    )
-    chmod 0600 config/caddy/secrets/consul-token
-    token_state="written"
-  elif [ -f config/caddy/secrets/consul-token ]; then
-    chmod 0600 config/caddy/secrets/consul-token
-    token_state="kept"
-  fi
 fi
 {
   printf '# Rendered by setup.sh caddy. Do not edit. Run the wizard again to regenerate.\n'
@@ -698,10 +736,6 @@ fi
   printf 'consul {\n'
   printf '  # This is the address of the Consul agent or server.\n'
   printf '  address = "%s"\n' "$consul_address"
-  if [ "$token_state" = "written" ] || [ "$token_state" = "kept" ]; then
-    printf '  # The ACL token is read from a file. It never appears inline.\n'
-    printf '  token_file = "/etc/consul-template/secrets/consul-token"\n'
-  fi
   printf '}\n'
   printf '\n'
   printf 'template {\n'
@@ -718,15 +752,15 @@ chmod 0640 config/caddy/consul-template.hcl
 # Step 6: print the summary.
 echo "Configured the caddy wizard files:"
 echo "  config/caddy/consul-template.hcl"
-case "$token_state" in
-written)
-  echo "  config/caddy/secrets/consul-token (written)"
-  ;;
-kept)
-  echo "  config/caddy/secrets/consul-token (kept)"
-  ;;
-esac
-echo "caddy vhosts: https://consul.$stack_domain (all consul nodes, :8500), https://lldap.$stack_domain, https://tinyauth.$stack_domain"
+echo "note: capability flags: consul=$consul_enabled litefs=$litefs_enabled oidc=$oidc_enabled tls=$tls_enabled"
+if [ "$consul_enabled" -eq 0 ]; then
+  echo "mode: standalone. The container uses a static Caddyfile and tls internal."
+else
+  echo "mode: integrated. The container uses consul-template."
+  echo "note: the entrypoint reads initial_management from config/consul/secrets/agent.hcl."
+  echo "note: mount that file into the caddy container before you start it."
+fi
+echo "caddy vhosts: https://consul.$stack_domain (all consul nodes, :8500), https://lldap.$stack_domain, https://tinyauth.$stack_domain, https://forgejo.$stack_domain"
 case "$tls_mode" in
 internal)
   echo "TLS mode: internal. caddy issues certificates from its internal CA."
@@ -746,16 +780,16 @@ existing)
   ;;
 esac
 echo "note: .env written with STACK_DOMAIN=$stack_domain and CADDY_TLS_MODE=$tls_mode"
-echo "note: consul-template renders state/caddy/Caddyfile.tpl into /etc/caddy/Caddyfile (inside the caddy container)"
-echo "note: caddy reloads the file itself when it changes (caddy run --watch)"
+if [ "$consul_enabled" -eq 1 ]; then
+  echo "note: consul-template renders state/caddy/Caddyfile.tpl into /etc/caddy/Caddyfile"
+  echo "note: caddy reloads the file itself when it changes (caddy run --watch)"
+else
+  echo "note: the entrypoint renders state/caddy/Caddyfile.static.tpl into /etc/caddy/Caddyfile"
+fi
 echo "note: the caddy service publishes ports 80 and 443."
-if [ "$use_local_consul" -eq 1 ]; then
-  echo "note: this repo's consul uses default_policy=deny. To render, create an anonymous read policy, or re-run and answer N with 127.0.0.1 and a token."
-  if [ -f config/caddy/secrets/consul-token ]; then
-    echo "warning: config/caddy/secrets/consul-token exists but is not referenced by the new configuration." >&2
-  fi
+if [ "$consul_enabled" -eq 1 ] && [ "$use_local_consul" -eq 1 ]; then
+  echo "hint: consul must run too (docker compose up -d consul)."
+  echo "hint: the entrypoint creates the caddy read ACL when the consul CLI is in the image."
 fi
 echo "Next step: docker compose up -d caddy"
 echo "hint: the caddy image is built locally from state/caddy/Dockerfile (build context ./state/caddy)."
-echo "hint: the container waits for consul on boot and renders once consul answers."
-echo "hint: for the local case, consul must run too (docker compose up -d consul)."

@@ -19,6 +19,9 @@ CONSUL_TEMPLATE_CONFIG="${CONSUL_TEMPLATE_CONFIG:-/etc/consul-template/config.hc
 RENDER_DIR="${RENDER_DIR:-/run/forgejo}"
 APP_INI="${APP_INI:-/run/forgejo/app.ini}"
 RENDERED_HOOK="${RENDERED_HOOK:-/run/forgejo/post-receive}"
+APP_INI_TPL="${APP_INI_TPL:-/etc/consul-template/templates/app.ini.tpl}"
+POST_RECEIVE_TPL="${POST_RECEIVE_TPL:-/etc/consul-template/templates/post-receive.tpl}"
+RENDER_SCRIPT="${RENDER_SCRIPT:-/usr/local/bin/render.sh}"
 LITEFS_YML="${LITEFS_YML:-/run/litefs.yml}"
 LITEFS_MOUNT_DIR="${LITEFS_MOUNT_DIR:-/data}"
 LITEFS_DATA_DIR="${LITEFS_DATA_DIR:-/var/lib/litefs}"
@@ -28,11 +31,17 @@ REPO_ROOT="${REPO_ROOT:-/data/gitea/forgejo-repositories}"
 PUBLIC_IP="${PUBLIC_IP:-}"
 CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-http://consul:8500}"
 STACK_DOMAIN="${STACK_DOMAIN:-sh.lan}"
+CONSUL_ENABLED="${CONSUL_ENABLED:-0}"
+LITEFS_ENABLED="${LITEFS_ENABLED:-0}"
+OIDC_ENABLED="${OIDC_ENABLED:-0}"
+TLS_ENABLED="${TLS_ENABLED:-0}"
 
 readonly FORGEJO_SECRETS_DIR CONSUL_AGENT_HCL CONSUL_TEMPLATE_CONFIG
-readonly RENDER_DIR APP_INI RENDERED_HOOK LITEFS_YML
+readonly RENDER_DIR APP_INI RENDERED_HOOK APP_INI_TPL POST_RECEIVE_TPL
+readonly RENDER_SCRIPT LITEFS_YML
 readonly LITEFS_MOUNT_DIR LITEFS_DATA_DIR REPO_ROOT
-readonly PUBLIC_IP CONSUL_HTTP_ADDR STACK_DOMAIN
+readonly CONSUL_HTTP_ADDR STACK_DOMAIN
+readonly CONSUL_ENABLED LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
 
 readonly TOKEN_FILE="${FORGEJO_SECRETS_DIR}/litefs-token"
 readonly POLICY_NAME="forgejo-litefs"
@@ -272,6 +281,27 @@ render_once() {
   fix_rendered_files
 }
 
+# Render both templates with the local renderer. No Consul agent is required.
+render_local() {
+  if [ ! -r "$APP_INI_TPL" ]; then
+    err "app.ini template not readable at $APP_INI_TPL."
+    exit 1
+  fi
+  if [ ! -r "$POST_RECEIVE_TPL" ]; then
+    err "post-receive template not readable at $POST_RECEIVE_TPL."
+    exit 1
+  fi
+  sh "$RENDER_SCRIPT" "$APP_INI_TPL" "$APP_INI"
+  sh "$RENDER_SCRIPT" "$POST_RECEIVE_TPL" "$RENDERED_HOOK"
+  for rendered_file in "$APP_INI" "$RENDERED_HOOK"; do
+    if [ ! -s "$rendered_file" ]; then
+      err "the local renderer did not write $rendered_file."
+      exit 1
+    fi
+  done
+  fix_rendered_files
+}
+
 # Write the small launcher that Forgejo chains from every repository.
 # Forgejo ignores the name "gitea" in hooks/post-receive.d, so this name is
 # different. The launcher execs the consul-template output. A re-render reaches
@@ -358,6 +388,35 @@ esac
 # ---------------------------------------------------------------------------
 # Boot sequence
 # ---------------------------------------------------------------------------
+
+# LiteFS needs both the Consul lease and the LiteFS wrapper. Without either
+# flag, run Forgejo directly on local SQLite with built-in authentication.
+use_litefs=0
+if [ "$CONSUL_ENABLED" = "1" ] && [ "$LITEFS_ENABLED" = "1" ]; then
+  use_litefs=1
+fi
+
+if [ "$use_litefs" -eq 0 ]; then
+  PUBLIC_IP="${PUBLIC_IP:-127.0.0.1}"
+  if ! is_valid_ipv4 "$PUBLIC_IP"; then
+    err "PUBLIC_IP '$PUBLIC_IP' is not a valid IPv4 address."
+    exit 1
+  fi
+  export PUBLIC_IP STACK_DOMAIN CONSUL_ENABLED LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
+  log "starting Forgejo in standalone mode with local SQLite"
+  log "LiteFS and Consul are disabled"
+  mkdir -p "$RENDER_DIR" \
+    "$LITEFS_MOUNT_DIR/gitea/conf" \
+    "$LITEFS_MOUNT_DIR/gitea/log" \
+    "$LITEFS_MOUNT_DIR/gitea/home" \
+    "$LITEFS_MOUNT_DIR/gitea/tmp" \
+    "$LITEFS_MOUNT_DIR/git" \
+    "$LITEFS_MOUNT_DIR/gitea/forgejo-repositories"
+  chmod 0777 "$LITEFS_MOUNT_DIR" "$LITEFS_MOUNT_DIR/gitea" 2>/dev/null || true
+  render_local
+  log "rendered app.ini at $APP_INI"
+  exec gosu "${EXEC_UID}:${EXEC_GID}" "$EXEC_BINARY" web --config "$APP_INI"
+fi
 
 if [ -z "$PUBLIC_IP" ]; then
   err "PUBLIC_IP is not set. Set it in the root .env or export it before starting the container."

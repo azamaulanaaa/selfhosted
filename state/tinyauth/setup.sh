@@ -24,7 +24,7 @@
 #   TINYAUTH_LDAP_ADDRESS   LDAP URL. Required when TINYAUTH_LDAP_LOCAL=no.
 #                           Interactive default for local LLDAP: ldap://lldap:3890.
 #   TINYAUTH_LDAP_BASEDN    LDAP base DN. Read from the environment. For local LLDAP
-#                           the default is dc=home,dc=lan.
+#                           the default is derived from STACK_DOMAIN.
 #   TINYAUTH_OBSERVER_AUTO  yes to create the observer in LLDAP automatically. Default: yes.
 #                           Falls back to manual instructions when the local admin
 #                           password, the API, or docker is not available.
@@ -51,7 +51,6 @@ readonly LDAP_SECRET_FILE="config/tinyauth/secrets/ldap-observer"
 readonly LDAP_PASSWORD_FILE="config/ldap/secrets/user-pass"
 
 readonly DEFAULT_LDAP_ADDRESS="ldap://lldap:3890"
-readonly DEFAULT_BASE_DN="dc=home,dc=lan"
 readonly DEFAULT_STACK_DOMAIN="sh.lan"
 readonly DEFAULT_LLDAP_HTTP_URL="http://localhost:17170"
 readonly DEFAULT_ADMIN_USER="admin"
@@ -459,6 +458,11 @@ fi
 readonly ISSUER
 readonly DISCOVERY_URL="${ISSUER}/.well-known/openid-configuration"
 
+# Build the default LDAP base DN from the canonical stack domain.
+# For example, sh.lan becomes dc=sh,dc=lan. No service uses the lan domain alone.
+default_base_dn="$(printf '%s\n' "$stack_domain" | awk -F. '{for (i = 1; i <= NF; i++) printf "%sdc=%s", (i > 1 ? "," : ""), $i}')"
+readonly default_base_dn
+
 # Step 3: resolve the LDAP source and the base DN.
 local_ldap=1
 ldap_address="$DEFAULT_LDAP_ADDRESS"
@@ -489,13 +493,13 @@ fi
 if [ "$local_ldap" -eq 1 ]; then
   base_dn="${TINYAUTH_LDAP_BASEDN:-}"
   if [ -t 0 ] && [ -z "$base_dn" ]; then
-    if ! read -r -p "LDAP base DN? [$DEFAULT_BASE_DN] " answer; then
+    if ! read -r -p "LDAP base DN? [$default_base_dn] " answer; then
       answer=""
     fi
-    base_dn="${answer:-$DEFAULT_BASE_DN}"
+    base_dn="${answer:-$default_base_dn}"
   fi
   if [ -z "$base_dn" ]; then
-    base_dn="$DEFAULT_BASE_DN"
+    base_dn="$default_base_dn"
   fi
 else
   if [ -t 0 ]; then
@@ -503,10 +507,10 @@ else
       answer=""
     fi
     ldap_address="${answer:-$DEFAULT_LDAP_ADDRESS}"
-    if ! read -r -p "LDAP base DN? [$DEFAULT_BASE_DN] " answer; then
+    if ! read -r -p "LDAP base DN? [$default_base_dn] " answer; then
       answer=""
     fi
-    base_dn="${answer:-$DEFAULT_BASE_DN}"
+    base_dn="${answer:-$default_base_dn}"
   else
     ldap_address="${TINYAUTH_LDAP_ADDRESS:-}"
     base_dn="${TINYAUTH_LDAP_BASEDN:-}"

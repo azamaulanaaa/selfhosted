@@ -1,10 +1,11 @@
 services:
-  # LLDAP, wrapped with LiteFS. LiteFS replicates the SQLite database between
-  # nodes through consul. A single node is the LiteFS primary. Only the primary
-  # can write the database. Consul ACLs protect the litefs lease (key
-  # "lldap/litefs"). The token is created by the entrypoint at boot.
-  # The LDAP port is intentionally not published. The HTTP UI goes through
-  # caddy at lldap.<STACK_DOMAIN>. A single host serves a 200 at the UI root.
+  # LLDAP in standalone mode or integrated mode.
+  # Standalone mode: with CONSUL_ENABLED=0 or LITEFS_ENABLED=0 the entrypoint
+  # starts LLDAP directly. No LiteFS, no Consul lease, and no FUSE mount.
+  # Integrated mode: with both flags at 1, LiteFS replicates the SQLite
+  # database through Consul. A single node is the primary. Only the primary
+  # writes the database. Consul ACLs protect the lease key "lldap/litefs".
+  # The HTTP UI goes through caddy at lldap.<STACK_DOMAIN>.
   # Note: LLDAP needs a writable SQLite database. A litefs replica is
   # read-only, therefore LLDAP does not run on replicas.
   lldap:
@@ -17,12 +18,21 @@ services:
       # LLDAP configuration and secrets. Rendered by setup.sh. Read-only.
       - ./config/lldap/lldap_config.toml:/etc/lldap/lldap_config.toml:ro
       - ./config/lldap/secrets:/etc/lldap/secrets:ro
-      # LiteFS internal data (LTX files). Back this up.
-      - ./data/lldap/store:/var/lib/litefs:rw
+      # Standalone SQLite database. Back this up. In integrated mode the
+      # LiteFS FUSE mount at /data shadows this path.
+      - ./data/lldap/store/db:/data:rw
+      # LiteFS internal data (LTX files). Back this up. Used in integrated mode.
+      - ./data/lldap/store/litefs:/var/lib/litefs:rw
+      # Consul agent secrets. The entrypoint reads initial_management at start.
+      # The wizard never copies the token into the lldap secret tree.
+      - ./config/consul/secrets:/etc/consul/secrets:ro
     environment:
       - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
       - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
       - CONSUL_HTTP_ADDR=${CONSUL_HTTP_ADDR:-http://consul:8500}
+      # Standalone mode when either flag is 0. Integrated mode needs both at 1.
+      - CONSUL_ENABLED=${CONSUL_ENABLED:-0}
+      - LITEFS_ENABLED=${LITEFS_ENABLED:-0}
       - LLDAP_HTTP_URL=http://lldap.${STACK_DOMAIN:-sh.lan}
       # The wizard writes these files. LLDAP reads the file contents.
       - LLDAP_JWT_SECRET_FILE=/etc/lldap/secrets/jwt_secret

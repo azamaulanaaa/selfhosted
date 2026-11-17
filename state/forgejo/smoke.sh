@@ -10,6 +10,7 @@ readonly STATE_DIR="$REPO_ROOT/state/forgejo"
 readonly RENDER="$STATE_DIR/render.sh"
 readonly APP_TPL="$STATE_DIR/app.ini.tpl"
 readonly HOOK_TPL="$STATE_DIR/post-receive.tpl"
+readonly COMPOSE_FILE="$REPO_ROOT/compose/forgejo.yaml"
 
 scratch="$(mktemp -d)"
 trap 'rm -rf -- "$scratch"' EXIT
@@ -57,6 +58,47 @@ expect_shebang() {
   if [ "$first_line" != "#!/bin/sh" ]; then
     fail "$label does not start with a shebang."
   fi
+}
+
+# Print the lines of one service from the compose fragment.
+service_block() {
+  service="$1"
+  awk -v name="  $service:" '
+    $0 == name { inside = 1; print; next }
+    inside && /^  [^ ]/ { exit }
+    inside { print }
+  ' "$COMPOSE_FILE"
+}
+
+# Check that both ports bind to PUBLIC_IP with the long syntax.
+check_compose_port_bindings() {
+  forgejo_block="$scratch/forgejo-service.yaml"
+  peer_block="$scratch/peer-service.yaml"
+  service_block forgejo >"$forgejo_block"
+  service_block forgejo-peer-port >"$peer_block"
+
+  expect_line "$forgejo_block" "      - target: 3000" "forgejo service"
+  expect_line "$forgejo_block" "        published: 3000" "forgejo service"
+  expect_line "$forgejo_block" "        host_ip: \${PUBLIC_IP:-127.0.0.1}" "forgejo service"
+  expect_line "$forgejo_block" "        protocol: tcp" "forgejo service"
+  expect_no_text "$forgejo_block" "\${PUBLIC_IP:-127.0.0.1}:3000:3000" "forgejo service"
+
+  expect_line "$peer_block" "      - target: 20202" "peer service"
+  expect_line "$peer_block" "        published: 20202" "peer service"
+  expect_line "$peer_block" "        host_ip: \${PUBLIC_IP:-127.0.0.1}" "peer service"
+  expect_line "$peer_block" "        protocol: tcp" "peer service"
+  expect_no_text "$peer_block" "\${PUBLIC_IP:-127.0.0.1}:20202:20202" "peer service"
+  echo "smoke: compose port bindings passed."
+}
+
+# Check that the peer service has no build section.
+check_peer_service_no_build() {
+  peer_block="$scratch/peer-build-check.yaml"
+  service_block forgejo-peer-port >"$peer_block"
+  if grep -Eq -- '^    build:' "$peer_block"; then
+    fail "the peer service must not declare a build section."
+  fi
+  echo "smoke: peer service build check passed."
 }
 
 # Render the standalone mode into the scratch tree.
@@ -191,4 +233,6 @@ check_standalone
 render_integrated
 check_integrated
 check_domain_fallback
-echo "smoke: all render checks passed."
+check_compose_port_bindings
+check_peer_service_no_build
+echo "smoke: all checks passed."

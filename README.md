@@ -1,17 +1,10 @@
-# Guide
+# Selfhosting
 
-![Checks](https://github.com/azamaulanaaa/init/actions/workflows/ci.yml/badge.svg)
+![Checks](https://github.com/azamaulanaaa/selfhosting/actions/workflows/ci.yml/badge.svg)
 
-The sections below show how to install the hooks, run the checks,
-commit, and release a version.
-
-## Customize this template
-
-Replace these values before you use this template:
-
-- The default branch name `main` in `cog.toml` and `ci.yml`. Use your
-  default branch name.
-- The copyright holder in `LICENSE` and `README.md`. Use your name.
+This repository contains the checks, hooks, CI, release flow, and smolvm
+sandbox for the selfhosting stack. The sections below show how to install
+the hooks, run the checks, commit, and release a version.
 
 To add the checks and tools to an existing repository, see
 [Add the checks and tools](docs/adopt.md).
@@ -300,4 +293,4 @@ See the [smolvm documentation](docs/smolvm.md) for the full list.
 
 This project uses the MIT License. See [`LICENSE`](LICENSE).
 
-Copyright (c) 2026 Aza Maulana.
+Copyright (c) 2026 Selfhosting maintainers.

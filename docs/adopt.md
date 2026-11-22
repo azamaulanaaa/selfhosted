@@ -84,7 +84,7 @@ still works.
 Clone this repository to a staging directory:
 
 ```bash
-git clone https://github.com/azamaulanaaa/init.git /tmp/template
+git clone https://github.com/azamaulanaaa/selfhosting.git /tmp/template
 ```
 
 Run these commands from your repository root:

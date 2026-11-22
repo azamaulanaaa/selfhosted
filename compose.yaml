@@ -10,3 +10,6 @@ include:
   - path: compose/caddy.yaml
     project_directory: .
     env_file: .env
+  - path: compose/tinyauth.yaml
+    project_directory: .
+    env_file: .env

@@ -1,0 +1,67 @@
+# dclint disable require-project-name-field
+# The root compose.yaml owns the project name. This file is an included fragment.
+services:
+  # Reverse proxy for the consul, LLDAP, tinyauth and forgejo web UIs. Serves
+  # consul.<STACK_DOMAIN>, lldap.<STACK_DOMAIN>, tinyauth.<STACK_DOMAIN> and
+  # forgejo.<STACK_DOMAIN> over HTTPS. The TLS mode is asked by the caddy wizard
+  # and stored in the root .env
+  # (CADDY_TLS_MODE); this service forwards it into the container. The image is
+  # built locally: it embeds consul-template (see state/caddy/Dockerfile).
+  # consul-template renders /etc/caddy/Caddyfile from state/caddy/Caddyfile.tpl on
+  # the fly and caddy reloads itself when the file changes (caddy run --watch).
+  caddy:
+    image: caddy-consul:local
+    build:
+      context: ./state/caddy
+      dockerfile: Dockerfile
+    container_name: caddy
+    volumes:
+      - ./state/caddy/Caddyfile.tpl:/etc/consul-template/templates/Caddyfile.tpl:ro
+      - ./state/caddy/Caddyfile.static.tpl:/etc/consul-template/templates/Caddyfile.static.tpl:ro
+      - ./config/caddy/consul-template.hcl:/etc/consul-template/config.hcl:ro
+      - ./config/caddy/secrets:/etc/consul-template/secrets:ro
+      - ./config/caddy/certs:/etc/caddy/certs:ro
+      # Read at container start. The wizard never copies this token.
+      - ./config/consul/secrets/agent.hcl:/etc/caddy/consul-agent.hcl:ro
+      - ./data/caddy/store:/data:rw
+    environment:
+      # Not a secret. The template uses it to build the vhost labels at render time.
+      - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
+      # Capability flags. At 0, caddy uses the static standalone Caddyfile.
+      # At CONSUL_ENABLED=1, caddy uses consul-template.
+      - CONSUL_ENABLED=${CONSUL_ENABLED:-0}
+      - LITEFS_ENABLED=${LITEFS_ENABLED:-0}
+      - OIDC_ENABLED=${OIDC_ENABLED:-0}
+      - TLS_ENABLED=${TLS_ENABLED:-0}
+      # Not a secret. The lldap vhost compares it against the LiteFS lease to
+      # split reads (local) from writes (the current primary). Falls back to
+      # 127.0.0.1 when PUBLIC_IP is not set in the root .env.
+      - IP_ADDR=${PUBLIC_IP:-127.0.0.1}
+      # Not a secret. The TLS mode (and the email/cert-layout for letsencrypt and
+      # existing) are asked by the wizard and stored in the root .env. The compose
+      # fallback is a last-resort safety net; the wizard always writes the value.
+      - CADDY_TLS_MODE=${CADDY_TLS_MODE:-internal}
+      - CADDY_TLS_EMAIL=${CADDY_TLS_EMAIL:-}
+      - CADDY_TLS_CERT_LAYOUT=${CADDY_TLS_CERT_LAYOUT:-per-vhost}
+    ports:
+      # HTTP is used for the ACME challenge and the HTTP->HTTPS redirect when caddy
+      # manages HTTPS. Not used by the internal and existing TLS modes.
+      - '0.0.0.0:80:80/tcp'
+      # HTTPS is required for every TLS mode.
+      - '0.0.0.0:443:443/tcp'
+    restart: unless-stopped
+    healthcheck:
+      # Port 80 does not answer when no HTTP site exists (verified with the
+      # official caddy binary): every TLS mode refuses plain TCP there. Caddy,
+      # though, answers plaintext HTTP on its TLS port with a deterministic
+      # response. Use busybox nc (in the image) to assert that response.
+      test: [ "CMD-SHELL", "printf 'GET / HTTP/1.0\r\n\r\n' | nc -w 2 127.0.0.1 443 | grep -q 'HTTPS server'" ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    # The entrypoint creates the store as root. This uid matches the store owner
+    # and the owner of the ACME files in it.
+    user: "0:0"
+    # Local image: always build, never pull (caddy-consul:local is not published).
+    pull_policy: build

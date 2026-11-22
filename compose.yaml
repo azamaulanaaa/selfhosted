@@ -7,6 +7,9 @@ include:
   - path: compose/lldap.yaml
     project_directory: .
     env_file: .env
+  - path: compose/forgejo.yaml
+    project_directory: .
+    env_file: .env
   - path: compose/caddy.yaml
     project_directory: .
     env_file: .env

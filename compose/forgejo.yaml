@@ -1,0 +1,90 @@
+# dclint disable require-project-name-field
+# The root compose.yaml owns the project name. This file is an included fragment.
+services:
+  # Forgejo serves the stack at forgejo.<STACK_DOMAIN>. Caddy proxies the HTTPS
+  # vhost in integrated mode. Port 3000 is published on PUBLIC_IP so a
+  # standalone node answers without a proxy and so git peers can replicate.
+  # LiteFS and Consul start only when both capability flags are 1.
+  forgejo:
+    image: forgejo-litefs:local
+    build:
+      context: ./state/forgejo
+    # The image is built locally. Never pull it from a registry.
+    container_name: forgejo
+    # No hard Consul dependency. In standalone mode Forgejo starts with no peer.
+    volumes:
+      # Consul-template templates. Read-only. Rendered output is never committed.
+      - ./state/forgejo/app.ini.tpl:/etc/consul-template/templates/app.ini.tpl:ro
+      - ./state/forgejo/post-receive.tpl:/etc/consul-template/templates/post-receive.tpl:ro
+      # Wizard-written consul-template configuration. Read-only.
+      - ./config/forgejo/consul-template.hcl:/etc/consul-template/config.hcl:ro
+      # Wizard-written answer file. env_file loads it into the container.
+      # The read-only mount also makes the file visible inside the container.
+      - ./config/forgejo/forgejo.env:/etc/forgejo/forgejo.env:ro
+      # Forgejo secrets. The entrypoint writes the LiteFS token here at boot.
+      - ./config/forgejo/secrets:/etc/forgejo/secrets:rw
+      # Consul agent secrets. The entrypoint reads initial_management at boot.
+      # Keep this direct mount in both modes.
+      - ./config/consul/secrets/agent.hcl:/config/consul/agent.hcl:ro
+      # Local SQLite and git data in standalone mode. LiteFS overlays /data in
+      # integrated mode. Back up the whole store tree.
+      - ./data/forgejo/store:/data:rw
+      # LiteFS internal data (LTX files). Used only in integrated mode.
+      - ./data/forgejo/store/litefs:/var/lib/litefs:rw
+    environment:
+      - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
+      - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
+      - CONSUL_HTTP_ADDR=${CONSUL_HTTP_ADDR:-http://consul:8500}
+      - CONSUL_ENABLED=${CONSUL_ENABLED:-0}
+      - LITEFS_ENABLED=${LITEFS_ENABLED:-0}
+      - OIDC_ENABLED=${OIDC_ENABLED:-0}
+      - TLS_ENABLED=${TLS_ENABLED:-0}
+    env_file:
+      # Wizard-generated. Holds FORGEJO_* answers and *_FILE paths only.
+      - ./config/forgejo/forgejo.env
+    ports:
+      # Standalone access and git peer replication use this port.
+      # The long syntax binds the port to PUBLIC_IP only.
+      - target: 3000
+        published: 3000
+        host_ip: ${PUBLIC_IP:-127.0.0.1}
+        protocol: tcp
+    restart: unless-stopped
+    healthcheck:
+      # Unauthenticated endpoint. curl is in the base image.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 40s
+    # LiteFS mounts a FUSE filesystem through /dev/fuse. cap_add SYS_ADMIN
+    # allows FUSE mounts. devices exposes /dev/fuse. No blanket privileges.
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    # Built locally. Never pull it from a registry.
+    pull_policy: build
+
+  # Opt-in LiteFS peer port. Enable it with --profile peer on a second node.
+  # Git replication already uses port 3000. This port carries LiteFS LTX data.
+  forgejo-peer-port:
+    image: forgejo-litefs:local
+    container_name: forgejo-peer-port
+    depends_on:
+      - forgejo
+    ports:
+      # The peer shares the Forgejo network namespace. No build is needed.
+      # The long syntax binds the port to PUBLIC_IP only.
+      - target: 20202
+        published: 20202
+        host_ip: ${PUBLIC_IP:-127.0.0.1}
+        protocol: tcp
+    network_mode: "service:forgejo"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - sleep infinity
+    restart: unless-stopped
+    profiles:
+      - peer

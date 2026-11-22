@@ -1,0 +1,65 @@
+services:
+  # LLDAP in standalone mode or integrated mode.
+  # Standalone mode: with CONSUL_ENABLED=0 or LITEFS_ENABLED=0 the entrypoint
+  # starts LLDAP directly. No LiteFS, no Consul lease, and no FUSE mount.
+  # Integrated mode: with both flags at 1, LiteFS replicates the SQLite
+  # database through Consul. A single node is the primary. Only the primary
+  # writes the database. Consul ACLs protect the lease key "lldap/litefs".
+  # The HTTP UI goes through caddy at lldap.<STACK_DOMAIN>.
+  # Note: LLDAP needs a writable SQLite database. A litefs replica is
+  # read-only, therefore LLDAP does not run on replicas.
+  lldap:
+    image: lldap-litefs:local
+    build:
+      context: ./state/lldap
+    # The image is built locally. Never pull it from a registry.
+    container_name: lldap
+    volumes:
+      # LLDAP configuration and secrets. Rendered by setup.sh. Read-only.
+      - ./config/lldap/lldap_config.toml:/etc/lldap/lldap_config.toml:ro
+      - ./config/lldap/secrets:/etc/lldap/secrets:ro
+      # Standalone SQLite database. Back this up. In integrated mode the
+      # LiteFS FUSE mount at /data shadows this path.
+      - ./data/lldap/store/db:/data:rw
+      # LiteFS internal data (LTX files). Back this up. Used in integrated mode.
+      - ./data/lldap/store/litefs:/var/lib/litefs:rw
+      # Consul agent secrets. The entrypoint reads initial_management at start.
+      # The wizard never copies the token into the lldap secret tree.
+      - ./config/consul/secrets:/etc/consul/secrets:ro
+    environment:
+      - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
+      - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
+      - CONSUL_HTTP_ADDR=${CONSUL_HTTP_ADDR:-http://consul:8500}
+      # Standalone mode when either flag is 0. Integrated mode needs both at 1.
+      - CONSUL_ENABLED=${CONSUL_ENABLED:-0}
+      - LITEFS_ENABLED=${LITEFS_ENABLED:-0}
+      - LLDAP_HTTP_URL=http://lldap.${STACK_DOMAIN:-sh.lan}
+      # The wizard writes these files. LLDAP reads the file contents.
+      - LLDAP_JWT_SECRET_FILE=/etc/lldap/secrets/jwt_secret
+      - LLDAP_KEY_SEED_FILE=/etc/lldap/secrets/key_seed
+      - LLDAP_LDAP_USER_PASS_FILE=/etc/lldap/secrets/ldap_user_pass
+    ports:
+      # LDAP port for standalone clients. Bound to PUBLIC_IP, which defaults
+      # to 127.0.0.1. Set PUBLIC_IP to a trusted LAN address to expose it.
+      - target: 3890
+        published: 3890
+        host_ip: ${PUBLIC_IP:-127.0.0.1}
+        protocol: tcp
+      # HTTP UI and API. Trusted LAN only. Goes through caddy.
+      - '0.0.0.0:17170:17170/tcp'
+    restart: unless-stopped
+    healthcheck:
+      # Unauthenticated endpoint. The login page returns 200.
+      test: [ "CMD", "curl", "-fsS", "http://127.0.0.1:17170/" ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 40s
+    # LiteFS mounts a FUSE filesystem through /dev/fuse. cap_add SYS_ADMIN
+    # allows FUSE mounts. devices exposes /dev/fuse. No blanket privileges.
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    # Built locally. Never pull it from a registry.
+    pull_policy: build

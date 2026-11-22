@@ -4,3 +4,6 @@ include:
   - path: compose/consul.yaml
     project_directory: .
     env_file: .env
+  - path: compose/lldap.yaml
+    project_directory: .
+    env_file: .env

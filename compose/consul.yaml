@@ -1,0 +1,50 @@
+# Consul single-node server. Publishes ports on all interfaces.
+# Trusted LAN only. Do not expose these ports to untrusted networks.
+services:
+  consul:
+    image: hashicorp/consul:2.1.0@sha256:259fd02f2544fe1aa03fa49efd3b105c8dd67106d710a72f5e898110266356f7
+    container_name: consul
+    depends_on:
+      consul-data-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./config/consul/consul.hcl:/consul/config/00-base.hcl:ro
+      - ./config/consul/local.hcl:/consul/config/10-local.hcl:ro
+      - ./config/consul/secrets/agent.hcl:/consul/config/20-secrets.hcl:ro
+      - ./config/consul/join.hcl:/consul/config/15-join.hcl:ro
+      - ./data/consul/store:/consul/data:rw
+    ports:
+      # Server RPC. Required for multi-server clusters. Trusted LAN only.
+      - '0.0.0.0:8300:8300/tcp'
+      # Serf LAN gossip. TCP and UDP. Trusted LAN only.
+      - '0.0.0.0:8301:8301/tcp'
+      - '0.0.0.0:8301:8301/udp'
+      # HTTP API and web UI. Trusted LAN only.
+      - '0.0.0.0:8500:8500/tcp'
+      # DNS. TCP and UDP. Trusted LAN only.
+      - '0.0.0.0:8600:8600/tcp'
+      - '0.0.0.0:8600:8600/udp'
+    command: agent -config-dir=/consul/config
+    restart: unless-stopped
+    healthcheck:
+      # Unauthenticated endpoint. ACLs do not block it.
+      test: [ "CMD", "curl", "-fsS", "http://127.0.0.1:8500/v1/status/leader" ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+  # Create and own the store directory before Consul starts.
+  # The wizard never writes to data/. Docker creates a missing bind mount as root with mode 0755.
+  # This init service sets the owner to uid 100 and gid 1000 and the mode to 0700.
+  consul-data-init:
+    image: hashicorp/consul:2.1.0@sha256:259fd02f2544fe1aa03fa49efd3b105c8dd67106d710a72f5e898110266356f7
+    container_name: consul-data-init
+    volumes:
+      - ./data/consul/store:/consul/data:rw
+    command: |
+      mkdir -p /consul/data
+      chown 100:1000 /consul/data
+      chmod 0700 /consul/data
+    entrypoint: ["/bin/sh", "-c"]
+    restart: "no"
+    user: "0:0"

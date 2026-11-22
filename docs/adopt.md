@@ -15,7 +15,7 @@ checks, the hooks, the CI jobs, and the release flow.
 | --- | --- | --- |
 | Checks | `scripts/ci.sh` | Runs every check. |
 | Formatters | `scripts/format.sh` | Applies every formatter. |
-| Git hooks | `.githook/` | Checks the message and runs the checks. |
+| Git hooks | `.githook/` | Runs the checks. |
 | CI checks | `.github/workflows/ci.yml` | Runs the same checks on GitHub. |
 | Release | `cog.toml`, `release.yml` | Creates the changelog and a tag. |
 | Sandbox | `scripts/smolvm*.sh`, `smol/` | Runs the checks in a microVM. |
@@ -249,7 +249,7 @@ Run this command:
 make hooks
 ```
 
-The target sets `core.hooksPath` to `.githook`. It also makes the three
+The target sets `core.hooksPath` to `.githook`. It also makes the two
 hook files executable. Check the value:
 
 ```bash
@@ -261,7 +261,7 @@ clone must run `make hooks`.
 
 `make hooks` replaces any existing hook path. Do not run it when the
 repository uses Husky, lefthook, or the pre-commit framework. Run
-`scripts/ci.sh` and `cog verify` from the existing hooks instead.
+`scripts/ci.sh` from the existing hooks instead.
 
 Add this command to the existing pre-commit hook and the existing
 pre-push hook:
@@ -271,15 +271,11 @@ pre-push hook:
 exec scripts/ci.sh
 ```
 
-Add this command to the existing commit-msg hook:
-
-```sh
-#!/bin/sh
-exec cog verify --file "$1"
-```
-
 The `pre-commit` and `pre-push` hooks run the full pipeline. A commit
 waits for every check. The wait can be long on a large repository.
+
+The commit history check has no hook. `make check-commits` and the CI
+workflow run `scripts/check-commits.sh`.
 
 The committed hooks also change to the repository root first. Keep that
 step when your hook tool starts in another directory.
@@ -401,9 +397,8 @@ PATCH. A `feat` bumps MINOR. A `!` or a `BREAKING CHANGE:` footer bumps
 MAJOR.
 
 When the existing history does not follow Conventional Commits, do not
-enable the commit check and the commit-msg hook yet. Keep
-`scripts/check-commits.sh` and `.githook/commit-msg` out of the first
-adoption commit. Add them after the history can pass.
+enable the commit check yet. Keep `scripts/check-commits.sh` out of the
+first adoption commit. Add it after the history can pass.
 
 When the history follows Conventional Commits and has no tag, create a
 local baseline tag at the adoption commit:
@@ -553,7 +548,7 @@ is unavailable. Set `SMOLVM_ENABLED=0` to force the host path.
 | Path | Action | Notes |
 | --- | --- | --- |
 | `.editorconfig` | merge or copy | Keep your existing rules. |
-| `.githook/*` | copy | Copy the three hooks. |
+| `.githook/*` | copy | Copy the two hooks. |
 | `.github/workflows/ci.yml` | adapt | Change branches and matrix. |
 | `.github/workflows/release.yml` | adapt or skip | Adapt the tag trigger. |
 | `.github/dependabot.yml` | optional | Updates the action pins. |
@@ -613,8 +608,7 @@ That file sources the resources file. Host mode needs neither.
     make hooks
     ```
 
-5. Make one test commit. The commit-msg hook runs `cog verify`. The
-    pre-commit hook runs `scripts/ci.sh`:
+5. Make one test commit. The pre-commit hook runs `scripts/ci.sh`:
 
     ```bash
     git commit --allow-empty -m 'chore: test the hooks'
@@ -717,8 +711,8 @@ git config --get core.hooksPath
 
 The output must be `.githook`. Each clone needs `make hooks`. When the
 output is another path, an existing hook tool owns the path. Do not
-overwrite it. Add `scripts/ci.sh` and `cog verify` to that tool's
-hooks.
+overwrite it. Add `scripts/ci.sh` to that tool's hooks. The commit
+history check runs in CI and in `make check-commits`.
 
 ### check-commits fails on old history
 
@@ -734,8 +728,8 @@ git tag v0.0.0
 
 Do not push the tag. The check then reads only the commits after it.
 You can also delete `scripts/check-commits.sh` until the history can
-pass. The commit-msg hook still rejects a new message that does not
-follow the format. Do not use `--no-verify`.
+pass. Delete the `commits` matrix entry in the CI workflow too. Add
+both after the history can pass.
 
 ### check-editorconfig reports many existing files
 

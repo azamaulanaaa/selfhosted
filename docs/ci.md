@@ -106,16 +106,17 @@ These commands and files form the pipeline:
 - `scripts/format.sh` runs every `scripts/format-*.sh` in name order. It
   stops when a formatter fails.
 - `make format` runs `scripts/format.sh`.
-- `.githook/commit-msg` runs `cog verify` on the commit message. A bad
-  message stops the commit.
 - `.githook/pre-commit` runs `scripts/ci.sh` before each commit.
 - `.githook/pre-push` runs `scripts/ci.sh` before each push.
 - `make hooks` sets `core.hooksPath` to `.githook`. It makes the hooks
   executable.
+- The CI workflow and `make check-commits` run
+  `scripts/check-commits.sh`. That script checks the commit history
+  with `cog check`.
 
 The `pre-commit` and `pre-push` hooks call `scripts/ci.sh` directly.
-The `commit-msg` hook calls `cog verify`. No hook calls `mise`. If a
-required tool is missing from `PATH`, the hook fails.
+No hook calls `mise`. If a required tool is missing from `PATH`, the
+hook fails.
 
 `scripts/ci.sh` prints `run: <script>` before each check. It prints
 `all checks passed (N scripts)` after the last check. A failed check

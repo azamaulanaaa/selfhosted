@@ -32,7 +32,7 @@ make hooks
 ```
 
 The target sets `core.hooksPath` to `.githook`. The target also makes
-the three hook files executable.
+the two hook files executable.
 
 ## Checks
 
@@ -153,11 +153,13 @@ GitHub Actions runs the same checks on pull requests and pushes to
 
 ## Git hooks
 
-`make hooks` installs three hooks:
+`make hooks` installs two hooks:
 
-- `.githook/commit-msg` checks the commit message with `cog verify`.
 - `.githook/pre-commit` runs `scripts/ci.sh` before each commit.
 - `.githook/pre-push` runs `scripts/ci.sh` before each push.
+
+The commit history check does not use a hook. `make check-commits` and
+the CI workflow run `scripts/check-commits.sh`.
 
 Do not use `--no-verify` to skip a hook. A failed hook shows a problem.
 Fix the problem. Then commit or push again.
@@ -266,7 +268,7 @@ See the [smolvm documentation](docs/smolvm.md) for the full list.
 
 - `.github/workflows/ci.yml` defines the check workflow for GitHub
   Actions.
-- `.githook/` contains the three Git hooks.
+- `.githook/` contains the two Git hooks.
 - `scripts/` contains the check scripts, the format scripts, the
   `ci.sh` entry point, the release scripts, and the `smolvm.sh`,
   `smolvm-clean.sh`, `smolvm-exec.sh`, and `smolvm-serve.sh` helpers.

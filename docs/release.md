@@ -43,10 +43,8 @@ A `BREAKING CHANGE:` footer also marks a breaking change.
 
 ## Enforcement
 
-The repository enforces the commit format in three places:
+The repository enforces the commit format in two places:
 
-- `.githook/commit-msg` runs `cog verify --file` on the message before
-  Git creates the commit. A bad message stops the commit.
 - `scripts/check-commits.sh` runs `cog check` from `scripts/ci.sh`.
   `make ci` and both Git hooks run this script.
 - `.githook/pre-push` runs `scripts/ci.sh` before each push. A bad
@@ -238,10 +236,11 @@ the tool is absent:
 error: cog is not on PATH. Install cocogitto first.
 ```
 
-### The commit hook rejects a message
+### The commit check rejects a message
 
-The commit hook runs `cog verify`. Read the error. Write the message in
-the commit format. Run this command to correct the last commit:
+`scripts/check-commits.sh` runs `cog check`. Read the error. Write the
+message in the commit format. Run this command to correct the last
+commit:
 
 ```bash
 git commit --amend

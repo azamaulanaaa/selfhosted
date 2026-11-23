@@ -1,0 +1,7 @@
+# Garage scaling files. The columns are path, mode, scope, when, presence, purpose.
+config/garage	700	shared	both	required	Garage configuration directory.
+config/garage/secrets	700	shared	both	required	Garage secret directory.
+config/garage/garage.toml	600	node-local	both	required	Garage config. The public RPC address differs for each node.
+config/garage/secrets/rpc_secret	600	shared	both	required	Garage RPC secret. It must match on every node.
+config/garage/secrets/admin_token	600	node-local	both	required	Garage admin API token.
+config/garage/secrets/metrics_token	600	node-local	both	required	Garage metrics token.

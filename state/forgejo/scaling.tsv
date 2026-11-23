@@ -1,0 +1,8 @@
+# Forgejo scaling files. The columns are path, mode, scope, when, presence, purpose.
+config/forgejo	750	shared	both	required	Forgejo configuration directory.
+config/forgejo/secrets	700	shared	both	required	Forgejo secret directory.
+config/forgejo/forgejo.env	640	shared	both	required	Wizard answers and secret file paths.
+config/forgejo/consul-template.hcl	640	shared	both	required	Consul-template settings for app.ini and the hook.
+config/forgejo/secrets/secret-key	600	shared	both	required	Forgejo secret key. Copy it to every node.
+config/forgejo/secrets/oidc-client-secret	600	shared	both	optional	OIDC client secret when OIDC is enabled.
+config/forgejo/secrets/litefs-token	600	node-local	both	optional	LiteFS Consul token. The entrypoint creates it.

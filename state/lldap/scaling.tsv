@@ -1,0 +1,9 @@
+# LLDAP scaling files. The columns are path, mode, scope, when, presence, purpose.
+config/lldap	700	shared	both	required	LLDAP configuration directory.
+config/lldap/secrets	700	shared	both	required	LLDAP secret directory.
+config/lldap/lldap_config.toml	600	shared	both	required	Base DN, admin user, and database URL.
+config/lldap/secrets/jwt_secret	600	shared	both	required	JWT signing secret. Copy it to every node.
+config/lldap/secrets/key_seed	600	shared	both	required	Key seed for stored values. Copy it to every node.
+config/lldap/secrets/ldap_user_pass	600	shared	both	required	Admin password copy in the LLDAP secret tree.
+config/ldap/secrets	700	shared	both	required	Shared LDAP secret directory.
+config/ldap/secrets/user-pass	600	shared	both	required	Canonical LDAP admin password.

@@ -1,0 +1,12 @@
+# Consul scaling files. The columns are path, mode, scope, when, presence, purpose.
+.env	640	node-local	both	required	Root environment file. PUBLIC_IP differs for each node.
+config/consul	750	shared	local	required	Consul configuration directory.
+config/consul/secrets	700	shared	both	required	Consul secret directory.
+config/consul/consul.hcl	640	shared	local	required	Rendered server base configuration.
+config/consul/local.hcl	640	node-local	local	required	Node name and advertise address.
+config/consul/bootstrap.hcl	640	shared	local	required	Cluster bootstrap_expect value.
+config/consul/join.hcl	640	shared	local	required	Rendered retry_join peer list.
+config/consul/peers.txt	640	shared	local	required	Peer list. Copy it to every server.
+config/consul/secrets/agent.hcl	600,640	shared	local	required	Gossip key and initial ACL tokens.
+config/consul/secrets/gossip.key	600	shared	local	required	Shared Serf gossip key.
+config/consul/secrets/remote-token	600	shared	remote	required	Remote Consul ACL token. It must match on every node.

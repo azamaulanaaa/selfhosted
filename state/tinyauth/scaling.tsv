@@ -1,0 +1,9 @@
+# Tinyauth scaling files. The columns are path, mode, scope, when, presence, purpose.
+config/tinyauth	700	shared	both	required	Tinyauth configuration directory.
+config/tinyauth/secrets	700	shared	both	required	Tinyauth secret directory.
+config/tinyauth/tinyauth.env	640	shared	both	required	Wizard answers and secret file paths.
+config/tinyauth/secrets/oidc	700	shared	both	required	OIDC key and client secret directory.
+config/tinyauth/secrets/oidc/private.pem	600	shared	both	required	OIDC private signing key.
+config/tinyauth/secrets/oidc/public.pem	600	shared	both	required	OIDC public signing key.
+config/tinyauth/secrets/ldap-observer	600	shared	both	required	Observer bind password.
+config/tinyauth/secrets/litefs-token	600	node-local	both	optional	LiteFS Consul token. The entrypoint creates it.

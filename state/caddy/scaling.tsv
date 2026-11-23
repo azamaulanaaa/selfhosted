@@ -1,0 +1,8 @@
+# Caddy scaling files. The columns are path, mode, scope, when, presence, purpose.
+config/caddy	750	shared	both	required	Caddy configuration directory.
+config/caddy/secrets	700	shared	both	required	Caddy secret directory. The wizard creates it empty.
+config/caddy/consul-template.hcl	640	shared	both	required	Consul address and consul-template settings.
+config/caddy/certs	750	shared	both	required	Certificate directory. Share it when you supply certificates by hand.
+config/caddy/certs/wildcard/fullchain.pem	640	shared	both	optional	Wildcard certificate chain for the existing TLS mode.
+config/caddy/certs/wildcard/privkey.pem	600	shared	both	optional	Wildcard private key for the existing TLS mode.
+data/caddy/store	700	node-local	both	required	ACME and internal CA state. Do not copy it.

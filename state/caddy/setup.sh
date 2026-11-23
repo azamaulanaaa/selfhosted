@@ -5,17 +5,16 @@
 #
 # One container serves the stack vhosts over HTTPS. The caddy image is
 # built locally from state/caddy/Dockerfile. It embeds consul-template.
+# Consul is always required. consul-template renders /etc/caddy/Caddyfile
+# from state/caddy/Caddyfile.tpl and caddy reloads on change
+# (caddy run --watch). There is no sidecar service.
 #
-# Two modes exist. With CONSUL_ENABLED=0 the entrypoint renders a static
-# Caddyfile from state/caddy/Caddyfile.static.tpl. No peer is required.
-# With CONSUL_ENABLED=1 consul-template renders /etc/caddy/Caddyfile from
-# state/caddy/Caddyfile.tpl and caddy reloads on change (caddy run --watch).
-# There is no sidecar service.
+# The wizard never writes a consul token. The entrypoint reads the token
+# from config/consul/secrets at container start: agent.hcl in local mode,
+# remote-token in remote mode. The local address is http://consul:8500.
 #
-# The wizard never writes a consul token. The entrypoint reads
-# initial_management from config/consul/secrets/agent.hcl at container start.
-# In integrated mode the TLS mode is asked on every run. There is no default.
-# Standalone mode uses the internal CA.
+# TLS_ENABLED=1 asks for CADDY_TLS_MODE on every run. There is no default.
+# TLS_ENABLED=0 uses the internal CA.
 #
 # The root dispatcher (setup.sh) calls this script. It can also run standalone.
 #
@@ -28,18 +27,17 @@
 # Non-interactive environment variables:
 #   STACK_DOMAIN            Base domain for the stack. Default: the STACK_DOMAIN line
 #                           in the root .env, else sh.lan. Example: sh.lan.
-#   CADDY_USE_LOCAL_CONSUL  1 to use this repo's consul service, 0 to use a remote one.
-#                           Default 1.
-#   CADDY_CONSUL_HOST       Consul IP or hostname (remote only). Required when
-#                           CADDY_USE_LOCAL_CONSUL=0.
-#   CADDY_CONSUL_PORT       Consul HTTP port (remote only). Default 8500.
-#   CONSUL_ENABLED          Capability flag. Default 0. Read from the root .env
-#                           when not set in the process environment.
+#   CONSUL_ADDR             Consul address. Read from the process environment, then
+#                           from the root .env. Default: http://consul:8500.
+#                           http://consul:8500 is local Consul. Any other valid
+#                           http:// or https:// value is remote Consul.
 #   LITEFS_ENABLED          Capability flag. Default 0.
 #   OIDC_ENABLED            Capability flag. Default 0.
-#   TLS_ENABLED             Capability flag. Default 0.
+#   TLS_ENABLED             Capability flag. Default 0. At 1, the wizard asks for
+#                           CADDY_TLS_MODE. At 0, the TLS mode is internal.
 #   CADDY_TLS_MODE          TLS mode: internal, letsencrypt, or existing.
-#                           There is no default. Non-interactive runs must set it.
+#                           Required when TLS_ENABLED=1. Non-interactive runs must
+#                           set it.
 #   CADDY_TLS_EMAIL         ACME contact email. Required when CADDY_TLS_MODE=letsencrypt.
 #   CADDY_TLS_CERTS         For CADDY_TLS_MODE=existing. One of:
 #                             wildcard                          keep the existing
@@ -62,14 +60,21 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 readonly REPO_ROOT
 
-# Parse the STACK_DOMAIN value from the root .env file.
+# Parse the value of a key from the root .env file.
 # Print the trimmed value. Print nothing when the file or the line is missing.
-read_env_stack_domain() {
+read_env_value() {
+  local key="$1"
   if [ ! -f .env ]; then
     return 0
   fi
-  { grep -E '^STACK_DOMAIN=' .env || true; } | tail -n1 | cut -d= -f2- |
+  { grep -E "^${key}=" .env || true; } | tail -n1 | cut -d= -f2- |
     sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\\1/" -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
+}
+
+# Parse the STACK_DOMAIN value from the root .env file.
+# Print the trimmed value. Print nothing when the file or the line is missing.
+read_env_stack_domain() {
+  read_env_value STACK_DOMAIN
 }
 
 # Print a capability flag. The process environment wins over the root .env
@@ -184,15 +189,48 @@ write_env_file() {
   mv "$tmp_env" .env
 }
 
-# Return 0 when the argument is a plausible consul host.
-# Allow letters, digits, dots, dashes, and colons. It must not be empty.
-is_valid_consul_host() {
-  [[ "$1" =~ ^[a-zA-Z0-9.:-]+$ ]]
+# Return 0 when the argument is a valid Consul address.
+# A valid address starts with http:// or https://, has a host, and has no whitespace.
+is_valid_consul_addr() {
+  local addr="$1"
+  if [ -z "$addr" ] || [[ "$addr" =~ [[:space:]] ]]; then
+    return 1
+  fi
+  if [[ ! "$addr" =~ ^https?:// ]]; then
+    return 1
+  fi
+  local rest="${addr#*://}"
+  local host="${rest%%[/?#]*}"
+  if [ -z "$host" ] || [[ "$host" == :* ]]; then
+    return 1
+  fi
+  return 0
 }
 
-# Return 0 when the argument is a valid TCP port. 1 to 65535.
-is_valid_port() {
-  [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+# Resolve CONSUL_ADDR. Set consul_addr and consul_mode.
+# The order is: the process environment, then the root .env file, then the
+# local address. One trailing slash does not change the comparison.
+resolve_consul_addr() {
+  local candidate=""
+  if [ -n "${CONSUL_ADDR:-}" ]; then
+    candidate="$CONSUL_ADDR"
+  else
+    candidate="$(read_env_value CONSUL_ADDR)"
+  fi
+  if [ -z "$candidate" ]; then
+    candidate="http://consul:8500"
+  fi
+  if ! is_valid_consul_addr "$candidate"; then
+    echo "error: CONSUL_ADDR '$candidate' is not valid." >&2
+    echo "error: Use http:// or https://, a host, and no whitespace." >&2
+    exit 1
+  fi
+  consul_addr="$candidate"
+  if [ "${consul_addr%/}" = "http://consul:8500" ]; then
+    consul_mode="local"
+  else
+    consul_mode="remote"
+  fi
 }
 
 # Return 0 when the argument is a valid email address. user@host.tld shape.
@@ -408,88 +446,19 @@ fi
 
 # Step 1b: resolve the capability flags. The process environment wins over
 # the root .env file. Each flag defaults to 0.
-consul_enabled="$(read_capability_flag CONSUL_ENABLED)"
 litefs_enabled="$(read_capability_flag LITEFS_ENABLED)"
 oidc_enabled="$(read_capability_flag OIDC_ENABLED)"
 tls_enabled="$(read_capability_flag TLS_ENABLED)"
 
-use_local_consul=1
-consul_host="127.0.0.1"
-consul_port="8500"
-if [ "$consul_enabled" -eq 0 ]; then
-  echo "info: Standalone mode. Caddy does not use consul." >&2
-elif [ -t 0 ]; then
-  if ! read -r -p "Use this repo's consul service for consul-template? [Y/n] " local_answer; then
-    local_answer=""
-  fi
-  case "${local_answer:-Y}" in
-  [Yy] | [Yy][Ee][Ss])
-    use_local_consul=1
-    ;;
-  [Nn] | [Nn][Oo])
-    use_local_consul=0
-    ;;
-  *)
-    echo "error: Answer Y or N." >&2
-    exit 1
-    ;;
-  esac
-  if [ "$use_local_consul" -eq 0 ]; then
-    if ! read -r -p "Consul IP or hostname? " host_answer; then
-      host_answer=""
-    fi
-    if [ -z "$host_answer" ] || ! is_valid_consul_host "$host_answer"; then
-      echo "error: '$host_answer' is not a valid Consul IP or hostname. Allow letters, digits, dots, dashes, and colons." >&2
-      exit 1
-    fi
-    consul_host="$host_answer"
-    if ! read -r -p "Consul HTTP port? [8500] " port_answer; then
-      port_answer=""
-    fi
-    consul_port="${port_answer:-8500}"
-    if ! is_valid_port "$consul_port"; then
-      echo "error: '$consul_port' is not a valid port. Use 1 to 65535." >&2
-      exit 1
-    fi
-  fi
-else
-  case "${CADDY_USE_LOCAL_CONSUL:-1}" in
-  0 | 1)
-    ;;
-  *)
-    echo "error: CADDY_USE_LOCAL_CONSUL must be 0 or 1." >&2
-    exit 1
-    ;;
-  esac
-  case "${CADDY_USE_LOCAL_CONSUL:-1}" in
-  1)
-    use_local_consul=1
-    ;;
-  0)
-    use_local_consul=0
-    consul_host="${CADDY_CONSUL_HOST:-}"
-    consul_port="${CADDY_CONSUL_PORT:-8500}"
-    if [ -z "$consul_host" ]; then
-      echo "error: CADDY_CONSUL_HOST is required when CADDY_USE_LOCAL_CONSUL=0." >&2
-      exit 1
-    fi
-    if ! is_valid_consul_host "$consul_host"; then
-      echo "error: CADDY_CONSUL_HOST '$consul_host' is not a valid Consul IP or hostname. Allow letters, digits, dots, dashes, and colons." >&2
-      exit 1
-    fi
-    if ! is_valid_port "$consul_port"; then
-      echo "error: CADDY_CONSUL_PORT '$consul_port' is not a valid port. Use 1 to 65535." >&2
-      exit 1
-    fi
-    ;;
-  esac
-fi
+# Step 1c: resolve the Consul address. Consul is mandatory. The wizard does
+# not ask about Consul. The root wizard exports CONSUL_ADDR.
+resolve_consul_addr
 
-# Step 1b: collect the TLS answers. Standalone mode uses the internal CA.
-# Integrated mode always asks the mode. There is no default.
+# Step 1d: collect the TLS answers. TLS_ENABLED=0 uses the internal CA.
+# TLS_ENABLED=1 always asks the mode. There is no default.
 # Collect everything, then create the files. Invalid answers exit before any writes.
 tls_mode=""
-if [ "$consul_enabled" -eq 0 ]; then
+if [ "$tls_enabled" -eq 0 ]; then
   tls_mode="internal"
 elif [ -t 0 ]; then
   if ! read -r -p "TLS mode (internal, letsencrypt, existing)? " tls_answer; then
@@ -722,20 +691,16 @@ if [ "${#cert_copies[@]}" -gt 0 ]; then
 fi
 
 # Step 4: write the consul-template configuration.
-# The entrypoint reads the management token from
-# config/consul/secrets/agent.hcl at container start. The wizard never writes
-# a consul token. The entrypoint creates a scoped caddy token at run time.
-if [ "$use_local_consul" -eq 1 ]; then
-  consul_address="http://consul:8500"
-else
-  consul_address="http://$consul_host:$consul_port"
-fi
+# The entrypoint reads the token from config/consul/secrets at container
+# start: agent.hcl in local mode, remote-token in remote mode. The wizard
+# never writes a consul token. The entrypoint creates a scoped caddy token
+# at run time.
 {
   printf '# Rendered by setup.sh caddy. Do not edit. Run the wizard again to regenerate.\n'
   printf '# consul-template runs inside the caddy container.\n'
   printf 'consul {\n'
   printf '  # This is the address of the Consul agent or server.\n'
-  printf '  address = "%s"\n' "$consul_address"
+  printf '  address = "%s"\n' "$consul_addr"
   printf '}\n'
   printf '\n'
   printf 'template {\n'
@@ -752,14 +717,14 @@ chmod 0640 config/caddy/consul-template.hcl
 # Step 6: print the summary.
 echo "Configured the caddy wizard files:"
 echo "  config/caddy/consul-template.hcl"
-echo "note: capability flags: consul=$consul_enabled litefs=$litefs_enabled oidc=$oidc_enabled tls=$tls_enabled"
-if [ "$consul_enabled" -eq 0 ]; then
-  echo "mode: standalone. The container uses a static Caddyfile and tls internal."
-else
-  echo "mode: integrated. The container uses consul-template."
+echo "note: capability flags: litefs=$litefs_enabled oidc=$oidc_enabled tls=$tls_enabled"
+echo "consul: $consul_addr ($consul_mode)"
+if [ "$consul_mode" = "local" ]; then
   echo "note: the entrypoint reads initial_management from config/consul/secrets/agent.hcl."
-  echo "note: mount that file into the caddy container before you start it."
+else
+  echo "note: the entrypoint reads the ACL token from config/consul/secrets/remote-token."
 fi
+echo "note: mount config/consul/secrets into the caddy container before you start it."
 echo "caddy vhosts: https://consul.$stack_domain (all consul nodes, :8500), https://lldap.$stack_domain, https://tinyauth.$stack_domain, https://forgejo.$stack_domain"
 case "$tls_mode" in
 internal)
@@ -780,16 +745,12 @@ existing)
   ;;
 esac
 echo "note: .env written with STACK_DOMAIN=$stack_domain and CADDY_TLS_MODE=$tls_mode"
-if [ "$consul_enabled" -eq 1 ]; then
-  echo "note: consul-template renders state/caddy/Caddyfile.tpl into /etc/caddy/Caddyfile"
-  echo "note: caddy reloads the file itself when it changes (caddy run --watch)"
-else
-  echo "note: the entrypoint renders state/caddy/Caddyfile.static.tpl into /etc/caddy/Caddyfile"
-fi
+echo "note: consul-template renders state/caddy/Caddyfile.tpl into /etc/caddy/Caddyfile"
+echo "note: caddy reloads the file itself when it changes (caddy run --watch)"
 echo "note: the caddy service publishes ports 80 and 443."
-if [ "$consul_enabled" -eq 1 ] && [ "$use_local_consul" -eq 1 ]; then
+if [ "$consul_mode" = "local" ]; then
   echo "hint: consul must run too (docker compose up -d consul)."
-  echo "hint: the entrypoint creates the caddy read ACL when the consul CLI is in the image."
 fi
+echo "hint: the entrypoint creates the caddy read ACL when the consul CLI is in the image."
 echo "Next step: docker compose up -d caddy"
 echo "hint: the caddy image is built locally from state/caddy/Dockerfile (build context ./state/caddy)."

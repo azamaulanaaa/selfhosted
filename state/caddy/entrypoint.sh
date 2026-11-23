@@ -1,46 +1,77 @@
 #!/bin/sh
-# Start caddy in standalone mode or integrated mode.
-# Standalone (CONSUL_ENABLED=0): render a static Caddyfile. No consul calls.
-# Integrated (CONSUL_ENABLED=1): create the read ACL, render once with
-# consul-template, supervise it, then run caddy in watch mode.
+# Create the caddy read ACL, render the Caddyfile with consul-template, and
+# run caddy in watch mode.
+# Consul is always required. The CONSUL_ADDR value selects local or remote
+# Consul. The entrypoint never prints the token.
 set -eu
 
 CFG=/etc/consul-template/config.hcl
-STATIC_TEMPLATE=/etc/consul-template/templates/Caddyfile.static.tpl
-MANAGEMENT_FILE=/etc/caddy/consul-agent.hcl
+MANAGEMENT_FILE=/etc/consul/secrets/agent.hcl
+REMOTE_TOKEN_FILE=/etc/consul/secrets/remote-token
 CADDYFILE=/etc/caddy/Caddyfile
 STORE=/data/caddy
-CONSUL_ENABLED="${CONSUL_ENABLED:-0}"
-STACK_DOMAIN="${STACK_DOMAIN:-sh.lan}"
+LOCAL_CONSUL_ADDR=http://consul:8500
 
-# Docker creates a missing bind mount root as root-owned mode 0755. The
-# container runs as root, so it owns the store and the ACME files in it.
-# A backup must read the store with root privileges.
-mkdir -p "$STORE"
-chmod 0700 /data "$STORE"
+# Return 0 when the argument is the local Consul address.
+# Remove one trailing slash before the comparison.
+is_local_consul_addr() {
+  [ "${1%/}" = "$LOCAL_CONSUL_ADDR" ]
+}
+
+# Print the token file for the given Consul address.
+token_file_for_addr() {
+  if is_local_consul_addr "$1"; then
+    printf '%s\n' "$MANAGEMENT_FILE"
+  else
+    printf '%s\n' "$REMOTE_TOKEN_FILE"
+  fi
+}
+
+# Print the Consul address from the consul-template configuration.
+read_config_address() {
+  sed -n 's/.*address[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$CFG" | head -n1
+}
+
+# Resolve CONSUL_ADDR. Set consul_addr.
+# The environment wins. Fall back to the configuration file, then local.
+resolve_consul_addr() {
+  consul_addr="${CONSUL_ADDR:-}"
+  if [ -z "$consul_addr" ]; then
+    consul_addr="$(read_config_address)"
+  fi
+  if [ -z "$consul_addr" ]; then
+    consul_addr="$LOCAL_CONSUL_ADDR"
+  fi
+}
+
+# Print the management token. Print nothing when the file is absent.
+# Local mode reads initial_management from agent.hcl.
+# Remote mode reads the first line of remote-token.
+read_management_token() {
+  source_token_file="$(token_file_for_addr "$consul_addr")"
+  [ -f "$source_token_file" ] || return 0
+  if is_local_consul_addr "$consul_addr"; then
+    sed -n 's/.*initial_management[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "$source_token_file" | head -n1
+  else
+    head -n1 "$source_token_file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+  fi
+}
 
 # Print the commands that create the caddy read ACL by hand.
 print_acl_commands() {
   echo "hint: Create the caddy read ACL policy with these commands." >&2
-  echo "hint: 1. Read initial_management from config/consul/secrets/agent.hcl." >&2
-  echo "hint: 2. Run: export CONSUL_HTTP_ADDR=$1" >&2
-  echo "hint: 3. Run: export CONSUL_HTTP_TOKEN=<initial_management>" >&2
+  if is_local_consul_addr "$consul_addr"; then
+    echo "hint: 1. Read initial_management from config/consul/secrets/agent.hcl." >&2
+  else
+    echo "hint: 1. Read the ACL token from config/consul/secrets/remote-token." >&2
+  fi
+  echo "hint: 2. Run: export CONSUL_HTTP_ADDR=$consul_addr" >&2
+  echo "hint: 3. Run: export CONSUL_HTTP_TOKEN=<management-token>" >&2
   printf '%s\n' "hint: 4. Run: printf 'service_prefix \"\" { policy = \"read\" }\\nkey_prefix \"\" { policy = \"read\" }\\n' > /tmp/caddy-read.hcl" >&2
   echo "hint: 5. Run: consul acl policy create -name caddy-read -rules @/tmp/caddy-read.hcl" >&2
   echo "hint: 6. Run: consul acl token create -description 'caddy read' -policy-name caddy-read" >&2
-}
-
-# Print the management token. Print nothing when the file is absent.
-read_management_token() {
-  [ -f "$MANAGEMENT_FILE" ] || return 0
-  sed -n 's/.*initial_management[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
-    "$MANAGEMENT_FILE" | head -n1
-}
-
-# Print the consul address from the consul-template configuration.
-read_consul_address() {
-  sed -n 's/.*address[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
-    "$CFG" | head -n1
 }
 
 # Restart consul-template after a crash. Caddy must keep receiving updates.
@@ -55,13 +86,9 @@ supervise_consul_template() {
 # Create the caddy read ACL policy and token. Write a runtime consul-template
 # config that uses the token. Print commands when automatic creation fails.
 bootstrap_read_acl() {
-  consul_addr="$(read_consul_address)"
-  if [ -z "$consul_addr" ]; then
-    consul_addr="http://consul:8500"
-  fi
   management_token="$(read_management_token)"
   if [ -z "$management_token" ] || ! command -v consul >/dev/null 2>&1; then
-    print_acl_commands "$consul_addr"
+    print_acl_commands
     return 0
   fi
 
@@ -80,7 +107,7 @@ bootstrap_read_acl() {
   if ! consul acl policy read -name caddy-read >/dev/null 2>&1; then
     if ! consul acl policy create -name caddy-read -rules "@$policy_file" >/dev/null 2>&1; then
       echo "warning: Could not create the caddy read ACL policy." >&2
-      print_acl_commands "$consul_addr"
+      print_acl_commands
       return 0
     fi
   fi
@@ -88,25 +115,25 @@ bootstrap_read_acl() {
   token_json="$(consul acl token create -description 'caddy read' \
     -policy-name caddy-read -format json 2>/dev/null)" || {
     echo "warning: Could not create the caddy read ACL token." >&2
-    print_acl_commands "$consul_addr"
+    print_acl_commands
     return 0
   }
   acl_token="$(printf '%s\n' "$token_json" |
     sed -n 's/.*"SecretID"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
   if [ -z "$acl_token" ]; then
     echo "warning: Could not read the new caddy read ACL token." >&2
-    print_acl_commands "$consul_addr"
+    print_acl_commands
     return 0
   fi
 
-  token_file="$STORE/consul-template.token"
-  (umask 077 && printf '%s\n' "$acl_token" >"$token_file")
+  runtime_token_file="$STORE/consul-template.token"
+  (umask 077 && printf '%s\n' "$acl_token" >"$runtime_token_file")
 
   runtime_cfg="$STORE/consul-template.hcl"
   {
     printf 'consul {\n'
     printf '  address = "%s"\n' "$consul_addr"
-    printf '  token_file = "%s"\n' "$token_file"
+    printf '  token_file = "%s"\n' "$runtime_token_file"
     printf '}\n\n'
     printf 'template {\n'
     printf '  source = "/etc/consul-template/templates/Caddyfile.tpl"\n'
@@ -119,25 +146,8 @@ bootstrap_read_acl() {
   echo "info: Created the caddy read ACL policy and token." >&2
 }
 
-# Render the static Caddyfile for standalone mode.
-render_standalone_caddyfile() {
-  if [ ! -f "$STATIC_TEMPLATE" ]; then
-    echo "error: The standalone caddy template is missing." >&2
-    exit 1
-  fi
-  sed "s|__STACK_DOMAIN__|$STACK_DOMAIN|g" "$STATIC_TEMPLATE" >"$CADDYFILE"
-  echo "info: Rendered the standalone caddyfile." >&2
-}
-
-# Start caddy with no peer. No consul-template calls.
-start_standalone() {
-  render_standalone_caddyfile
-  echo "info: Start caddy in standalone mode." >&2
-  exec caddy run --config "$CADDYFILE" --adapter caddyfile
-}
-
 # Render once, supervise consul-template, and run caddy in watch mode.
-start_integrated() {
+start() {
   bootstrap_read_acl
   max_tries=30
   i=0
@@ -159,8 +169,18 @@ start_integrated() {
   exec caddy run --watch --config "$CADDYFILE" --adapter caddyfile
 }
 
-if [ "$CONSUL_ENABLED" = "1" ]; then
-  start_integrated
-else
-  start_standalone
+# Create the store, resolve the Consul address, and start the services.
+main() {
+  # Docker creates a missing bind mount root as root-owned mode 0755. The
+  # container runs as root, so it owns the store and the ACME files in it.
+  # A backup must read the store with root privileges.
+  mkdir -p "$STORE"
+  chmod 0700 /data "$STORE"
+  resolve_consul_addr
+  start
+}
+
+# The smoke test sources this file as a function library.
+if [ "${CADDY_ENTRYPOINT_LIB:-0}" != "1" ]; then
+  main
 fi

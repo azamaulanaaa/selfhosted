@@ -1,46 +1,94 @@
 # Combined stack
 
 This document describes how to run the five services together. The services
-are consul, lldap, caddy, tinyauth, and forgejo. See
-[`docs/layout.md`](layout.md) for the file contract and
+are caddy, consul, forgejo, lldap, and tinyauth. Garage is not part of this
+stack. See [`docs/layout.md`](layout.md) for the file contract and
 [`docs/caddy.md`](caddy.md) for the caddy keys.
+
+## Consul is mandatory
+
+Every service uses Consul. Consul runs in this stack (local) or outside it
+(remote). The root `setup.sh` asks about Consul first. A service wizard never
+asks about Consul.
+
+`CONSUL_ADDR` selects the location:
+
+- `http://consul:8500` selects local Consul. The setup deploys the `consul`
+  service.
+- Any other valid `http://` or `https://` value selects remote Consul. The
+  setup does not deploy the `consul` service.
+
+A valid address starts with `http://` or `https://`, has a host, and has no
+whitespace.
+
+### Local mode
+
+The root wizard asks for the peer list and for `bootstrap_expect`. It stores
+both values in `.env` as `CONSUL_JOIN_IPS` and `CONSUL_BOOTSTRAP_EXPECT`. It
+then deploys Consul with the other enabled services.
+
+The root wizard forces the `consul` service into the enabled list. This
+applies when the user answers no and when `SETUP_SERVICES=none`.
+
+### Remote mode
+
+The root wizard asks for the remote ACL token with a hidden prompt. It writes
+the token to `config/consul/secrets/remote-token` with mode 600. It gives the
+directory mode 700. It does not deploy Consul. Non-interactive input is
+`CONSUL_HTTP_TOKEN`.
+
+The root wizard never writes the token to `.env`. It removes `consul` from
+the enabled services.
 
 ## Capability flags
 
-The root `.env` file holds four capability flags. `STACK_DOMAIN` defaults to
-`sh.lan`. `PUBLIC_IP` holds the address that peers use to reach this node.
+The root `.env` file holds three capability flags:
 
-- `CONSUL_ENABLED`
-- `LITEFS_ENABLED`
-- `OIDC_ENABLED`
-- `TLS_ENABLED`
+- `LITEFS_ENABLED` gates LiteFS.
+- `OIDC_ENABLED` gates OIDC.
+- `TLS_ENABLED` gates the caddy TLS mode question.
 
-Each flag defaults to `0`. A service with every flag at `0` runs in standalone
-mode. Set all four flags to `1` for the combined stack. Run `setup.sh` once
-after you change the flags. The script regenerates `compose.yaml` from the
-files in `compose/`. Do not edit `compose.yaml` by hand.
+Each flag defaults to `0`. A flag does not select the Consul location.
+
+`STACK_DOMAIN` defaults to `sh.lan`. `PUBLIC_IP` holds the address that peers
+use to reach this node.
 
 ## Startup order
 
 Start the services in this order:
 
-1. Start consul. Wait for a leader and for the web UI on port 8500.
-2. Start lldap, tinyauth, and forgejo. The entrypoints read the LDAP password
-    from `config/ldap/secrets/user-pass`. They read the Consul management
-    token from `config/consul/secrets/agent.hcl` at start. Wizards do not copy
-    the token into their own secret trees.
-3. Start caddy last. In integrated mode consul-template renders the vhosts
-    from the Consul service list and KV keys.
+1. In local mode, start consul first. Wait for a leader and for the web UI
+    on port 8500. In remote mode, skip this step.
+2. Start lldap, tinyauth, and forgejo. The entrypoints read the LDAP
+    password from `config/ldap/secrets/user-pass`. Each entrypoint selects the
+    Consul token at container start.
+3. Start caddy last. consul-template renders the vhosts from the Consul
+    service list and KV keys.
 
-Run `docker compose up -d consul`, then the other services, then
-`docker compose up -d caddy`.
+In local mode, run `docker compose up -d consul`, then the other services,
+then `docker compose up -d caddy`.
+
+## Consul token files
+
+A container selects the token file by comparing `CONSUL_ADDR` to
+`http://consul:8500`. One trailing slash does not change the comparison.
+
+- Local Consul: the container reads key `initial_management` from
+  `config/consul/secrets/agent.hcl`.
+- Remote Consul: the container reads the token from
+  `config/consul/secrets/remote-token`.
+
+A wizard does not copy the token into its own secret tree.
 
 ## Caddy read policy
 
 Consul uses `default_policy = "deny"`. The caddy entrypoint creates the
 `caddy-read` policy and token at start when the Consul CLI and the management
 token are available. If the CLI is absent, the entrypoint prints these
-commands. Run them by hand:
+commands. Run them by hand.
+
+For local Consul, read `initial_management` from
+`config/consul/secrets/agent.hcl`:
 
 ```bash
 export CONSUL_HTTP_ADDR=http://127.0.0.1:8500
@@ -50,6 +98,10 @@ printf 'key_prefix "" { policy = "read" }\n' >> /tmp/caddy-read.hcl
 consul acl policy create -name caddy-read -rules @/tmp/caddy-read.hcl
 consul acl token create -description 'caddy read' -policy-name caddy-read
 ```
+
+For remote Consul, read the token from
+`config/consul/secrets/remote-token`. Set `CONSUL_HTTP_ADDR` to the remote
+address. Then run the same commands.
 
 The policy grants read access to the service list and the KV keys.
 

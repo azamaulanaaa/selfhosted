@@ -127,10 +127,13 @@ The root wizard uses this order:
 3. Resolve `CONSUL_ADDR`.
 4. Remote: resolve and write the remote token. Local: ask for the peers,
     then ask for `bootstrap_expect`.
-5. Run the service enable loop.
+5. Run the service enable loop for the other services.
 6. Resolve `PUBLIC_IP`.
 7. Write `.env`.
 8. Run each enabled service wizard in sorted order.
+
+`CONSUL_ADDR` decides Consul. The service enable loop asks only the other
+services.
 
 Each service owns one wizard at `state/<app>/setup.sh`. The service
 wizard asks the service-specific questions. It generates the service

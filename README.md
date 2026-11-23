@@ -62,6 +62,7 @@ make check-gitleaks
 make check-hadolint
 make check-markdown
 make check-mise
+make check-scaling
 make check-shfmt
 make check-zizmor
 ```
@@ -290,6 +291,8 @@ See the [smolvm documentation](docs/smolvm.md) for the full list.
   and the release steps.
 - The [smolvm](docs/smolvm.md) describes the sandbox settings,
   the pack cache, and the known limits.
+- The [scaling guide](docs/scaling.md) describes the shared and node-local
+  files and the offline checker.
 
 ## License
 

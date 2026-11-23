@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Ask which services to enable, ask for the shared PUBLIC_IP, and run the
-# wizard of each enabled service.
+# Make Consul the mandatory control plane, ask which services to enable, ask
+# for the shared PUBLIC_IP, and run the wizard of each enabled service.
+# Consul runs in this stack (local) or outside it (remote). The CONSUL_ADDR
+# value selects the location. A service never asks about Consul.
 # The per-service wizards live in state/<service>/setup.sh.
 # The stack assembles compose services with include. compose requires .env; this script creates it when it is missing.
 # Safe to run again: the per-service wizards are idempotent. This script
-# rewrites the PUBLIC_IP line in the root .env and keeps the other lines.
+# rewrites the managed lines in the root .env and keeps the other lines.
 # It never prints secret values. It prints paths only.
+#
+# Order: create .env, assemble compose.yaml, resolve Consul, enable services,
+# resolve PUBLIC_IP, write .env, run the service wizards.
 #
 # Usage:
 #   setup.sh                        Ask which services to enable and for the shared PUBLIC_IP,
@@ -18,10 +23,18 @@
 #                                   Services may support extra flags.
 #
 # Non-interactive environment variables:
+#   CONSUL_ADDR              Consul address. Read from the environment, then from the
+#                            root .env file. http://consul:8500 runs Consul in this
+#                            stack. Any other value runs Consul outside it.
+#   CONSUL_JOIN_IPS          Comma-separated IPv4 list of local Consul peers. Local mode only.
+#   CONSUL_BOOTSTRAP_EXPECT  Local Consul bootstrap_expect. A number from 1 to 99. Local mode only.
+#   CONSUL_HTTP_TOKEN        Remote Consul ACL token. Remote mode only. The script writes
+#                            it to config/consul/secrets/remote-token. It never writes
+#                            the token to .env.
 #   SETUP_SERVICES  Comma-separated list of the services to enable. "all" enables every
 #                   service. "none" enables no service. An empty or absent value enables
 #                   every service. Surrounding whitespace is ignored. Unknown names are
-#                   an error.
+#                   an error. Local Consul always stays enabled.
 #   PUBLIC_IP       Public or LAN IPv4 of this node. The enabled services read it from .env.
 #                   compose substitutes ${PUBLIC_IP}.
 set -euo pipefail
@@ -79,14 +92,27 @@ is_valid_ipv4() {
   return 0
 }
 
-# Parse the PUBLIC_IP value from the root .env file.
+# Parse the value of a key from the root .env file.
 # Print the trimmed value. Print nothing when the file or the line is missing.
-read_env_public_ip() {
+read_env_value() {
+  local key="$1"
   if [ ! -f .env ]; then
     return 0
   fi
-  { grep -E '^PUBLIC_IP=' .env || true; } | tail -n1 | cut -d= -f2- |
+  { grep -E "^${key}=" .env || true; } | tail -n1 | cut -d= -f2- |
     sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\\1/" -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
+}
+
+# Return 0 when the root .env file holds the key.
+env_file_has_key() {
+  local key="$1"
+  [ -f .env ] && grep -qE "^${key}=" .env
+}
+
+# Parse the PUBLIC_IP value from the root .env file.
+# Print the trimmed value. Print nothing when the file or the line is missing.
+read_env_public_ip() {
+  read_env_value PUBLIC_IP
 }
 
 # Resolve the default public or LAN IPv4 of this node.
@@ -157,16 +183,300 @@ public_ip_answer_invalid() {
   exit 1
 }
 
-# Write the root .env with the shared PUBLIC_IP. Keep the other lines.
-# Preserve every line except the PUBLIC_IP=... lines.
+# Trim the surrounding whitespace from the argument and print it.
+trim_whitespace() {
+  printf '%s' "$1" | sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
+}
+
+# Return 0 when the argument is a valid Consul address.
+# A valid address starts with http:// or https://, has a host, and has no whitespace.
+is_valid_consul_addr() {
+  local addr="$1"
+  if [ -z "$addr" ] || [[ "$addr" =~ [[:space:]] ]]; then
+    return 1
+  fi
+  if [[ ! "$addr" =~ ^https?:// ]]; then
+    return 1
+  fi
+  local rest="${addr#*://}"
+  local host="${rest%%[/?#]*}"
+  if [ -z "$host" ] || [[ "$host" == :* ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# Return 0 when the argument is empty or a comma-separated list of IPv4 addresses.
+# Surrounding whitespace around each entry is ignored.
+is_valid_peer_list() {
+  local list
+  list="$(trim_whitespace "$1")"
+  if [ -z "$list" ]; then
+    return 0
+  fi
+  local IFS=','
+  local -a entries
+  read -r -a entries <<<"$list"
+  local entry
+  for entry in "${entries[@]}"; do
+    entry="$(trim_whitespace "$entry")"
+    if ! is_valid_ipv4 "$entry"; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+# Print the peer list with trimmed entries. Print nothing for an empty list.
+normalize_peer_list() {
+  local list
+  list="$(trim_whitespace "$1")"
+  if [ -z "$list" ]; then
+    return 0
+  fi
+  local IFS=','
+  local -a entries
+  read -r -a entries <<<"$list"
+  local out=""
+  local entry
+  for entry in "${entries[@]}"; do
+    entry="$(trim_whitespace "$entry")"
+    if [ -n "$out" ]; then
+      out="$out,"
+    fi
+    out="$out$entry"
+  done
+  printf '%s\n' "$out"
+}
+
+# Return 0 when the argument is a positive integer from 1 to 99.
+is_valid_bootstrap_expect() {
+  local value="$1"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  local number=$((10#$value))
+  [ "$number" -ge 1 ] && [ "$number" -le 99 ]
+}
+
+# Print an STE error for an invalid Consul value and exit 1.
+# The message tells the user which source holds the bad value.
+consul_value_invalid() {
+  local key="$1"
+  local value="$2"
+  local source="$3"
+  local rule="$4"
+  case "$source" in
+  env)
+    echo "error: $key '$value' is not valid. $rule" >&2
+    ;;
+  envfile)
+    echo "error: The root .env holds the invalid $key '$value'. Fix .env by hand or set $key." >&2
+    ;;
+  *)
+    echo "error: '$value' is not valid. $rule" >&2
+    ;;
+  esac
+  exit 1
+}
+
+# Resolve CONSUL_ADDR. Set consul_addr and consul_mode.
+# The order is: the process environment, then the root .env file, then a prompt.
+# The default is local Consul when stdin is not a TTY.
+# One trailing slash does not change the comparison with the local address.
+resolve_consul_addr() {
+  local candidate=""
+  local source="none"
+  if [ -n "${CONSUL_ADDR+x}" ]; then
+    candidate="$CONSUL_ADDR"
+    source="env"
+  elif env_file_has_key CONSUL_ADDR; then
+    candidate="$(read_env_value CONSUL_ADDR)"
+    source="envfile"
+  fi
+  if [ "$source" = "none" ]; then
+    if [ -t 0 ]; then
+      local answer
+      if ! read -r -p "Consul address? [http://consul:8500] " answer; then
+        answer=""
+      fi
+      candidate="${answer:-http://consul:8500}"
+      source="answer"
+    else
+      candidate="http://consul:8500"
+      source="default"
+    fi
+  fi
+  if ! is_valid_consul_addr "$candidate"; then
+    consul_value_invalid CONSUL_ADDR "$candidate" "$source" "Use http:// or https://, a host, and no whitespace."
+  fi
+  consul_addr="$candidate"
+  if [ "${consul_addr%/}" = "http://consul:8500" ]; then
+    consul_mode="local"
+  else
+    consul_mode="remote"
+  fi
+}
+
+# Resolve and write the remote Consul ACL token.
+# Read CONSUL_HTTP_TOKEN first. Keep an existing token file by default.
+# Write config/consul/secrets/remote-token with mode 600 and the directory with mode 700.
+# Never print the token.
+write_remote_consul_token() {
+  local token_dir="config/consul/secrets"
+  local token_file="$token_dir/remote-token"
+  local token=""
+  local token_source=""
+  if [ -n "${CONSUL_HTTP_TOKEN+x}" ]; then
+    token="$CONSUL_HTTP_TOKEN"
+    token_source="env"
+  elif [ -f "$token_file" ]; then
+    token_source="file"
+  elif [ -t 0 ]; then
+    local answer
+    if ! read -r -s -p "Remote Consul ACL token? " answer; then
+      answer=""
+    fi
+    printf '\n' >&2
+    token="$answer"
+    token_source="answer"
+  else
+    echo "error: The remote Consul ACL token is required. Set CONSUL_HTTP_TOKEN." >&2
+    exit 1
+  fi
+
+  if [ "$token_source" = "file" ]; then
+    chmod 0700 "$token_dir"
+    chmod 0600 "$token_file"
+    echo "Kept the remote Consul token: $token_file"
+    return 0
+  fi
+  if [ -z "$token" ]; then
+    if [ "$token_source" = "env" ]; then
+      echo "error: CONSUL_HTTP_TOKEN is empty." >&2
+    else
+      echo "error: The remote Consul ACL token is required." >&2
+    fi
+    exit 1
+  fi
+  mkdir -p "$token_dir"
+  chmod 0700 "$token_dir"
+  local tmp_token
+  tmp_token="$(mktemp "$token_dir/.remote-token.XXXXXX")"
+  chmod 0600 "$tmp_token"
+  printf '%s\n' "$token" >"$tmp_token"
+  mv "$tmp_token" "$token_file"
+  chmod 0600 "$token_file"
+  echo "Wrote the remote Consul token: $token_file"
+}
+
+# Resolve the local Consul peer list and bootstrap_expect.
+# Read each value from the environment, then from the root .env file.
+# Ask both questions when stdin is a TTY.
+# A missing bootstrap_expect defaults to 1.
+resolve_consul_local_settings() {
+  local join_current=""
+  local join_source="none"
+  local bootstrap_current="1"
+  local bootstrap_source="none"
+  if [ -n "${CONSUL_JOIN_IPS+x}" ]; then
+    join_current="$CONSUL_JOIN_IPS"
+    join_source="env"
+  elif env_file_has_key CONSUL_JOIN_IPS; then
+    join_current="$(read_env_value CONSUL_JOIN_IPS)"
+    join_source="envfile"
+  fi
+  if ! is_valid_peer_list "$join_current"; then
+    consul_value_invalid CONSUL_JOIN_IPS "$join_current" "$join_source" "Use a comma-separated list of IPv4 addresses."
+  fi
+  join_current="$(normalize_peer_list "$join_current")"
+
+  if [ -n "${CONSUL_BOOTSTRAP_EXPECT+x}" ]; then
+    bootstrap_current="$CONSUL_BOOTSTRAP_EXPECT"
+    bootstrap_source="env"
+  elif env_file_has_key CONSUL_BOOTSTRAP_EXPECT; then
+    bootstrap_current="$(read_env_value CONSUL_BOOTSTRAP_EXPECT)"
+    bootstrap_source="envfile"
+  fi
+  if ! is_valid_bootstrap_expect "$bootstrap_current"; then
+    consul_value_invalid CONSUL_BOOTSTRAP_EXPECT "$bootstrap_current" "$bootstrap_source" "Use a number from 1 to 99."
+  fi
+
+  consul_join_ips="$join_current"
+  consul_bootstrap_expect="$((10#$bootstrap_current))"
+
+  if [ -t 0 ]; then
+    local join_answer
+    if ! read -r -p "Peer IPs, comma-separated? [$consul_join_ips] " join_answer; then
+      join_answer=""
+    fi
+    if [ -n "$join_answer" ]; then
+      if ! is_valid_peer_list "$join_answer"; then
+        consul_value_invalid CONSUL_JOIN_IPS "$join_answer" "answer" "Use a comma-separated list of IPv4 addresses."
+      fi
+      consul_join_ips="$(normalize_peer_list "$join_answer")"
+    fi
+
+    local bootstrap_answer
+    if ! read -r -p "Consul bootstrap_expect? [$consul_bootstrap_expect] " bootstrap_answer; then
+      bootstrap_answer=""
+    fi
+    if [ -n "$bootstrap_answer" ]; then
+      if ! is_valid_bootstrap_expect "$bootstrap_answer"; then
+        consul_value_invalid CONSUL_BOOTSTRAP_EXPECT "$bootstrap_answer" "answer" "Use a number from 1 to 99."
+      fi
+      consul_bootstrap_expect="$((10#$bootstrap_answer))"
+    fi
+  fi
+}
+
+# Keep the discovered order. In local mode, force consul into the list.
+# In remote mode, remove consul from the list.
+normalize_enabled_services() {
+  local service wanted
+  local listed
+  local -a normalized=()
+  for service in "${services[@]}"; do
+    listed=0
+    for wanted in "${enabled[@]}"; do
+      if [ "$service" = "$wanted" ]; then
+        listed=1
+        break
+      fi
+    done
+    if [ "$service" = "consul" ]; then
+      if [ "$consul_mode" = "remote" ]; then
+        listed=0
+      else
+        listed=1
+      fi
+    fi
+    if [ "$listed" -eq 1 ]; then
+      normalized+=("$service")
+    fi
+  done
+  enabled=("${normalized[@]}")
+}
+
+# Write the root .env with the shared Consul values and PUBLIC_IP. Keep the other lines.
+# Preserve every line except the managed keys.
+# In remote mode, do not write CONSUL_JOIN_IPS or CONSUL_BOOTSTRAP_EXPECT.
 # When the resolved public IP is empty, keep the preserved lines without a PUBLIC_IP line.
-# chmod 0640 the file. Never print the contents beyond the PUBLIC_IP line itself.
+# chmod 0640 the file. Never print the contents.
 write_env_file() {
-  local public_ip="$1"
+  local consul_addr="$1"
+  local consul_join_ips="$2"
+  local consul_bootstrap_expect="$3"
+  local public_ip="$4"
   local tmp_env
   tmp_env="$(mktemp ./.env.tmp.XXXXXX)"
   if [ -f .env ]; then
-    { grep -E -v '^PUBLIC_IP=' .env || true; } >"$tmp_env"
+    { grep -E -v '^(CONSUL_ADDR|CONSUL_JOIN_IPS|CONSUL_BOOTSTRAP_EXPECT|PUBLIC_IP)=' .env || true; } >"$tmp_env"
+  fi
+  printf 'CONSUL_ADDR=%s\n' "$consul_addr" >>"$tmp_env"
+  if [ "$consul_mode" = "local" ]; then
+    printf 'CONSUL_JOIN_IPS=%s\n' "$consul_join_ips" >>"$tmp_env"
+    printf 'CONSUL_BOOTSTRAP_EXPECT=%s\n' "$consul_bootstrap_expect" >>"$tmp_env"
   fi
   if [ -n "$public_ip" ]; then
     printf 'PUBLIC_IP=%s\n' "$public_ip" >>"$tmp_env"
@@ -190,23 +500,49 @@ if [ "$#" -ge 1 ]; then
   exit 2
 fi
 
-# Step 1: discover the services.
+# Discover the services.
 mapfile -t services < <(list_known_services)
-if [ "${#services[@]}" -eq 0 ]; then
-  echo "No services found in state/."
-  exit 0
-fi
 
-# Create the root .env when it is missing. compose requires it.
+# Step 1: create the root .env when it is missing. compose requires it.
 if [ ! -e .env ]; then : >.env && chmod 0640 .env; fi
 
-# Regenerate the stack assembler from the current service fragments.
+# Step 2: regenerate the stack assembler from the current service fragments.
 bash "$REPO_ROOT/scripts/compose-assemble.sh"
 
-# Step 2: select the services to enable.
+# Step 3: resolve the Consul address. Consul is mandatory.
+resolve_consul_addr
+
+# Step 4: resolve the Consul details for the selected mode.
+consul_join_ips=""
+consul_bootstrap_expect=""
+if [ "$consul_mode" = "remote" ]; then
+  write_remote_consul_token
+  unset CONSUL_HTTP_TOKEN CONSUL_JOIN_IPS CONSUL_BOOTSTRAP_EXPECT
+else
+  if [ ! -f state/consul/setup.sh ] || [ ! -r state/consul/setup.sh ]; then
+    echo "error: state/consul/setup.sh is missing. Local Consul needs this wizard." >&2
+    echo "error: Set CONSUL_ADDR to a remote Consul or add the consul service." >&2
+    exit 1
+  fi
+  resolve_consul_local_settings
+  export CONSUL_JOIN_IPS="$consul_join_ips"
+  export CONSUL_BOOTSTRAP_EXPECT="$consul_bootstrap_expect"
+fi
+export CONSUL_ADDR="$consul_addr"
+
+# Step 5: select the services to enable.
+# Consul is already decided by CONSUL_ADDR. The loop asks only the other services.
+if [ "$consul_mode" = "local" ]; then
+  echo "Consul is required in local mode. The setup enables the consul service."
+else
+  echo "Remote Consul is in use. The setup does not enable the local consul service."
+fi
 enabled=()
 if [ -t 0 ]; then
   for service in "${services[@]}"; do
+    if [ "$service" = "consul" ]; then
+      continue
+    fi
     if ! read -r -p "Enable the $service service? [Y/n] " answer; then
       answer=""
     fi
@@ -237,6 +573,11 @@ else
       service_name="$(printf '%s' "$token" | sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' | tr '[:upper:]' '[:lower:]')"
       if [ -z "$service_name" ]; then
         continue
+      fi
+      if [ "$service_name" = "consul" ] && [ "$consul_mode" = "remote" ]; then
+        echo "error: SETUP_SERVICES names consul, but CONSUL_ADDR '$consul_addr' is remote." >&2
+        echo "error: Remove consul from SETUP_SERVICES." >&2
+        exit 1
       fi
       duplicate=0
       for seen in "${requested[@]}"; do
@@ -275,12 +616,10 @@ else
   fi
 fi
 
-if [ "${#enabled[@]}" -eq 0 ]; then
-  echo "No services enabled."
-  exit 0
-fi
+# Consul is mandatory in local mode. It is absent in remote mode.
+normalize_enabled_services
 
-# Step 3: resolve the public IP of this node. The enabled services advertise it.
+# Step 6: resolve the public IP of this node. The enabled services advertise it.
 resolve_public_ip_default
 if [ -n "$public_ip_default" ] && ! is_valid_ipv4 "$public_ip_default"; then
   public_ip_default_invalid
@@ -303,10 +642,15 @@ if [ -z "$public_ip" ]; then
 fi
 export PUBLIC_IP="$public_ip"
 
-# Step 4: write the root .env with the shared PUBLIC_IP. Keep the other lines.
-write_env_file "$public_ip"
+# Step 7: write the root .env with the shared Consul values and PUBLIC_IP. Keep the other lines.
+write_env_file "$consul_addr" "$consul_join_ips" "$consul_bootstrap_expect" "$public_ip"
 
-# Step 5: run the wizard of each enabled service, in sorted order.
+if [ "${#enabled[@]}" -eq 0 ]; then
+  echo "No services enabled."
+  exit 0
+fi
+
+# Step 8: run the wizard of each enabled service, in sorted order.
 for service in "${enabled[@]}"; do
   if ! bash "$REPO_ROOT/state/$service/setup.sh"; then
     echo "error: the $service setup failed." >&2
@@ -314,11 +658,12 @@ for service in "${enabled[@]}"; do
   fi
 done
 
-# Step 6: print the summary.
+# Step 9: print the summary.
 echo "Configured the stack:"
 for service in "${enabled[@]}"; do
   echo "  $service"
 done
+echo "CONSUL_ADDR: $consul_addr ($consul_mode)"
 if [ -n "$public_ip" ]; then
   echo "PUBLIC_IP: $public_ip"
 else

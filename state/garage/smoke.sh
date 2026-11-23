@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Check the Garage wizard and entrypoint in standalone and integrated modes.
+# Standalone means remote Consul. Integrated means local Consul.
 # The checks use a scratch tree. They need no Docker and no Consul.
 set -euo pipefail
 
@@ -44,29 +45,25 @@ new_tree() {
 # Write the shared root .env file for one scratch tree.
 write_root_env() {
   local tree="$1"
-  local consul_enabled="$2"
+  local consul_addr="$2"
   {
     printf 'STACK_DOMAIN=example.test\n'
     printf 'PUBLIC_IP=192.0.2.10\n'
-    printf 'CONSUL_ENABLED=%s\n' "$consul_enabled"
+    printf 'CONSUL_ADDR=%s\n' "$consul_addr"
   } >"$tree/.env"
 }
 
 # Run the wizard in a scratch tree without an interactive terminal.
 run_wizard() {
   local tree="$1"
-  local consul_enabled="$2"
-  local consul_addr="$3"
-  local consul_token="$4"
-  local replication_factor="${5:-1}"
+  local consul_addr="$2"
+  local replication_factor="${3:-1}"
   (
     cd "$tree"
     env \
       STACK_DOMAIN=example.test \
       PUBLIC_IP=192.0.2.10 \
-      CONSUL_ENABLED="$consul_enabled" \
-      CONSUL_HTTP_ADDR="$consul_addr" \
-      CONSUL_HTTP_TOKEN="$consul_token" \
+      CONSUL_ADDR="$consul_addr" \
       GARAGE_REPLICATION_FACTOR="$replication_factor" \
       bash "$tree/state/garage/setup.sh" </dev/null
   ) >>"$tree/wizard.log" 2>&1
@@ -75,7 +72,7 @@ run_wizard() {
 # Run the entrypoint in render-only mode. No process starts.
 render_entrypoint() {
   local tree="$1"
-  local consul_enabled="$2"
+  local consul_addr="$2"
   mkdir -p "$tree/run"
   (
     cd "$tree"
@@ -86,7 +83,8 @@ render_entrypoint() {
       GARAGE_SECRETS_DIR="$tree/config/garage/secrets" \
       CONSUL_SECRETS_DIR="$tree/config/consul/secrets" \
       CONSUL_AGENT_HCL_FILE="$tree/config/consul/secrets/agent.hcl" \
-      CONSUL_ENABLED="$consul_enabled" \
+      CONSUL_REMOTE_TOKEN_FILE="$tree/config/consul/secrets/remote-token" \
+      CONSUL_ADDR="$consul_addr" \
       GARAGE_RENDER_ONLY=1 \
       sh "$tree/state/garage/entrypoint.sh"
   ) >>"$tree/entrypoint.log" 2>&1
@@ -191,6 +189,18 @@ assert_content() {
   fi
 }
 
+# Check that no value from one file appears in another tree.
+assert_value_not_copied() {
+  local value="$1"
+  local dir="$2"
+  local description="$3"
+  if grep -rFq -- "$value" "$dir"; then
+    fail "$description" 'a secret value was copied'
+  else
+    pass "$description"
+  fi
+}
+
 # Print a stable checksum of the generated files.
 file_checksums() {
   local tree="$1"
@@ -241,28 +251,29 @@ check_secret_modes() {
   assert_mode "$tree/config/garage/garage.toml" 600 'garage.toml has mode 600'
 }
 
-# Check the standalone wizard, its config, and a second run.
+# Check standalone mode. Standalone means remote Consul.
+# The wizard reads CONSUL_ADDR from the root .env file.
 check_standalone_mode() {
   local tree
   tree="$(new_tree standalone)"
-  write_root_env "$tree" 0
+  write_root_env "$tree" 'http://10.20.30.40:8500'
 
-  if ! run_wizard "$tree" 0 'http://10.20.30.40:8500' ''; then
+  if ! run_wizard "$tree" 'http://10.20.30.40:8500'; then
     fail 'standalone wizard runs' "read $tree/wizard.log"
     return 0
   fi
   pass 'standalone wizard runs'
 
   local config="$tree/config/garage/garage.toml"
-  assert_line "$config" 'consul_http_addr = "http://10.20.30.40:8500"' 'standalone wizard uses the supplied Consul address'
+  assert_line "$config" 'consul_http_addr = "http://10.20.30.40:8500"' 'standalone wizard uses CONSUL_ADDR'
   assert_line "$config" '# __CONSUL_TOKEN__' 'standalone config keeps the token marker'
-  assert_file_absent "$tree/config/garage/secrets/consul_token" 'standalone wizard writes no token file by default'
+  assert_file_absent "$tree/config/garage/secrets/consul_token" 'wizard writes no garage Consul token file'
   check_config_shape "$config"
   check_secret_modes "$tree"
 
   local before after
   before="$(file_checksums "$tree")"
-  if ! run_wizard "$tree" 0 'http://10.20.30.40:8500' ''; then
+  if ! run_wizard "$tree" 'http://10.20.30.40:8500'; then
     fail 'second standalone wizard run succeeds' "read $tree/wizard.log"
     return 0
   fi
@@ -273,14 +284,14 @@ check_standalone_mode() {
     fail 'second standalone wizard run is idempotent' 'a generated file changed'
   fi
 
-  if ! run_wizard "$tree" 0 'http://10.20.30.40:8500' '' 3; then
+  if ! run_wizard "$tree" 'http://10.20.30.40:8500' 3; then
     fail 'wizard accepts GARAGE_REPLICATION_FACTOR' "read $tree/wizard.log"
     return 0
   fi
   assert_line "$config" 'replication_factor = 3' 'wizard applies GARAGE_REPLICATION_FACTOR'
 
-  # Render without a token. The entrypoint removes the marker.
-  if ! render_entrypoint "$tree" 0; then
+  # Render without a remote token. The entrypoint removes the marker.
+  if ! render_entrypoint "$tree" 'http://10.20.30.40:8500'; then
     fail 'standalone entrypoint renders without a token' "read $tree/entrypoint.log"
     return 0
   fi
@@ -295,32 +306,37 @@ check_standalone_mode() {
   done
 }
 
-# Check the standalone token path from the wizard to the entrypoint.
-check_standalone_token() {
+# Check the remote Consul token path from the token file to the entrypoint.
+check_remote_token() {
   local tree
   tree="$(new_tree standalone-token)"
-  write_root_env "$tree" 0
+  write_root_env "$tree" 'https://consul.example.test:8501'
   local token
-  token="smoke-standalone-token-$(openssl rand -hex 8)"
+  token="smoke-remote-token-$(openssl rand -hex 8)"
+  mkdir -p "$tree/config/consul/secrets"
+  (
+    umask 077
+    printf '%s\n' "$token" >"$tree/config/consul/secrets/remote-token"
+  )
+  chmod 0600 "$tree/config/consul/secrets/remote-token"
 
-  if ! run_wizard "$tree" 0 'https://consul.example.test:8501' "$token"; then
-    fail 'standalone wizard accepts a Consul token' "read $tree/wizard.log"
+  if ! run_wizard "$tree" 'https://consul.example.test:8501'; then
+    fail 'standalone wizard runs with a remote token file' "read $tree/wizard.log"
     return 0
   fi
-  pass 'standalone wizard accepts a Consul token'
+  pass 'standalone wizard runs with a remote token file'
 
-  local token_file="$tree/config/garage/secrets/consul_token"
-  assert_content "$token_file" "$token" 'standalone wizard stores the supplied token'
-  assert_mode "$token_file" 600 'standalone Consul token has mode 600'
   assert_line "$tree/config/garage/garage.toml" 'consul_http_addr = "https://consul.example.test:8501"' 'standalone wizard accepts an HTTPS Consul address'
+  assert_file_absent "$tree/config/garage/secrets/consul_token" 'wizard writes no garage Consul token file'
+  assert_value_not_copied "$token" "$tree/config/garage/secrets" 'wizard copies no remote token'
 
-  if ! render_entrypoint "$tree" 0; then
-    fail 'standalone entrypoint renders a token' "read $tree/entrypoint.log"
+  if ! render_entrypoint "$tree" 'https://consul.example.test:8501'; then
+    fail 'standalone entrypoint renders the remote token' "read $tree/entrypoint.log"
     return 0
   fi
   local runtime="$tree/run/garage.toml"
-  assert_secret_line "$runtime" "token = \"$token\"" 'entrypoint injects the standalone token file'
-  assert_no_line "$runtime" '# __CONSUL_TOKEN__' 'entrypoint replaces the marker with the standalone token'
+  assert_secret_line "$runtime" "token = \"$token\"" 'entrypoint injects the remote token'
+  assert_no_line "$runtime" '# __CONSUL_TOKEN__' 'entrypoint replaces the marker with the remote token'
 
   secret_values+=("$token")
   secret_values+=("$(cat "$tree/config/garage/secrets/rpc_secret")")
@@ -328,11 +344,12 @@ check_standalone_token() {
   secret_values+=("$(cat "$tree/config/garage/secrets/metrics_token")")
 }
 
-# Check integrated mode. The wizard uses the stack Consul and copies no token.
+# Check integrated mode. Integrated means local Consul.
+# The trailing slash in CONSUL_ADDR does not change the mode.
 check_integrated_mode() {
   local tree
   tree="$(new_tree integrated)"
-  write_root_env "$tree" 1
+  write_root_env "$tree" 'http://consul:8500/'
   local management
   management="smoke-management-token-$(openssl rand -hex 8)"
   mkdir -p "$tree/config/consul/secrets"
@@ -348,23 +365,19 @@ check_integrated_mode() {
   )
   chmod 0600 "$tree/config/consul/secrets/agent.hcl"
 
-  if ! run_wizard "$tree" 1 'http://ignored.example.test:9999' ''; then
+  if ! run_wizard "$tree" 'http://consul:8500/'; then
     fail 'integrated wizard runs' "read $tree/wizard.log"
     return 0
   fi
   pass 'integrated wizard runs'
 
   local config="$tree/config/garage/garage.toml"
-  assert_line "$config" 'consul_http_addr = "http://consul:8500"' 'integrated wizard uses the stack Consul'
+  assert_line "$config" 'consul_http_addr = "http://consul:8500"' 'integrated wizard strips one trailing slash'
   assert_line "$config" '# __CONSUL_TOKEN__' 'integrated config keeps the token marker'
   assert_file_absent "$tree/config/garage/secrets/consul_token" 'integrated wizard writes no Consul token file'
-  if grep -rFq -- "$management" "$tree/config/garage/secrets"; then
-    fail 'integrated wizard copies no management token' 'the management token is in the Garage secrets'
-  else
-    pass 'integrated wizard copies no management token'
-  fi
+  assert_value_not_copied "$management" "$tree/config/garage/secrets" 'integrated wizard copies no management token'
 
-  if ! render_entrypoint "$tree" 1; then
+  if ! render_entrypoint "$tree" 'http://consul:8500/'; then
     fail 'integrated entrypoint renders a token' "read $tree/entrypoint.log"
     return 0
   fi
@@ -378,30 +391,47 @@ check_integrated_mode() {
   secret_values+=("$(cat "$tree/config/garage/secrets/metrics_token")")
 }
 
-# Check that the wizard rejects a bad or missing Consul address in standalone mode.
+# Check that the wizard rejects a bad or missing Consul address.
 check_consul_address_validation() {
   local tree
   tree="$(new_tree invalid-address)"
-  write_root_env "$tree" 0
-  if run_wizard "$tree" 0 'ftp://consul.example.test:8500' ''; then
+  write_root_env "$tree" 'ftp://consul.example.test:8500'
+  if run_wizard "$tree" 'ftp://consul.example.test:8500'; then
     fail 'wizard rejects a Consul address with a bad scheme' 'the wizard accepted ftp://'
   else
     pass 'wizard rejects a Consul address with a bad scheme'
   fi
 
   tree="$(new_tree missing-address)"
-  write_root_env "$tree" 0
+  {
+    printf 'STACK_DOMAIN=example.test\n'
+    printf 'PUBLIC_IP=192.0.2.10\n'
+  } >"$tree/.env"
   if (
     cd "$tree"
-    env -u CONSUL_HTTP_ADDR \
+    env -u CONSUL_ADDR \
       STACK_DOMAIN=example.test \
       PUBLIC_IP=192.0.2.10 \
-      CONSUL_ENABLED=0 \
       bash "$tree/state/garage/setup.sh" </dev/null
   ) >>"$tree/wizard.log" 2>&1; then
-    fail 'wizard requires CONSUL_HTTP_ADDR in standalone mode' 'the wizard ran without an address'
+    fail 'wizard requires CONSUL_ADDR' 'the wizard ran without an address'
   else
-    pass 'wizard requires CONSUL_HTTP_ADDR in standalone mode'
+    pass 'wizard requires CONSUL_ADDR'
+  fi
+
+  tree="$(new_tree empty-address)"
+  write_root_env "$tree" 'http://10.20.30.40:8500'
+  if (
+    cd "$tree"
+    env \
+      STACK_DOMAIN=example.test \
+      PUBLIC_IP=192.0.2.10 \
+      CONSUL_ADDR='' \
+      bash "$tree/state/garage/setup.sh" </dev/null
+  ) >>"$tree/wizard.log" 2>&1; then
+    fail 'wizard rejects an empty CONSUL_ADDR' 'the wizard accepted an empty address'
+  else
+    pass 'wizard rejects an empty CONSUL_ADDR'
   fi
 }
 
@@ -425,7 +455,7 @@ check_logs_for_secrets() {
 
 scratch="$(mktemp -d /tmp/garage-smoke.XXXXXX)"
 check_standalone_mode
-check_standalone_token
+check_remote_token
 check_integrated_mode
 check_consul_address_validation
 check_logs_for_secrets

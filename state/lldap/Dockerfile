@@ -1,12 +1,13 @@
 # syntax=docker/dockerfile:1
-# LLDAP for standalone mode and integrated mode.
-# In standalone mode the entrypoint starts LLDAP directly. No LiteFS, Consul,
-# or FUSE mount is needed.
-# In integrated mode LiteFS replicates the SQLite database that LLDAP uses.
+# LLDAP with or without LiteFS.
+# LITEFS_ENABLED=0: the entrypoint starts LLDAP directly. No LiteFS or FUSE
+# mount is needed.
+# LITEFS_ENABLED=1: LiteFS replicates the SQLite database that LLDAP uses.
 # A single node is the LiteFS primary. Only the primary writes the database.
-# Leader election uses a Consul lease. The entrypoint reads the management
-# token from the Consul agent secrets at boot. The wizard writes the admin
-# password. This image contains no secrets.
+# Leader election uses a Consul lease. CONSUL_ADDR selects the Consul location.
+# The entrypoint reads the token from agent.hcl in local mode and from
+# remote-token in remote mode. The wizard writes the admin password.
+# This image contains no secrets.
 
 FROM lldap/lldap:v0.6.3
 

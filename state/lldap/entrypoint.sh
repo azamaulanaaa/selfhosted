@@ -1,7 +1,9 @@
 #!/bin/sh
-# Boot the LLDAP server in standalone mode or integrated mode.
-# Standalone mode starts LLDAP directly. It needs no LiteFS, no Consul, and no FUSE mount.
-# Integrated mode runs LLDAP behind LiteFS. LiteFS mounts the database at /data.
+# Boot the LLDAP server with or without LiteFS.
+# LITEFS_ENABLED=1 runs LLDAP behind LiteFS. LiteFS mounts the database at /data.
+# LITEFS_ENABLED=0 starts LLDAP directly. It needs no LiteFS and no FUSE mount.
+# CONSUL_ADDR selects the Consul location. http://consul:8500 is local. Any other value is remote.
+# The location selects the token file: local reads agent.hcl, remote reads remote-token.
 # LiteFS elects a single primary through a Consul lease. Only the primary writes the database.
 # Consul ACLs protect the lease. This script reads the management token at start.
 # The script never prints secret values. It prints paths only.
@@ -12,6 +14,7 @@ set -eu
 LLDAP_CONFIG_FILE="${LLDAP_CONFIG_FILE:-/etc/lldap/lldap_config.toml}"
 LLDAP_DATA_DIR="${LLDAP_DATA_DIR:-/data}"
 CONSUL_AGENT_HCL_FILE="${CONSUL_AGENT_HCL_FILE:-/etc/consul/secrets/agent.hcl}"
+CONSUL_REMOTE_TOKEN_FILE="${CONSUL_REMOTE_TOKEN_FILE:-/etc/consul/secrets/remote-token}"
 LITEFS_YML="${LITEFS_YML:-/run/litefs.yml}"
 LITEFS_MOUNT_DIR="${LITEFS_MOUNT_DIR:-/data}"
 LITEFS_DATA_DIR="${LITEFS_DATA_DIR:-/var/lib/litefs}"
@@ -22,21 +25,36 @@ RUNTIME_TOKEN_DIR="$(dirname -- "$RUNTIME_TOKEN_FILE")"
 
 # Environment that the operator sets.
 PUBLIC_IP="${PUBLIC_IP:-}"
-CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-http://consul:8500}"
+CONSUL_ADDR="${CONSUL_ADDR:-http://consul:8500}"
+# Remove one trailing slash before the comparison and before use.
+CONSUL_ADDR="${CONSUL_ADDR%/}"
 STACK_DOMAIN="${STACK_DOMAIN:-sh.lan}"
-CONSUL_ENABLED="${CONSUL_ENABLED:-0}"
 LITEFS_ENABLED="${LITEFS_ENABLED:-0}"
 
 readonly LLDAP_CONFIG_FILE LLDAP_DATA_DIR CONSUL_AGENT_HCL_FILE LITEFS_YML
-readonly LITEFS_MOUNT_DIR LITEFS_DATA_DIR PUBLIC_IP CONSUL_HTTP_ADDR STACK_DOMAIN
-readonly RUNTIME_TOKEN_FILE RUNTIME_TOKEN_DIR CONSUL_ENABLED LITEFS_ENABLED
+readonly CONSUL_REMOTE_TOKEN_FILE
+readonly LITEFS_MOUNT_DIR LITEFS_DATA_DIR PUBLIC_IP CONSUL_ADDR STACK_DOMAIN
+readonly RUNTIME_TOKEN_FILE RUNTIME_TOKEN_DIR LITEFS_ENABLED
 
-# Use integrated mode only when both peers are enabled.
-# Any other flag combination selects standalone mode.
-integrated_mode=0
-if [ "$CONSUL_ENABLED" = "1" ] && [ "$LITEFS_ENABLED" = "1" ]; then
-  integrated_mode=1
+# CONSUL_ADDR selects the Consul location.
+# The location selects the token file. Only LiteFS needs the token.
+readonly LOCAL_CONSUL_ADDR="http://consul:8500"
+if [ "$CONSUL_ADDR" = "$LOCAL_CONSUL_ADDR" ]; then
+  consul_mode="local"
+  CONSUL_TOKEN_FILE="$CONSUL_AGENT_HCL_FILE"
+else
+  consul_mode="remote"
+  CONSUL_TOKEN_FILE="$CONSUL_REMOTE_TOKEN_FILE"
 fi
+readonly consul_mode CONSUL_TOKEN_FILE
+
+# LITEFS_ENABLED alone gates LiteFS.
+# Any other value starts LLDAP directly.
+litefs_mode=0
+if [ "$LITEFS_ENABLED" = "1" ]; then
+  litefs_mode=1
+fi
+readonly litefs_mode
 
 readonly POLICY_NAME="lldap-litefs"
 # The rules grant write access to the lease key and to the session.
@@ -53,15 +71,21 @@ readonly EXEC_UID EXEC_GID
 log() { echo "lldap-litefs: $1" >&2; }
 err() { echo "lldap-litefs: error: $1" >&2; }
 
-# Read initial_management from the Consul agent secret file.
+# Read the Consul ACL token for the selected Consul location.
+# Local mode reads initial_management from the agent HCL file.
+# Remote mode reads the first line of the remote token file.
 # Print the token on stdout. Return 1 when the file is missing.
-read_management_token() {
-  if [ ! -r "$CONSUL_AGENT_HCL_FILE" ]; then
+read_consul_token() {
+  if [ ! -r "$CONSUL_TOKEN_FILE" ]; then
     return 1
   fi
-  {
-    grep -E '^[[:space:]]*initial_management' "$CONSUL_AGENT_HCL_FILE" 2>/dev/null || true
-  } | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
+  if [ "$consul_mode" = "local" ]; then
+    {
+      grep -E '^[[:space:]]*initial_management' "$CONSUL_TOKEN_FILE" 2>/dev/null || true
+    } | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
+    return 0
+  fi
+  head -n1 "$CONSUL_TOKEN_FILE" | sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
 }
 
 # Print the value of one string field from a flat JSON response.
@@ -89,15 +113,24 @@ is_token_chars() {
 # The function prints the token on stdout.
 # Return 1 with a message on stderr when any step fails.
 create_litefs_token() {
-  mgmt_token="$(read_management_token)" || {
-    err "Cannot read the Consul agent secret file."
-    err "Create the file $CONSUL_AGENT_HCL_FILE."
-    err "The file must hold initial_management."
+  mgmt_token="$(read_consul_token)" || {
+    if [ "$consul_mode" = "local" ]; then
+      err "Cannot read the Consul agent secret file $CONSUL_TOKEN_FILE."
+      err "The file must hold initial_management."
+    else
+      err "Cannot read the remote Consul token file $CONSUL_TOKEN_FILE."
+      err "Set CONSUL_HTTP_TOKEN in the root setup."
+    fi
     return 1
   }
   if [ -z "$mgmt_token" ]; then
-    err "The Consul agent secret file has no management token."
-    err "Add initial_management to $CONSUL_AGENT_HCL_FILE."
+    if [ "$consul_mode" = "local" ]; then
+      err "The Consul agent secret file has no management token."
+      err "Add initial_management to $CONSUL_TOKEN_FILE."
+    else
+      err "The remote Consul token file is empty."
+      err "Set CONSUL_HTTP_TOKEN in the root setup."
+    fi
     return 1
   fi
   if ! is_token_chars "$mgmt_token"; then
@@ -110,7 +143,7 @@ create_litefs_token() {
   # Reuse the policy when it exists. Create it when it does not.
   policy_code="$(curl -fsS -o "$resp_file" -w '%{http_code}' \
     -H "X-Consul-Token: $mgmt_token" \
-    "$CONSUL_HTTP_ADDR/v1/acl/policy/name/$POLICY_NAME" 2>/dev/null || true)"
+    "$CONSUL_ADDR/v1/acl/policy/name/$POLICY_NAME" 2>/dev/null || true)"
   if [ "$policy_code" = "404" ]; then
     policy_body="$(printf '{"Name":"%s","Description":"LiteFS lease for the lldap cluster","Rules":"%s"}' \
       "$POLICY_NAME" "$POLICY_RULES_JSON")"
@@ -118,7 +151,7 @@ create_litefs_token() {
       -X PUT -H "X-Consul-Token: $mgmt_token" \
       -H "Content-Type: application/json" \
       -d "$policy_body" \
-      "$CONSUL_HTTP_ADDR/v1/acl/policy" 2>/dev/null || true)"
+      "$CONSUL_ADDR/v1/acl/policy" 2>/dev/null || true)"
     if [ "$policy_code" != "200" ] && [ "$policy_code" != "201" ]; then
       err "could not create the consul policy $POLICY_NAME (HTTP $policy_code)."
       return 1
@@ -146,7 +179,7 @@ create_litefs_token() {
     -X PUT -H "X-Consul-Token: $mgmt_token" \
     -H "Content-Type: application/json" \
     -d "$token_body" \
-    "$CONSUL_HTTP_ADDR/v1/acl/token" 2>/dev/null || true)"
+    "$CONSUL_ADDR/v1/acl/token" 2>/dev/null || true)"
   if [ "$token_code" != "200" ] && [ "$token_code" != "201" ]; then
     err "could not create the consul token for litefs (HTTP $token_code)."
     return 1
@@ -181,7 +214,7 @@ write_token_file() {
 check_litefs_token() {
   code="$(curl -s -o /dev/null -w '%{http_code}' \
     -H "X-Consul-Token: $1" \
-    "$CONSUL_HTTP_ADDR/v1/kv/lldap/litefs" 2>/dev/null || true)"
+    "$CONSUL_ADDR/v1/kv/lldap/litefs" 2>/dev/null || true)"
   case "$code" in
   200 | 404)
     return 0
@@ -202,26 +235,27 @@ if [ ! -r "$LLDAP_CONFIG_FILE" ]; then
   exit 1
 fi
 
-# Standalone mode needs no peer. Prepare the database directory and start LLDAP.
-if [ "$integrated_mode" -eq 0 ]; then
+# Without LiteFS the entrypoint needs no Consul token.
+# Prepare the database directory and start LLDAP.
+if [ "$litefs_mode" -eq 0 ]; then
   mkdir -p "$LLDAP_DATA_DIR"
   if [ "$(id -u)" -eq 0 ] && ! chown "${EXEC_UID}:${EXEC_GID}" "$LLDAP_DATA_DIR" 2>/dev/null; then
     log "cannot change the owner of $LLDAP_DATA_DIR. Check the directory permissions."
   fi
   chmod 0700 "$LLDAP_DATA_DIR"
-  log "starting lldap in standalone mode"
+  log "starting lldap without litefs"
   exec gosu "${EXEC_UID}:${EXEC_GID}" /app/lldap run --config-file "$LLDAP_CONFIG_FILE"
 fi
 
-log "starting lldap in integrated mode with litefs and consul"
+log "starting lldap with litefs (consul mode: $consul_mode)"
 
 if [ -z "$PUBLIC_IP" ]; then
   err "PUBLIC_IP is not set. Set it in the root .env or export it before starting the container."
   exit 1
 fi
 
-if ! curl -fsS -o /dev/null "$CONSUL_HTTP_ADDR/v1/status/leader" 2>/dev/null; then
-  err "consul is not reachable at $CONSUL_HTTP_ADDR."
+if ! curl -fsS -o /dev/null "$CONSUL_ADDR/v1/status/leader" 2>/dev/null; then
+  err "consul is not reachable at $CONSUL_ADDR."
   err "Start consul first: docker compose up -d consul"
   exit 1
 fi
@@ -288,7 +322,7 @@ lease:
   hostname: "lldap"
   candidate: true
   consul:
-    url: "$CONSUL_HTTP_ADDR"
+    url: "$CONSUL_ADDR"
     key: "lldap/litefs"
     ttl: "10s"
     lock-delay: "1s"

@@ -1,6 +1,8 @@
 #!/bin/sh
-# Check that the Forgejo templates render in both stack modes.
-# Each check writes output into a scratch tree. No Consul agent is required.
+# Check that the Forgejo templates render in the standalone and integrated modes.
+# Check that the wizard, the entrypoint, and the compose fragment follow the
+# Consul-first contract. Each render writes into a scratch tree. No Consul agent
+# is required.
 set -eu
 
 REPO_ROOT="$(cd -- "$(dirname -- "$0")/../.." && pwd)"
@@ -10,6 +12,8 @@ readonly STATE_DIR="$REPO_ROOT/state/forgejo"
 readonly RENDER="$STATE_DIR/render.sh"
 readonly APP_TPL="$STATE_DIR/app.ini.tpl"
 readonly HOOK_TPL="$STATE_DIR/post-receive.tpl"
+readonly WIZARD="$STATE_DIR/setup.sh"
+readonly ENTRYPOINT="$STATE_DIR/entrypoint.sh"
 readonly COMPOSE_FILE="$REPO_ROOT/compose/forgejo.yaml"
 
 scratch="$(mktemp -d)"
@@ -38,6 +42,16 @@ expect_no_text() {
   label="$3"
   if grep -Fq -- "$text" "$file"; then
     fail "$label holds this text: $text"
+  fi
+}
+
+# Check that a file holds one string.
+expect_contains() {
+  file="$1"
+  text="$2"
+  label="$3"
+  if ! grep -Fq -- "$text" "$file"; then
+    fail "$label does not hold this text: $text"
   fi
 }
 
@@ -101,6 +115,47 @@ check_peer_service_no_build() {
   echo "smoke: peer service build check passed."
 }
 
+# Check that the wizard and the entrypoint follow the Consul-first contract.
+check_consul_contract() {
+  expect_contains "$WIZARD" 'CONSUL_ADDR' "wizard"
+  expect_contains "$WIZARD" 'address = "%s"' "wizard consul-template output"
+  expect_contains "$WIZARD" 'token_file = "/run/forgejo/consul-token"' "wizard consul-template output"
+  expect_no_text "$WIZARD" 'CONSUL_ENABLED' "wizard"
+  expect_no_text "$WIZARD" 'FORGEJO_USE_LOCAL_CONSUL' "wizard"
+  expect_no_text "$WIZARD" 'FORGEJO_CONSUL_HOST' "wizard"
+  expect_no_text "$WIZARD" 'FORGEJO_CONSUL_PORT' "wizard"
+  expect_no_text "$WIZARD" 'FORGEJO_CONSUL_TOKEN' "wizard"
+
+  expect_contains "$ENTRYPOINT" 'agent.hcl' "entrypoint"
+  expect_contains "$ENTRYPOINT" 'remote-token' "entrypoint"
+  expect_contains "$ENTRYPOINT" 'http://consul:8500' "entrypoint"
+  expect_contains "$ENTRYPOINT" 'CONSUL_ADDR' "entrypoint"
+  expect_contains "$ENTRYPOINT" 'LITEFS_ENABLED' "entrypoint"
+  expect_no_text "$ENTRYPOINT" 'CONSUL_ENABLED' "entrypoint"
+  expect_no_text "$ENTRYPOINT" 'render_local' "entrypoint"
+  echo "smoke: Consul contract passed."
+}
+
+# Check that the templates gate their optional blocks on the right flags.
+check_template_gates() {
+  expect_contains "$APP_TPL" '{{ if eq (env "TLS_ENABLED") "1" }}' "app.ini template"
+  expect_no_text "$APP_TPL" 'CONSUL_ENABLED' "app.ini template"
+  expect_contains "$HOOK_TPL" '{{ if eq (env "LITEFS_ENABLED") "1" }}' "post-receive template"
+  echo "smoke: template gates passed."
+}
+
+# Check that the compose fragment mounts the Consul secrets and passes CONSUL_ADDR.
+check_compose_consul_contract() {
+  block="$scratch/forgejo-consul-check.yaml"
+  service_block forgejo >"$block"
+  expect_contains "$block" "CONSUL_ADDR=\${CONSUL_ADDR:-http://consul:8500}" "forgejo service"
+  expect_no_text "$block" "CONSUL_ENABLED" "forgejo service"
+  expect_no_text "$block" "CONSUL_HTTP_ADDR" "forgejo service"
+  expect_contains "$block" './config/consul/secrets:/config/consul/secrets:ro' "forgejo service"
+  expect_no_text "$block" './config/consul/secrets/agent.hcl:/config/consul/agent.hcl:ro' "forgejo service"
+  echo "smoke: compose Consul contract passed."
+}
+
 # Render the standalone mode into the scratch tree.
 render_standalone() {
   mode_dir="$scratch/standalone"
@@ -108,7 +163,6 @@ render_standalone() {
   printf 'test-secret-key' >"$mode_dir/secrets/secret-key"
   env \
     SECRET_FILE_ROOT="$mode_dir/secrets" \
-    CONSUL_ENABLED=0 \
     LITEFS_ENABLED=0 \
     OIDC_ENABLED=0 \
     TLS_ENABLED=0 \
@@ -118,7 +172,6 @@ render_standalone() {
     sh "$RENDER" "$APP_TPL" "$mode_dir/out/app.ini"
   env \
     SECRET_FILE_ROOT="$mode_dir/secrets" \
-    CONSUL_ENABLED=0 \
     LITEFS_ENABLED=0 \
     OIDC_ENABLED=0 \
     TLS_ENABLED=0 \
@@ -159,7 +212,6 @@ render_integrated() {
   printf 'test-oidc-secret' >"$mode_dir/secrets/oidc-client-secret"
   env \
     SECRET_FILE_ROOT="$mode_dir/secrets" \
-    CONSUL_ENABLED=1 \
     LITEFS_ENABLED=1 \
     OIDC_ENABLED=1 \
     TLS_ENABLED=1 \
@@ -174,7 +226,6 @@ render_integrated() {
     sh "$RENDER" "$APP_TPL" "$mode_dir/out/app.ini"
   env \
     SECRET_FILE_ROOT="$mode_dir/secrets" \
-    CONSUL_ENABLED=1 \
     LITEFS_ENABLED=1 \
     OIDC_ENABLED=1 \
     TLS_ENABLED=1 \
@@ -218,7 +269,6 @@ check_domain_fallback() {
   printf 'test-secret-key' >"$mode_dir/secrets/secret-key"
   env \
     SECRET_FILE_ROOT="$mode_dir/secrets" \
-    CONSUL_ENABLED=0 \
     LITEFS_ENABLED=0 \
     OIDC_ENABLED=0 \
     PUBLIC_IP=127.0.0.1 \
@@ -235,4 +285,7 @@ check_integrated
 check_domain_fallback
 check_compose_port_bindings
 check_peer_service_no_build
+check_consul_contract
+check_template_gates
+check_compose_consul_contract
 echo "smoke: all checks passed."

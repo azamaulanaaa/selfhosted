@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Generate the Forgejo wizard files for this stack.
+# Consul is mandatory. The root dispatcher resolves CONSUL_ADDR. This wizard
+# reads CONSUL_ADDR and writes the consul-template configuration.
+# This wizard never asks about Consul.
 # Safe to run again: it keeps existing secrets unless rotation is asked for.
 # It never prints secret values. It prints paths only.
 #
@@ -14,25 +17,28 @@
 # Non-interactive environment variables:
 #   STACK_DOMAIN              Base domain for the stack. Read from the environment,
 #                             then the root .env, then sh.lan.
+#   CONSUL_ADDR               Consul address. Read from the environment, then the
+#                             root .env, then http://consul:8500. The value
+#                             http://consul:8500 selects local Consul. Any other
+#                             value selects remote Consul.
 #   OIDC_ENABLED              Set to 1 to require OIDC answers. Default 0.
-#   CONSUL_ENABLED            Set to 1 with LITEFS_ENABLED for integrated mode.
-#   LITEFS_ENABLED            Set to 1 with CONSUL_ENABLED for integrated mode.
+#   LITEFS_ENABLED            Set to 1 to enable LiteFS and peer replication. Default 0.
 #   FORGEJO_APP_NAME          Display name for the forge. Default: Forgejo.
-#   FORGEJO_USE_LOCAL_CONSUL  1 to use this repo's consul service, 0 for a remote one.
-#                             Default 1.
-#   FORGEJO_CONSUL_HOST       Consul IP or hostname. Required when the consul is remote.
-#   FORGEJO_CONSUL_PORT       Consul HTTP port. Default 8500.
-#   FORGEJO_CONSUL_TOKEN      Consul ACL token when the consul is remote. When empty,
-#                             an existing token file is kept.
-#   FORGEJO_OIDC_ISSUER_URL   OIDC issuer URL. Required. Must start with https://.
-#   FORGEJO_OIDC_CLIENT_ID    OIDC client ID. Required.
+#   FORGEJO_OIDC_ISSUER_URL   OIDC issuer URL. Required when OIDC_ENABLED=1.
+#                             Must start with https://.
+#   FORGEJO_OIDC_CLIENT_ID    OIDC client ID. Required when OIDC_ENABLED=1.
 #   FORGEJO_OIDC_CLIENT_SECRET  OIDC client secret. When empty, an existing secret
 #                             file is kept. Interactive runs prompt for it.
 #   FORGEJO_OIDC_PROVIDER_NAME Name shown for the OIDC provider. Default: oidc.
 #   FORGEJO_OIDC_AUTO_REGISTER  yes to create accounts for new OIDC users. Default: no.
-#   FORGEJO_PEER_GIT_PORT     Port used by peer git pushes. Default 3000.
+#   FORGEJO_PEER_GIT_PORT     Port used by peer git pushes. Asked only when
+#                             LITEFS_ENABLED=1. Default 3000.
 #   FORGEJO_ROTATE_SECRETS    1 to replace the OIDC client secret and the Forgejo
 #                             secret key. Default 0.
+#   TLS_ENABLED               1 uses https://forgejo.<STACK_DOMAIN>/ as ROOT_URL.
+#                             0 uses http://<PUBLIC_IP>:3000/ as ROOT_URL.
+#                             For Caddy with the internal CA and the domain URL,
+#                             set TLS_ENABLED=1 and CADDY_TLS_MODE=internal.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -46,7 +52,6 @@ readonly ENV_FILE="config/forgejo/forgejo.env"
 readonly CT_FILE="config/forgejo/consul-template.hcl"
 readonly OIDC_SECRET_FILE="config/forgejo/secrets/oidc-client-secret"
 readonly FORGEJO_SECRET_FILE="config/forgejo/secrets/secret-key"
-readonly CONSUL_TOKEN_FILE="config/forgejo/secrets/consul-token"
 
 readonly DEFAULT_STACK_DOMAIN="sh.lan"
 readonly DEFAULT_APP_NAME="Forgejo"
@@ -78,16 +83,9 @@ resolve_flag() {
   esac
 }
 
-consul_enabled="$(resolve_flag CONSUL_ENABLED)"
 litefs_enabled="$(resolve_flag LITEFS_ENABLED)"
 oidc_enabled="$(resolve_flag OIDC_ENABLED)"
-readonly consul_enabled litefs_enabled oidc_enabled
-
-use_litefs=0
-if [ "$consul_enabled" -eq 1 ] && [ "$litefs_enabled" -eq 1 ]; then
-  use_litefs=1
-fi
-readonly use_litefs
+readonly litefs_enabled oidc_enabled
 
 # Print the STACK_DOMAIN value from the root .env file.
 read_env_stack_domain() {
@@ -139,6 +137,65 @@ is_valid_domain() {
   [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]
 }
 
+# Return 0 when the argument is a valid Consul address.
+# A valid address starts with http:// or https://, has a host, and has no whitespace.
+is_valid_consul_addr() {
+  local addr="$1"
+  if [ -z "$addr" ] || [[ "$addr" =~ [[:space:]] ]]; then
+    return 1
+  fi
+  if [[ ! "$addr" =~ ^https?:// ]]; then
+    return 1
+  fi
+  local rest="${addr#*://}"
+  local host="${rest%%[/?#]*}"
+  if [ -z "$host" ] || [[ "$host" == :* ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# Resolve CONSUL_ADDR. Set consul_addr and consul_mode.
+# The order is: the process environment, then the root .env file, then
+# http://consul:8500. One trailing slash does not change the comparison with
+# the local address.
+resolve_consul_addr() {
+  local candidate=""
+  local source="none"
+  if [ -n "${CONSUL_ADDR+x}" ]; then
+    candidate="$CONSUL_ADDR"
+    source="env"
+  elif [ -f .env ] && grep -qE '^CONSUL_ADDR=' .env; then
+    candidate="$(read_root_env_value CONSUL_ADDR)"
+    source="envfile"
+  fi
+  if [ "$source" = "none" ]; then
+    candidate="http://consul:8500"
+    source="default"
+  fi
+  if ! is_valid_consul_addr "$candidate"; then
+    case "$source" in
+    env)
+      echo "error: CONSUL_ADDR '$candidate' is not valid. Use http:// or https://, a host, and no whitespace." >&2
+      ;;
+    envfile)
+      echo "error: The root .env holds the invalid CONSUL_ADDR '$candidate'." >&2
+      echo "error: Fix .env by hand or set CONSUL_ADDR." >&2
+      ;;
+    *)
+      echo "error: '$candidate' is not valid. Use http:// or https://, a host, and no whitespace." >&2
+      ;;
+    esac
+    exit 1
+  fi
+  consul_addr="$candidate"
+  if [ "${consul_addr%/}" = "http://consul:8500" ]; then
+    consul_mode="local"
+  else
+    consul_mode="remote"
+  fi
+}
+
 # Return 0 when the argument is an HTTPS URL with a host.
 is_valid_issuer_url() {
   [[ "$1" =~ ^https://[A-Za-z0-9][A-Za-z0-9.:_-]*(/[^[:space:]]*)?$ ]]
@@ -152,11 +209,6 @@ is_valid_client_id() {
 # Return 0 when the argument is a valid provider name.
 is_valid_provider_name() {
   [[ "$1" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]
-}
-
-# Return 0 when the argument is a plausible consul host.
-is_valid_consul_host() {
-  [[ "$1" =~ ^[a-zA-Z0-9.:-]+$ ]]
 }
 
 # Return 0 when the argument is a TCP port from 1 to 65535.
@@ -347,6 +399,9 @@ if ! is_valid_domain "$stack_domain"; then
   stack_domain_invalid
 fi
 
+# Step 2b: resolve and validate the Consul address. Consul is mandatory.
+resolve_consul_addr
+
 # Step 3: collect the answers. Use the environment when stdin is not a TTY.
 # Resolve one value from the environment, then the existing answer file, then
 # the default. Print the resolved value.
@@ -371,10 +426,6 @@ client_secret="${FORGEJO_OIDC_CLIENT_SECRET:-}"
 provider_name="$(resolve_answer "${FORGEJO_OIDC_PROVIDER_NAME:-}" FORGEJO_OIDC_PROVIDER_NAME "$DEFAULT_OIDC_PROVIDER")"
 auto_register="$(resolve_answer "${FORGEJO_OIDC_AUTO_REGISTER:-}" FORGEJO_OIDC_AUTO_REGISTER "no")"
 peer_git_port="$(resolve_answer "${FORGEJO_PEER_GIT_PORT:-}" FORGEJO_PEER_GIT_PORT "$DEFAULT_PEER_GIT_PORT")"
-use_local_consul=1
-consul_host="127.0.0.1"
-consul_port="8500"
-consul_token="${FORGEJO_CONSUL_TOKEN:-}"
 rotate=0
 
 if [ -t 0 ]; then
@@ -388,44 +439,6 @@ if [ -t 0 ]; then
       exit 1
     fi
     stack_domain="$domain_answer"
-  fi
-
-  if ! read -r -p "Use this repo's consul service for consul-template? [Y/n] " local_answer; then
-    local_answer=""
-  fi
-  case "${local_answer:-Y}" in
-  [Yy] | [Yy][Ee][Ss]) use_local_consul=1 ;;
-  [Nn] | [Nn][Oo]) use_local_consul=0 ;;
-  *)
-    echo "error: Answer Y or N." >&2
-    exit 1
-    ;;
-  esac
-  if [ "$use_local_consul" -eq 0 ]; then
-    if ! read -r -p "Consul IP or hostname? " host_answer; then
-      host_answer=""
-    fi
-    if ! is_valid_consul_host "$host_answer"; then
-      echo "error: '$host_answer' is not a valid Consul IP or hostname." >&2
-      echo "error: Use letters, digits, dots, dashes, and colons." >&2
-      exit 1
-    fi
-    consul_host="$host_answer"
-    if ! read -r -p "Consul HTTP port? [$consul_port] " port_answer; then
-      port_answer=""
-    fi
-    if [ -n "$port_answer" ]; then
-      if ! is_valid_port "$port_answer"; then
-        echo "error: '$port_answer' is not a valid port. Use 1 to 65535." >&2
-        exit 1
-      fi
-      consul_port="$port_answer"
-    fi
-    if ! read -r -s -p "Consul ACL token? (empty for anonymous) " token_answer; then
-      token_answer=""
-    fi
-    echo >&2
-    consul_token="$token_answer"
   fi
 
   if ! read -r -p "Display name for the forge? [$app_name] " name_answer; then
@@ -466,10 +479,12 @@ if [ -t 0 ]; then
     esac
   fi
 
-  if ! read -r -p "Port used by peer git pushes? [$peer_git_port] " port_answer; then
-    port_answer=""
+  if [ "$litefs_enabled" -eq 1 ]; then
+    if ! read -r -p "Port used by peer git pushes? [$peer_git_port] " port_answer; then
+      port_answer=""
+    fi
+    peer_git_port="${port_answer:-$peer_git_port}"
   fi
-  peer_git_port="${port_answer:-$peer_git_port}"
 
   if [ -f "$OIDC_SECRET_FILE" ]; then
     if ! read -r -p "Rotate the OIDC secret and the Forgejo secret key? [y/N] " rotate_answer; then
@@ -485,30 +500,6 @@ if [ -t 0 ]; then
     esac
   fi
 else
-  case "${FORGEJO_USE_LOCAL_CONSUL:-1}" in
-  0 | 1) use_local_consul="${FORGEJO_USE_LOCAL_CONSUL:-1}" ;;
-  *)
-    echo "error: FORGEJO_USE_LOCAL_CONSUL must be 0 or 1." >&2
-    exit 1
-    ;;
-  esac
-  if [ "$use_local_consul" -eq 0 ]; then
-    consul_host="${FORGEJO_CONSUL_HOST:-}"
-    consul_port="${FORGEJO_CONSUL_PORT:-8500}"
-    if [ -z "$consul_host" ]; then
-      echo "error: FORGEJO_CONSUL_HOST is required when FORGEJO_USE_LOCAL_CONSUL=0." >&2
-      exit 1
-    fi
-    if ! is_valid_consul_host "$consul_host"; then
-      echo "error: FORGEJO_CONSUL_HOST '$consul_host' is not a valid Consul host." >&2
-      echo "error: Use letters, digits, dots, dashes, and colons." >&2
-      exit 1
-    fi
-    if ! is_valid_port "$consul_port"; then
-      echo "error: FORGEJO_CONSUL_PORT '$consul_port' is not a valid port. Use 1 to 65535." >&2
-      exit 1
-    fi
-  fi
   case "${FORGEJO_ROTATE_SECRETS:-0}" in
   0 | 1) rotate="${FORGEJO_ROTATE_SECRETS:-0}" ;;
   *)
@@ -550,7 +541,7 @@ if ! is_yes_no "$auto_register"; then
   echo "error: '$auto_register' is not a yes or no value." >&2
   exit 1
 fi
-if ! is_valid_port "$peer_git_port"; then
+if [ "$litefs_enabled" -eq 1 ] && ! is_valid_port "$peer_git_port"; then
   echo "error: '$peer_git_port' is not a valid port. Use 1 to 65535." >&2
   exit 1
 fi
@@ -604,41 +595,15 @@ if [ ! -s "$FORGEJO_SECRET_FILE" ] || [ "$rotate" = "1" ]; then
 fi
 chmod 0600 "$FORGEJO_SECRET_FILE"
 
-token_state="anonymous"
-if [ "$use_local_consul" -eq 0 ]; then
-  if [ -n "$consul_token" ]; then
-    (
-      umask 077
-      printf '%s\n' "$consul_token" >"$CONSUL_TOKEN_FILE"
-    )
-    chmod 0600 "$CONSUL_TOKEN_FILE"
-    token_state="written"
-  elif [ -f "$CONSUL_TOKEN_FILE" ]; then
-    chmod 0600 "$CONSUL_TOKEN_FILE"
-    token_state="kept"
-  fi
-fi
-
-# Step 7: write the consul-template configuration. The token flows as a file.
-# For local consul the LiteFS token is created by the entrypoint at boot.
-if [ "$use_local_consul" -eq 1 ]; then
-  consul_address="http://consul:8500"
-  token_file="/etc/forgejo/secrets/litefs-token"
-else
-  consul_address="http://$consul_host:$consul_port"
-  token_file=""
-  if [ "$token_state" = "written" ] || [ "$token_state" = "kept" ]; then
-    token_file="/etc/forgejo/secrets/consul-token"
-  fi
-fi
+# Step 7: write the consul-template configuration. The wizard writes the
+# resolved Consul address. The entrypoint selects the token source at boot and
+# writes it to the runtime token file.
 {
   printf '# Generated by state/forgejo/setup.sh. Do not edit.\n'
   printf '# Run the wizard again to regenerate this file.\n'
   printf 'consul {\n'
-  printf '  address = "%s"\n' "$consul_address"
-  if [ -n "$token_file" ]; then
-    printf '  token_file = "%s"\n' "$token_file"
-  fi
+  printf '  address = "%s"\n' "$consul_addr"
+  printf '  token_file = "/run/forgejo/consul-token"\n'
   printf '}\n'
   printf '\n'
   printf 'template {\n'
@@ -688,7 +653,9 @@ fi
     printf 'FORGEJO_OIDC_AUTO_REGISTER=%s\n' "$auto_register"
     printf 'FORGEJO_OIDC_CLIENT_SECRET_FILE=/etc/forgejo/secrets/oidc-client-secret\n'
   fi
-  printf 'FORGEJO_PEER_GIT_PORT=%s\n' "$peer_git_port"
+  if [ "$litefs_enabled" -eq 1 ]; then
+    printf 'FORGEJO_PEER_GIT_PORT=%s\n' "$peer_git_port"
+  fi
   printf 'FORGEJO_SECRET_KEY_FILE=/etc/forgejo/secrets/secret-key\n'
 } >>"$tmp_env"
 chmod 0640 "$tmp_env"
@@ -697,33 +664,35 @@ mv "$tmp_env" "$ENV_FILE"
 # Step 9: print the summary. Never print secret values.
 echo "Configured the forgejo wizard files:"
 echo "  $ENV_FILE"
+echo "  $CT_FILE"
 echo "  $FORGEJO_SECRET_FILE (Forgejo secret key $secret_key_state)"
 if [ "$oidc_enabled" -eq 1 ]; then
   echo "  $OIDC_SECRET_FILE (OIDC secret $oidc_state)"
-  echo "  $CT_FILE"
   echo "OIDC issuer: $issuer_url"
   echo "OIDC client ID: $client_id"
   echo "OIDC provider name: $provider_name"
 else
   echo "OIDC is off. Forgejo uses built-in authentication."
 fi
-case "$token_state" in
-written) echo "  $CONSUL_TOKEN_FILE (written)" ;;
-kept) echo "  $CONSUL_TOKEN_FILE (kept)" ;;
-esac
-echo "Peer git port: $peer_git_port"
+echo "Consul: $consul_addr ($consul_mode)"
 echo "Base domain: $stack_domain"
-if [ "$use_litefs" -eq 1 ]; then
-  echo "Mode: integrated with LiteFS and Consul."
+if [ "$consul_mode" = "local" ]; then
+  echo "Mode: integrated with local Consul."
 else
-  echo "Mode: standalone with local SQLite."
+  echo "Mode: standalone with remote Consul."
 fi
-if [ "$use_local_consul" -eq 1 ] && [ -f "$CONSUL_TOKEN_FILE" ]; then
-  echo "warning: $CONSUL_TOKEN_FILE exists but the new configuration does not use it." >&2
-fi
-if [ "$use_litefs" -eq 1 ]; then
+if [ "$litefs_enabled" -eq 1 ]; then
+  echo "LiteFS: enabled. Peer git port: $peer_git_port"
   echo "hint: LiteFS elects a primary through a consul lease (key forgejo/litefs)."
-  echo "hint: consul-template renders app.ini and the post-receive hook inside the container."
+  echo "hint: Start the peer port profile on a second node with --profile peer."
   echo "hint: the git hook launcher is installed in every repository by the entrypoint."
+  echo "Next step: docker compose --profile peer up -d forgejo"
+else
+  echo "LiteFS: disabled. Forgejo uses local SQLite without peers."
+  echo "Next step: docker compose up -d forgejo"
 fi
-echo "Next step: docker compose up -d forgejo"
+echo "hint: consul-template renders app.ini and the post-receive hook inside the container."
+if [ -f "$SECRETS_DIR/consul-token" ]; then
+  echo "warning: $SECRETS_DIR/consul-token is obsolete. This configuration does not use it." >&2
+  echo "warning: Delete the file. The container reads the Consul token from config/consul/secrets." >&2
+fi

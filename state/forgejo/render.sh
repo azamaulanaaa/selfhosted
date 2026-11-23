@@ -1,12 +1,14 @@
 #!/bin/sh
 # Render a Forgejo template without a Consul agent.
+# This script is the smoke-test renderer. The container always renders the
+# templates with consul-template.
 # This script supports the small template subset in state/forgejo/*.tpl:
 #   {{ env "NAME" }}
 #   {{ or (env "NAME") "default" }}
 #   {{ file "PATH" | trimSpace }}
 #   {{ if eq (env "NAME") "VALUE" }} ... {{ else }} ... {{ end }}
-# Lines between the peer block markers are dropped. Consul-template renders
-# that block in integrated mode. This script never prints a secret value.
+# Lines between the peer block markers are dropped. This script never prints a
+# secret value.
 # Usage: render.sh <template> <output>
 set -eu
 

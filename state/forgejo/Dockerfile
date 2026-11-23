@@ -1,10 +1,12 @@
 # syntax=docker/dockerfile:1
 # Forgejo wrapped with LiteFS, with consul-template embedded.
-# LiteFS replicates the SQLite database that Forgejo uses for its data.
-# A single node is the LiteFS primary. Only the primary can write the database.
-# Leader election uses a Consul lease. The entrypoint creates the Consul policy
-# and token that LiteFS uses for the lease. consul-template renders app.ini and
-# the git post-receive hook from state/forgejo/*.tpl at container start.
+# Consul is mandatory. CONSUL_ADDR selects local or remote Consul.
+# consul-template renders app.ini and the git post-receive hook at container
+# start and on every change. With LITEFS_ENABLED=1, LiteFS replicates the
+# SQLite database that Forgejo uses for its data. A single node is the LiteFS
+# primary. Only the primary can write the database. Leader election uses a
+# Consul lease. The entrypoint creates the Consul policy and token that LiteFS
+# uses for the lease.
 # This image contains no secrets.
 
 FROM codeberg.org/forgejo/forgejo:17.0.1
@@ -74,8 +76,6 @@ WORKDIR /srv
 RUN mkdir -p /etc/consul-template/templates /run/forgejo
 
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
-# The standalone renderer does not need a Consul agent.
-COPY --chmod=0755 render.sh /usr/local/bin/render.sh
 
 # The base image sets CMD to its own s6 supervisor. Clear it so that the base
 # CMD is not passed as arguments to this entrypoint.

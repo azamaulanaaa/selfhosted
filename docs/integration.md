@@ -1,8 +1,9 @@
 # Combined stack
 
-This document describes how to run the five services together. The services
-are caddy, consul, forgejo, lldap, and tinyauth. Garage is not part of this
-stack. See [`docs/layout.md`](layout.md) for the file contract and
+This document describes how to run the six services together. The services
+are caddy, consul, forgejo, garage, lldap, and tinyauth. See
+[`docs/layout.md`](layout.md) for the file contract,
+[`docs/scaling.md`](scaling.md) for the shared and node-local files, and
 [`docs/caddy.md`](caddy.md) for the caddy keys.
 
 ## Consul is mandatory
@@ -34,11 +35,48 @@ applies when the user answers no and when `SETUP_SERVICES=none`.
 
 The root wizard asks for the remote ACL token with a hidden prompt. It writes
 the token to `config/consul/secrets/remote-token` with mode 600. It gives the
-directory mode 700. It does not deploy Consul. Non-interactive input is
-`CONSUL_HTTP_TOKEN`.
+directory mode 700. It does not deploy Consul. The non-interactive token
+input is `CONSUL_HTTP_TOKEN`.
 
 The root wizard never writes the token to `.env`. It removes `consul` from
 the enabled services.
+
+## Services
+
+- **caddy** is the reverse proxy. It serves the lldap, tinyauth and forgejo
+  web UIs over HTTPS. It also proxies the Consul web UI in local mode.
+- **consul** is the service registry and the KV store. It runs only in local
+  mode.
+- **forgejo** is the Git forge.
+- **garage** is the S3-compatible object store.
+- **lldap** is the LDAP server.
+- **tinyauth** is the authentication proxy.
+
+### Garage
+
+Garage is infrastructure only. The operator uses the Garage CLI for the
+layout, the buckets, and the access keys. The wizard does not manage these
+steps. It writes the secrets and the config file only.
+
+Garage always uses Consul service discovery. It has no Consul-free mode.
+`CONSUL_ADDR` selects local or remote Consul.
+
+Garage publishes four ports on `PUBLIC_IP`:
+
+| Port | Use                     |
+| ---- | ----------------------- |
+| 3900 | S3 API                  |
+| 3901 | Garage RPC              |
+| 3902 | Static website endpoint |
+| 3903 | Admin and metrics API   |
+
+`PUBLIC_IP` defaults to `127.0.0.1`. Set it to a trusted LAN address to
+reach these ports from another host. Trusted LAN only.
+
+A node that runs only Garage can use remote Consul. Set `CONSUL_ADDR` to
+the remote address. The node keeps the same `rpc_secret` as the other
+Garage nodes. See [`docs/garage.md`](garage.md) and
+[`docs/scaling.md`](scaling.md).
 
 ## Capability flags
 
@@ -59,14 +97,18 @@ Start the services in this order:
 
 1. In local mode, start consul first. Wait for a leader and for the web UI
     on port 8500. In remote mode, skip this step.
-2. Start lldap, tinyauth, and forgejo. The entrypoints read the LDAP
+2. Start garage. Wait for the health check. Then use the Garage CLI for the
+    layout. The wizard does not do this step. See
+    [`docs/garage.md`](garage.md).
+3. Start lldap, then tinyauth, then forgejo. The entrypoints read the LDAP
     password from `config/ldap/secrets/user-pass`. Each entrypoint selects the
     Consul token at container start.
-3. Start caddy last. consul-template renders the vhosts from the Consul
+4. Start caddy last. consul-template renders the vhosts from the Consul
     service list and KV keys.
 
-In local mode, run `docker compose up -d consul`, then the other services,
-then `docker compose up -d caddy`.
+In local mode, run `docker compose up -d consul`, then
+`docker compose up -d garage`, then the other services, then
+`docker compose up -d caddy`.
 
 ## Consul token files
 
@@ -78,7 +120,8 @@ A container selects the token file by comparing `CONSUL_ADDR` to
 - Remote Consul: the container reads the token from
   `config/consul/secrets/remote-token`.
 
-A wizard does not copy the token into its own secret tree.
+A wizard does not copy the token into its own secret tree. Caddy, forgejo,
+garage, lldap and tinyauth mount `config/consul/secrets` read-only.
 
 ## Caddy read policy
 
@@ -109,8 +152,12 @@ The policy grants read access to the service list and the KV keys.
 
 - Run `bash state/<service>/smoke.sh` for each service before you start it.
   The scripts use scratch trees and need no Docker.
+- Run `scripts/check-scaling.sh` before you add a node. See
+  [`docs/scaling.md`](scaling.md).
 - Keep `STACK_DOMAIN=sh.lan` in `.env`. No service may use the `lan` domain.
 - Copy the same OIDC key files to every node before you start a second
   tinyauth node. LiteFS does not replicate them.
 - Forgejo peers replicate git over port 3000. Publish that port on each node
   when you run more than one Forgejo node.
+- Use the Garage CLI for the layout, the buckets, and the access keys. Do
+  not add a layout or key step to the wizard.

@@ -18,7 +18,12 @@
 #   CONSUL_UI_ENABLED      1 to enable the web UI, 0 to disable it. Default 1.
 #   CONSUL_ROTATE_SECRETS  1 to create a new gossip key and new ACL tokens, 0 to keep them. Default 0.
 #                          A new gossip key must be copied to every node in the cluster.
-#   CONSUL_JOIN_IPS        Comma-separated IPv4 list of cluster peers to merge into peers.txt.
+#   CONSUL_JOIN_IPS        Comma-separated IPv4 list of cluster peers. This script reads it
+#                          from the environment, then from the CONSUL_JOIN_IPS line in the
+#                          root .env. It merges the list into peers.txt. It does not prompt.
+#   CONSUL_BOOTSTRAP_EXPECT  Local Consul bootstrap_expect. A number from 1 to 99. This script
+#                          reads it from the environment, then from the CONSUL_BOOTSTRAP_EXPECT
+#                          line in the root .env. It does not prompt. Default: 1.
 #   CONSUL_NODE_NAME       Node name for this Consul server. Default: the machine hostname.
 #   PUBLIC_IP              Public or LAN IPv4 of this node. The root dispatcher asks for it and
 #                          stores it in the root .env. This script reads PUBLIC_IP from the
@@ -48,13 +53,14 @@ grant_read_access() {
   echo "warning: The consul container cannot read this file. Add your user to group 1000 or run this script as root." >&2
 }
 
-# Parse the PUBLIC_IP value from the root .env file.
+# Parse the value of a key from the root .env file.
 # Print the trimmed value. Print nothing when the file or the line is missing.
-read_env_public_ip() {
+read_env_value() {
+  local key="$1"
   if [ ! -f .env ]; then
     return 0
   fi
-  { grep -E '^PUBLIC_IP=' .env || true; } | tail -n1 | cut -d= -f2- |
+  { grep -E "^${key}=" .env || true; } | tail -n1 | cut -d= -f2- |
     sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\\1/" -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
 }
 
@@ -69,7 +75,7 @@ resolve_public_ip() {
     return 0
   fi
   local candidate
-  candidate="$(read_env_public_ip)"
+  candidate="$(read_env_value PUBLIC_IP)"
   if [ -n "$candidate" ]; then
     public_ip="$candidate"
     public_ip_source="envfile"
@@ -165,6 +171,8 @@ readonly JOIN_FILE="config/consul/join.hcl"
 # The wizard reads the committed template and never writes to state/.
 readonly BASE_CONFIG_FILE="state/consul/consul.hcl"
 readonly RENDERED_CONFIG_FILE="config/consul/consul.hcl"
+# The wizard owns bootstrap_expect. Consul loads this file with the other wizard files.
+readonly BOOTSTRAP_CONFIG_FILE="config/consul/bootstrap.hcl"
 # The shared gossip key lives in the backed-up secrets tree. Copy this file to every cluster node.
 readonly GOSSIP_KEY_FILE="config/consul/secrets/gossip.key"
 
@@ -188,6 +196,121 @@ is_valid_ipv4() {
     fi
   done
   return 0
+}
+
+# Trim the surrounding whitespace from the argument and print it.
+trim_whitespace() {
+  printf '%s' "$1" | sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
+}
+
+# Return 0 when the argument is empty or a comma-separated list of IPv4 addresses.
+# Surrounding whitespace around each entry is ignored.
+is_valid_peer_list() {
+  local list
+  list="$(trim_whitespace "$1")"
+  if [ -z "$list" ]; then
+    return 0
+  fi
+  local IFS=','
+  local -a entries
+  read -r -a entries <<<"$list"
+  local entry
+  for entry in "${entries[@]}"; do
+    if ! is_valid_ipv4 "$(trim_whitespace "$entry")"; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+# Print the peer list with trimmed entries. Print nothing for an empty list.
+normalize_peer_list() {
+  local list
+  list="$(trim_whitespace "$1")"
+  if [ -z "$list" ]; then
+    return 0
+  fi
+  local IFS=','
+  local -a entries
+  read -r -a entries <<<"$list"
+  local out=""
+  local entry
+  for entry in "${entries[@]}"; do
+    entry="$(trim_whitespace "$entry")"
+    if [ -n "$out" ]; then
+      out="$out,"
+    fi
+    out="$out$entry"
+  done
+  printf '%s\n' "$out"
+}
+
+# Return 0 when the argument is a number from 1 to 99.
+is_valid_bootstrap_expect() {
+  local value="$1"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  local number=$((10#$value))
+  [ "$number" -ge 1 ] && [ "$number" -le 99 ]
+}
+
+# Print an STE error for an invalid Consul value and exit 1.
+# The message tells the user which source holds the bad value.
+consul_value_invalid() {
+  local key="$1"
+  local value="$2"
+  local source="$3"
+  local rule="$4"
+  case "$source" in
+  env)
+    echo "error: $key '$value' is not valid. $rule" >&2
+    ;;
+  envfile)
+    echo "error: The root .env holds the invalid $key '$value'. Fix .env by hand or set $key." >&2
+    ;;
+  *)
+    echo "error: '$value' is not valid. $rule" >&2
+    ;;
+  esac
+  exit 1
+}
+
+# Resolve the peer list. Set consul_join_ips.
+# The order is: the process environment, then the root .env file.
+# A missing value is an empty list.
+resolve_join_ips() {
+  local candidate=""
+  local source="none"
+  if [ -n "${CONSUL_JOIN_IPS+x}" ]; then
+    candidate="$CONSUL_JOIN_IPS"
+    source="env"
+  elif [ -f .env ] && grep -qE '^CONSUL_JOIN_IPS=' .env; then
+    candidate="$(read_env_value CONSUL_JOIN_IPS)"
+    source="envfile"
+  fi
+  if ! is_valid_peer_list "$candidate"; then
+    consul_value_invalid CONSUL_JOIN_IPS "$candidate" "$source" "Use a comma-separated list of IPv4 addresses."
+  fi
+  consul_join_ips="$(normalize_peer_list "$candidate")"
+}
+
+# Resolve bootstrap_expect. Set consul_bootstrap_expect.
+# The order is: the process environment, then the root .env file, then 1.
+resolve_bootstrap_expect() {
+  local candidate="1"
+  local source="default"
+  if [ -n "${CONSUL_BOOTSTRAP_EXPECT+x}" ]; then
+    candidate="$CONSUL_BOOTSTRAP_EXPECT"
+    source="env"
+  elif [ -f .env ] && grep -qE '^CONSUL_BOOTSTRAP_EXPECT=' .env; then
+    candidate="$(read_env_value CONSUL_BOOTSTRAP_EXPECT)"
+    source="envfile"
+  fi
+  if ! is_valid_bootstrap_expect "$candidate"; then
+    consul_value_invalid CONSUL_BOOTSTRAP_EXPECT "$candidate" "$source" "Use a number from 1 to 99."
+  fi
+  consul_bootstrap_expect="$((10#$candidate))"
 }
 
 # Print the configured peers, one IPv4 per line. Sort and deduplicate the output.
@@ -250,6 +373,17 @@ render_consul_hcl() {
   grant_read_access "$RENDERED_CONFIG_FILE" 0640
 }
 
+# Render the wizard-owned bootstrap_expect file.
+# The committed template does not hold this key, so Consul reads it once.
+render_bootstrap_hcl() {
+  {
+    printf '# Rendered by setup.sh from CONSUL_BOOTSTRAP_EXPECT. Do not edit.\n'
+    printf 'bootstrap_expect = %s\n' "$consul_bootstrap_expect"
+  } >"$BOOTSTRAP_CONFIG_FILE"
+  chmod 0640 "$BOOTSTRAP_CONFIG_FILE"
+  grant_read_access "$BOOTSTRAP_CONFIG_FILE" 0640
+}
+
 # Print the exact commands that create a read-only policy and token for caddy.
 # The wizard does not run the Consul CLI and does not invent a token.
 # The operator runs these commands when the Consul CLI is available and the stack is up.
@@ -280,37 +414,22 @@ validate_ips() {
   return "$invalid"
 }
 
-# Merge the IPs from CONSUL_JOIN_IPS into peers.txt (union, deduplicated).
-# Exit 1 and write nothing when an entry is not a valid IPv4 address.
-seed_peers_from_env() {
-  if [ -z "${CONSUL_JOIN_IPS:-}" ]; then
+# Merge the resolved peer list into peers.txt (union, deduplicated).
+# resolve_join_ips validates the list before this function runs.
+seed_peers() {
+  if [ -z "$consul_join_ips" ]; then
     return 0
   fi
-  local entry ip
+  local ip
   local -a extra=()
   local IFS=','
-  read -r -a extra <<<"$CONSUL_JOIN_IPS"
+  read -r -a extra <<<"$consul_join_ips"
   unset IFS
-  local -a valid=()
-  for entry in "${extra[@]}"; do
-    ip="$(printf '%s' "$entry" | tr -d '[:space:]')"
-    if [ -z "$ip" ]; then
-      continue
-    fi
-    if ! is_valid_ipv4 "$ip"; then
-      echo "error: CONSUL_JOIN_IPS entry '$ip' is not a valid IPv4 address." >&2
-      exit 1
-    fi
-    valid+=("$ip")
-  done
-  if [ "${#valid[@]}" -eq 0 ]; then
-    return 0
-  fi
   local -a merged=()
   while IFS= read -r ip; do
     merged+=("$ip")
   done < <(read_peers)
-  merged+=("${valid[@]}")
+  merged+=("${extra[@]}")
   write_peers "${merged[@]}"
 }
 
@@ -329,6 +448,7 @@ usage_nodes() {
 # They never prompt and never need openssl. They run before the wizard path.
 if [ "${1:-}" = "nodes" ]; then
   mkdir -p config/consul
+  resolve_join_ips
   shift
   nodes_sub="${1:-}"
   if [ $# -gt 0 ]; then
@@ -343,7 +463,7 @@ if [ "${1:-}" = "nodes" ]; then
     if ! validate_ips "$@"; then
       exit 1
     fi
-    seed_peers_from_env
+    seed_peers
     merged=()
     while IFS= read -r peer; do
       merged+=("$peer")
@@ -361,7 +481,7 @@ if [ "${1:-}" = "nodes" ]; then
     if ! validate_ips "$@"; then
       exit 1
     fi
-    seed_peers_from_env
+    seed_peers
     local_peers=()
     while IFS= read -r peer; do
       local_peers+=("$peer")
@@ -574,7 +694,12 @@ mkdir -p config/consul/secrets
 chmod 0750 config/consul
 chmod 0700 config/consul/secrets
 
-# Step 3: collect the answers. Use the environment when stdin is not a TTY.
+# Step 3: read the cluster values and collect the answers.
+# The root dispatcher writes CONSUL_JOIN_IPS and CONSUL_BOOTSTRAP_EXPECT to
+# the root .env and exports them. This script reads them. It never asks for them.
+resolve_join_ips
+resolve_bootstrap_expect
+# Use the environment when stdin is not a TTY.
 ui_enabled=1
 rotate=0
 node_name=""
@@ -774,17 +899,20 @@ grant_read_access config/consul/local.hcl 0640
 # Step 5b: render the server config from the committed template.
 render_consul_hcl
 
+# Step 5c: write bootstrap_expect to the wizard-owned config file.
+render_bootstrap_hcl
+
 # Step 6: enforce the directory modes on every run.
 chmod 0700 config/consul/secrets
 chmod 0750 config/consul
 
-# Step 7: merge the optional CONSUL_JOIN_IPS seed and re-render the join config.
+# Step 7: merge the resolved CONSUL_JOIN_IPS list and re-render the join config.
 # peers.txt can be empty on the first run. Always write join.hcl so the mount never fails.
 # peers.txt can also be missing, for example after a clean. Always write it.
 if [ ! -f "$PEERS_FILE" ]; then
   write_peers
 fi
-seed_peers_from_env
+seed_peers
 render_join
 peers_configured="$(peer_count)"
 
@@ -793,6 +921,7 @@ peers_configured="$(peer_count)"
 # Step 9: print the summary.
 echo "Configured the consul wizard files:"
 echo "  config/consul/local.hcl"
+echo "  config/consul/bootstrap.hcl"
 echo "  config/consul/consul.hcl"
 echo "  config/consul/secrets/gossip.key ($gossip_key_state)"
 case "$secret_state" in
@@ -819,9 +948,7 @@ echo "Node name: $node_name"
 echo "hint: Node names must be unique per server."
 echo "  config/consul/join.hcl"
 echo "Peers configured: $peers_configured"
-if [ "$peers_configured" -gt 0 ]; then
-  echo "hint: After the peers join, raise bootstrap_expect to the number of servers in state/consul/consul.hcl and roll-restart the stack."
-fi
+echo "bootstrap_expect: $consul_bootstrap_expect"
 echo "Next step: docker compose up -d consul"
 echo "Back up config/consul/secrets and data/consul/store. These are the backup-critical paths. See docs/layout.md."
 echo ""

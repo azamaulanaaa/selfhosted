@@ -10,6 +10,7 @@ services:
     volumes:
       - ./config/consul/consul.hcl:/consul/config/00-base.hcl:ro
       - ./config/consul/local.hcl:/consul/config/10-local.hcl:ro
+      - ./config/consul/bootstrap.hcl:/consul/config/12-bootstrap.hcl:ro
       - ./config/consul/secrets/agent.hcl:/consul/config/20-secrets.hcl:ro
       - ./config/consul/join.hcl:/consul/config/15-join.hcl:ro
       - ./data/consul/store:/consul/data:rw

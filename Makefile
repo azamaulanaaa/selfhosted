@@ -1,7 +1,7 @@
 SHELL := bash
 .DEFAULT_GOAL := help
 
-.PHONY: help ci smolvm smolvm-pack smolvm-clean smolvm-exec smolvm-preflight smolvm-verify check-jactionlint check-bash check-commits check-dclint check-dockerfmt check-editorconfig check-gitleaks check-hadolint check-markdown check-mise check-shfmt check-zizmor format format-shfmt format-dockerfmt format-dclint hooks release
+.PHONY: help ci smolvm smolvm-pack smolvm-clean smolvm-exec smolvm-preflight smolvm-verify check-jactionlint check-bash check-commits check-dclint check-dockerfmt check-editorconfig check-gitleaks check-hadolint check-markdown check-mise check-scaling check-shfmt check-zizmor format format-shfmt format-dockerfmt format-dclint hooks release
 
 help: ## Show this help.
 	@echo "Targets:"
@@ -57,6 +57,9 @@ check-markdown: ## Check every Markdown file with markdownlint-cli2.
 
 check-mise: ## Check the mise config file when mise is available.
 	scripts/check-mise.sh
+
+check-scaling: ## Check the node directories in SCALING_NODES, or run the self-test.
+	scripts/check-scaling.sh $(SCALING_NODES)
 
 check-shfmt: ## Check the bash file format with shfmt.
 	scripts/check-shfmt.sh

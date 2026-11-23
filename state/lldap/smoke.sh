@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The expected patterns use single quotes on purpose.
 # shellcheck disable=SC2016
-# Smoke check for the lldap standalone mode and integrated mode.
+# Smoke check for lldap with and without LiteFS.
 # The check verifies the compose fragment, the entrypoint, and the wizard.
 # Names and messages use short active sentences.
 set -euo pipefail
@@ -34,28 +34,42 @@ assert_line() {
   fi
 }
 
+# Check that a file holds none of an unexpected line.
+assert_no_line() {
+  local file="$1"
+  local pattern="$2"
+  local description="$3"
+  if grep -Fq -- "$pattern" "$file"; then
+    smoke_error "$description Unexpected: $pattern"
+  fi
+}
+
 # Check the compose settings for both modes.
 check_compose_fragment() {
   echo "smoke: checking the compose fragment"
-  assert_line "$COMPOSE_FRAGMENT" 'CONSUL_ENABLED=${CONSUL_ENABLED:-0}' 'The compose fragment lacks the Consul flag.'
+  assert_line "$COMPOSE_FRAGMENT" 'CONSUL_ADDR=${CONSUL_ADDR:-http://consul:8500}' 'The compose fragment lacks the Consul address.'
   assert_line "$COMPOSE_FRAGMENT" 'LITEFS_ENABLED=${LITEFS_ENABLED:-0}' 'The compose fragment lacks the LiteFS flag.'
   assert_line "$COMPOSE_FRAGMENT" 'target: 3890' 'The compose fragment lacks the LDAP target port.'
   assert_line "$COMPOSE_FRAGMENT" 'published: 3890' 'The compose fragment lacks the LDAP published port.'
   assert_line "$COMPOSE_FRAGMENT" 'host_ip: ${PUBLIC_IP:-127.0.0.1}' 'The compose fragment lacks the explicit LDAP interface.'
-  assert_line "$COMPOSE_FRAGMENT" './data/lldap/store/db:/data:rw' 'The compose fragment lacks the standalone database mount.'
+  assert_line "$COMPOSE_FRAGMENT" './data/lldap/store/db:/data:rw' 'The compose fragment lacks the database mount.'
   assert_line "$COMPOSE_FRAGMENT" './data/lldap/store/litefs:/var/lib/litefs:rw' 'The compose fragment lacks the LiteFS data mount.'
   assert_line "$COMPOSE_FRAGMENT" './config/consul/secrets:/etc/consul/secrets:ro' 'The compose fragment lacks the Consul secrets mount.'
+  assert_no_line "$COMPOSE_FRAGMENT" 'CONSUL_HTTP_ADDR' 'The compose fragment still holds the old Consul address key.'
 }
 
 # Check that the entrypoint selects a mode and starts the right process.
 check_entrypoint_modes() {
   echo "smoke: checking the entrypoint modes"
-  assert_line "$ENTRYPOINT" 'CONSUL_ENABLED="${CONSUL_ENABLED:-0}"' 'The entrypoint lacks the Consul flag.'
   assert_line "$ENTRYPOINT" 'LITEFS_ENABLED="${LITEFS_ENABLED:-0}"' 'The entrypoint lacks the LiteFS flag.'
-  assert_line "$ENTRYPOINT" 'if [ "$integrated_mode" -eq 0 ]; then' 'The entrypoint lacks the standalone branch.'
-  assert_line "$ENTRYPOINT" 'exec gosu' 'The standalone branch lacks the direct LLDAP start.'
-  assert_line "$ENTRYPOINT" 'initial_management' 'The entrypoint does not read the Consul management token.'
-  assert_line "$ENTRYPOINT" 'litefs mount -config' 'The integrated branch lacks the LiteFS start.'
+  assert_line "$ENTRYPOINT" 'CONSUL_ADDR="${CONSUL_ADDR:-http://consul:8500}"' 'The entrypoint lacks the Consul address.'
+  assert_line "$ENTRYPOINT" 'LOCAL_CONSUL_ADDR="http://consul:8500"' 'The entrypoint lacks the local Consul comparison.'
+  assert_line "$ENTRYPOINT" 'CONSUL_REMOTE_TOKEN_FILE="${CONSUL_REMOTE_TOKEN_FILE:-/etc/consul/secrets/remote-token}"' 'The entrypoint lacks the remote token file.'
+  assert_line "$ENTRYPOINT" 'if [ "$litefs_mode" -eq 0 ]; then' 'The entrypoint lacks the branch without LiteFS.'
+  assert_line "$ENTRYPOINT" 'exec gosu' 'The branch without LiteFS lacks the direct LLDAP start.'
+  assert_line "$ENTRYPOINT" 'initial_management' 'The entrypoint does not read the local Consul token.'
+  assert_line "$ENTRYPOINT" 'litefs mount -config' 'The LiteFS branch lacks the LiteFS start.'
+  assert_no_line "$ENTRYPOINT" 'CONSUL_HTTP_ADDR' 'The entrypoint still holds the old Consul address key.'
 }
 
 # Check that the assembler output includes the lldap fragment.
@@ -81,6 +95,15 @@ run_wizard() {
   (
     cd "$SANDBOX"
     LLDAP_BASE_DN='dc=sh,dc=lan' bash state/lldap/setup.sh </dev/null >/dev/null
+  )
+}
+
+# Run the wizard in the sandbox with one CONSUL_ADDR value and print its output.
+# Do not use an interactive terminal.
+run_wizard_output() {
+  (
+    cd "$SANDBOX"
+    CONSUL_ADDR="$1" LLDAP_BASE_DN='dc=sh,dc=lan' bash state/lldap/setup.sh </dev/null
   )
 }
 
@@ -120,9 +143,24 @@ check_wizard_idempotence() {
   fi
 }
 
+# Check that the wizard hint names the token path of the selected Consul.
+check_wizard_token_hint() {
+  echo "smoke: checking the wizard token hint"
+  local local_output remote_output
+  local_output="$(run_wizard_output 'http://consul:8500')"
+  if ! printf '%s\n' "$local_output" | grep -Fq 'config/consul/secrets/agent.hcl'; then
+    smoke_error "The wizard hint lacks the local Consul token path."
+  fi
+  remote_output="$(run_wizard_output 'https://consul.example:8500')"
+  if ! printf '%s\n' "$remote_output" | grep -Fq 'config/consul/secrets/remote-token'; then
+    smoke_error "The wizard hint lacks the remote Consul token path."
+  fi
+}
+
 check_compose_fragment
 check_entrypoint_modes
 check_assembled_compose
 check_wizard_idempotence
+check_wizard_token_hint
 
 echo "smoke: all checks passed"

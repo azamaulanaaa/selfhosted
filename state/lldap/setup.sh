@@ -69,6 +69,33 @@ read_env_stack_domain() {
     sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\\1/" -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
 }
 
+# Print the CONSUL_ADDR value from the root .env file. Print nothing when the
+# file or the line is missing.
+read_env_consul_addr() {
+  if [ ! -f .env ]; then
+    return 0
+  fi
+  { grep -E '^CONSUL_ADDR=' .env || true; } | tail -n1 | cut -d= -f2- |
+    sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\\1/" -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
+}
+
+# Print the Consul token path for the selected Consul location.
+# Read CONSUL_ADDR from the environment, then from the root .env, then use the
+# local default. Remove one trailing slash before the comparison.
+# The wizard does not ask about Consul. It only reports the selected path.
+consul_token_path() {
+  local addr="${CONSUL_ADDR:-}"
+  if [ -z "$addr" ]; then
+    addr="$(read_env_consul_addr)"
+  fi
+  addr="${addr:-http://consul:8500}"
+  if [ "${addr%/}" = "http://consul:8500" ]; then
+    printf '%s\n' "config/consul/secrets/agent.hcl (key initial_management)"
+  else
+    printf '%s\n' "config/consul/secrets/remote-token"
+  fi
+}
+
 # Resolve the stack domain. Set stack_domain and stack_domain_source.
 # The order is: STACK_DOMAIN from the environment, then the root .env, then the
 # built-in default. The compose file uses the same default.
@@ -422,11 +449,11 @@ echo "LDAP password: $CANONICAL_USER_PASS_FILE (mode 0600)"
 echo "HTTP URL: $HTTP_URL"
 echo "Base DN: $base_dn"
 echo "Admin username: $admin_user"
-echo "hint: The SQLite database lives on the litefs mount at /data/lldap.sqlite."
+echo "hint: The SQLite database lives at /data/lldap.sqlite."
 echo "hint: LiteFS elects a single primary through a consul lease (key lldap/litefs)."
 echo "hint: Only the litefs primary can write the database."
 echo "hint: LLDAP reads its secrets from files in $SECRETS_DIR. Back that directory up."
-echo "hint: In integrated mode the entrypoint reads the Consul management token from config/consul/secrets/agent.hcl."
-echo "hint: LLDAP must run on the elected primary in integrated mode."
+echo "hint: The entrypoint reads the Consul token from $(consul_token_path)."
+echo "hint: LLDAP must run on the elected primary when LiteFS is enabled."
 echo "Next step: docker compose up -d lldap"
 echo "Next step: open $HTTP_URL (needs the caddy service)"

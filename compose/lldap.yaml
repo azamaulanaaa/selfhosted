@@ -1,10 +1,13 @@
 services:
-  # LLDAP in standalone mode or integrated mode.
-  # Standalone mode: with CONSUL_ENABLED=0 or LITEFS_ENABLED=0 the entrypoint
-  # starts LLDAP directly. No LiteFS, no Consul lease, and no FUSE mount.
-  # Integrated mode: with both flags at 1, LiteFS replicates the SQLite
-  # database through Consul. A single node is the primary. Only the primary
-  # writes the database. Consul ACLs protect the lease key "lldap/litefs".
+  # LLDAP with or without LiteFS.
+  # LITEFS_ENABLED=0: the entrypoint starts LLDAP directly. No LiteFS lease
+  # and no FUSE mount.
+  # LITEFS_ENABLED=1: LiteFS replicates the SQLite database through Consul.
+  # A single node is the primary. Only the primary writes the database.
+  # Consul ACLs protect the lease key "lldap/litefs".
+  # CONSUL_ADDR selects the Consul location and the token file. Local Consul
+  # reads config/consul/secrets/agent.hcl. Remote Consul reads
+  # config/consul/secrets/remote-token.
   # The HTTP UI goes through caddy at lldap.<STACK_DOMAIN>.
   # Note: LLDAP needs a writable SQLite database. A litefs replica is
   # read-only, therefore LLDAP does not run on replicas.
@@ -18,20 +21,21 @@ services:
       # LLDAP configuration and secrets. Rendered by setup.sh. Read-only.
       - ./config/lldap/lldap_config.toml:/etc/lldap/lldap_config.toml:ro
       - ./config/lldap/secrets:/etc/lldap/secrets:ro
-      # Standalone SQLite database. Back this up. In integrated mode the
-      # LiteFS FUSE mount at /data shadows this path.
+      # SQLite database when LiteFS is off. Back this up. When LiteFS is
+      # enabled, the LiteFS FUSE mount at /data shadows this path.
       - ./data/lldap/store/db:/data:rw
-      # LiteFS internal data (LTX files). Back this up. Used in integrated mode.
+      # LiteFS internal data (LTX files). Back this up. Used when LiteFS is enabled.
       - ./data/lldap/store/litefs:/var/lib/litefs:rw
-      # Consul agent secrets. The entrypoint reads initial_management at start.
+      # Consul secrets. The entrypoint reads initial_management from agent.hcl
+      # in local mode and remote-token in remote mode.
       # The wizard never copies the token into the lldap secret tree.
       - ./config/consul/secrets:/etc/consul/secrets:ro
     environment:
       - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
       - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
-      - CONSUL_HTTP_ADDR=${CONSUL_HTTP_ADDR:-http://consul:8500}
-      # Standalone mode when either flag is 0. Integrated mode needs both at 1.
-      - CONSUL_ENABLED=${CONSUL_ENABLED:-0}
+      # CONSUL_ADDR selects the Consul location and the token file.
+      - CONSUL_ADDR=${CONSUL_ADDR:-http://consul:8500}
+      # LITEFS_ENABLED alone gates LiteFS.
       - LITEFS_ENABLED=${LITEFS_ENABLED:-0}
       - LLDAP_HTTP_URL=http://lldap.${STACK_DOMAIN:-sh.lan}
       # The wizard writes these files. LLDAP reads the file contents.
@@ -39,7 +43,7 @@ services:
       - LLDAP_KEY_SEED_FILE=/etc/lldap/secrets/key_seed
       - LLDAP_LDAP_USER_PASS_FILE=/etc/lldap/secrets/ldap_user_pass
     ports:
-      # LDAP port for standalone clients. Bound to PUBLIC_IP, which defaults
+      # LDAP port for clients. Bound to PUBLIC_IP, which defaults
       # to 127.0.0.1. Set PUBLIC_IP to a trusted LAN address to expose it.
       - target: 3890
         published: 3890

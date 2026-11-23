@@ -1,0 +1,62 @@
+# dclint disable require-project-name-field
+# The root compose.yaml owns the project name. This file is an included fragment.
+services:
+  # Garage is an S3-compatible object store. Consul service discovery is always
+  # enabled. CONSUL_ADDR selects local or remote Consul. The entrypoint selects
+  # the Consul token file at container start. Ports are published on PUBLIC_IP,
+  # which defaults to 127.0.0.1.
+  garage:
+    image: garage-consul:local
+    build:
+      context: ./state/garage
+    # The image is built locally. Never pull it from a registry.
+    container_name: garage
+    volumes:
+      # Wizard configuration. The entrypoint renders /run/garage/garage.toml
+      # from this file. Read-only.
+      - ./config/garage/garage.toml:/etc/garage/garage.toml:ro
+      # RPC, admin, and metrics secret files. Read-only.
+      - ./config/garage/secrets:/etc/garage/secrets:ro
+      # Consul secrets. The entrypoint reads agent.hcl in local mode and
+      # remote-token in remote mode. Read-only. Do not mount only agent.hcl.
+      - ./config/consul/secrets:/etc/garage/consul-secrets:ro
+      # Garage metadata and object data. Back both up.
+      - ./data/garage/meta:/var/lib/garage/meta:rw
+      - ./data/garage/data:/var/lib/garage/data:rw
+    environment:
+      - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
+      - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
+      - CONSUL_ADDR=${CONSUL_ADDR:-http://consul:8500}
+    ports:
+      # S3 API. Trusted LAN only.
+      - target: 3900
+        published: 3900
+        host_ip: ${PUBLIC_IP:-127.0.0.1}
+        protocol: tcp
+      # Garage RPC for cluster peers. Trusted LAN only.
+      - target: 3901
+        published: 3901
+        host_ip: ${PUBLIC_IP:-127.0.0.1}
+        protocol: tcp
+      # Static website endpoint. Trusted LAN only.
+      - target: 3902
+        published: 3902
+        host_ip: ${PUBLIC_IP:-127.0.0.1}
+        protocol: tcp
+      # Admin and metrics API. Trusted LAN only.
+      - target: 3903
+        published: 3903
+        host_ip: ${PUBLIC_IP:-127.0.0.1}
+        protocol: tcp
+    restart: unless-stopped
+    healthcheck:
+      # Garage global flags come before the subcommand.
+      # This command reads the local metadata and reports the cluster status.
+      # It works in the scratch image and needs no shell.
+      test: ["CMD", "/garage", "-c", "/run/garage/garage.toml", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    # Built locally. Never pull it from a registry.
+    pull_policy: build

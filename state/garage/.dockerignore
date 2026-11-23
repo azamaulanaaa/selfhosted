@@ -1,0 +1,4 @@
+# Only the entrypoint script is needed to build the image.
+# Everything else in this directory is development material.
+**
+!entrypoint.sh

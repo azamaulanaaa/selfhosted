@@ -1,7 +1,7 @@
 # Rendered from state/forgejo/app.ini.tpl. Do not edit.
-# consul-template renders this file in integrated mode. state/forgejo/render.sh
-# renders it in standalone mode. The renderer reads non-secret values from the
-# environment and reads secrets from 0600 files through their *_FILE paths.
+# consul-template renders this file in every mode. state/forgejo/render.sh
+# renders it in the smoke test only. The renderer reads non-secret values from
+# the environment and reads secrets from 0600 files through their *_FILE paths.
 # Forgejo reads app.ini at startup. A restart is required after a re-render.
 
 [DEFAULT]
@@ -12,7 +12,7 @@ RUN_MODE = prod
 [server]
 PROTOCOL = http
 DOMAIN = {{ or (env "STACK_DOMAIN") "sh.lan" }}
-{{ if eq (env "CONSUL_ENABLED") "1" }}
+{{ if eq (env "TLS_ENABLED") "1" }}
 ROOT_URL = https://forgejo.{{ or (env "STACK_DOMAIN") "sh.lan" }}/
 {{ else }}
 ROOT_URL = http://{{ env "PUBLIC_IP" }}:3000/

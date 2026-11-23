@@ -4,14 +4,15 @@ services:
   # Forgejo serves the stack at forgejo.<STACK_DOMAIN>. Caddy proxies the HTTPS
   # vhost in integrated mode. Port 3000 is published on PUBLIC_IP so a
   # standalone node answers without a proxy and so git peers can replicate.
-  # LiteFS and Consul start only when both capability flags are 1.
+  # Consul is mandatory. CONSUL_ADDR selects local or remote Consul.
+  # LiteFS starts only when LITEFS_ENABLED is 1.
   forgejo:
     image: forgejo-litefs:local
     build:
       context: ./state/forgejo
     # The image is built locally. Never pull it from a registry.
     container_name: forgejo
-    # No hard Consul dependency. In standalone mode Forgejo starts with no peer.
+    # No hard Consul dependency. The entrypoint retries while Consul starts.
     volumes:
       # Consul-template templates. Read-only. Rendered output is never committed.
       - ./state/forgejo/app.ini.tpl:/etc/consul-template/templates/app.ini.tpl:ro
@@ -23,9 +24,10 @@ services:
       - ./config/forgejo/forgejo.env:/etc/forgejo/forgejo.env:ro
       # Forgejo secrets. The entrypoint writes the LiteFS token here at boot.
       - ./config/forgejo/secrets:/etc/forgejo/secrets:rw
-      # Consul agent secrets. The entrypoint reads initial_management at boot.
-      # Keep this direct mount in both modes.
-      - ./config/consul/secrets/agent.hcl:/config/consul/agent.hcl:ro
+      # Consul secrets. Read-only. The entrypoint reads initial_management from
+      # agent.hcl for local Consul and the token from remote-token for remote
+      # Consul. Mount the whole directory so both files are available.
+      - ./config/consul/secrets:/config/consul/secrets:ro
       # Local SQLite and git data in standalone mode. LiteFS overlays /data in
       # integrated mode. Back up the whole store tree.
       - ./data/forgejo/store:/data:rw
@@ -34,8 +36,7 @@ services:
     environment:
       - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
       - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
-      - CONSUL_HTTP_ADDR=${CONSUL_HTTP_ADDR:-http://consul:8500}
-      - CONSUL_ENABLED=${CONSUL_ENABLED:-0}
+      - CONSUL_ADDR=${CONSUL_ADDR:-http://consul:8500}
       - LITEFS_ENABLED=${LITEFS_ENABLED:-0}
       - OIDC_ENABLED=${OIDC_ENABLED:-0}
       - TLS_ENABLED=${TLS_ENABLED:-0}
@@ -66,7 +67,8 @@ services:
     # Built locally. Never pull it from a registry.
     pull_policy: build
 
-  # Opt-in LiteFS peer port. Enable it with --profile peer on a second node.
+  # Opt-in LiteFS peer port. Use it only when LITEFS_ENABLED is 1.
+  # Start it on a second node with --profile peer.
   # Git replication already uses port 3000. This port carries LiteFS LTX data.
   forgejo-peer-port:
     image: forgejo-litefs:local

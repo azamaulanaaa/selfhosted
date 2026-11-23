@@ -1,27 +1,29 @@
 #!/bin/sh
-# Boot the Forgejo server behind LiteFS.
-# LiteFS mounts the data directory at /data. Forgejo stores its SQLite
-# database and its git repositories in that directory.
-# LiteFS elects a single primary through a Consul lease.
-# Only the primary can write the database.
-# Consul ACLs protect the lease, therefore this script also creates
+# Boot the Forgejo server.
+# Consul is mandatory in every mode. CONSUL_ADDR selects local or remote Consul.
+# consul-template renders app.ini and the git post-receive hook at boot and on
+# every change. A launcher in each repository reads the rendered hook, so a
+# re-render reaches all repos.
+# With LITEFS_ENABLED=1, LiteFS mounts the data directory at /data and
+# replicates the SQLite database and the git repositories. LiteFS elects a
+# single primary through a Consul lease. Only the primary can write the
+# database. Consul ACLs protect the lease, therefore this script also creates
 # the Consul policy and token that LiteFS uses for the lease.
-# consul-template renders app.ini and the git post-receive hook. A launcher in
-# each repository reads the rendered hook, so a re-render reaches all repos.
+# With LITEFS_ENABLED=0, Forgejo runs on local SQLite and no peer replication
+# runs.
 # The script never prints secret values. It prints paths only.
 set -eu
 
 # These variables point at the runtime paths. The defaults match the image.
 # The tests override them with a scratch tree.
 FORGEJO_SECRETS_DIR="${FORGEJO_SECRETS_DIR:-/etc/forgejo/secrets}"
-CONSUL_AGENT_HCL="${CONSUL_AGENT_HCL:-/config/consul/agent.hcl}"
+CONSUL_SECRETS_DIR="${CONSUL_SECRETS_DIR:-/config/consul/secrets}"
+CONSUL_AGENT_HCL="${CONSUL_AGENT_HCL:-${CONSUL_SECRETS_DIR}/agent.hcl}"
+CONSUL_REMOTE_TOKEN="${CONSUL_REMOTE_TOKEN:-${CONSUL_SECRETS_DIR}/remote-token}"
 CONSUL_TEMPLATE_CONFIG="${CONSUL_TEMPLATE_CONFIG:-/etc/consul-template/config.hcl}"
 RENDER_DIR="${RENDER_DIR:-/run/forgejo}"
 APP_INI="${APP_INI:-/run/forgejo/app.ini}"
 RENDERED_HOOK="${RENDERED_HOOK:-/run/forgejo/post-receive}"
-APP_INI_TPL="${APP_INI_TPL:-/etc/consul-template/templates/app.ini.tpl}"
-POST_RECEIVE_TPL="${POST_RECEIVE_TPL:-/etc/consul-template/templates/post-receive.tpl}"
-RENDER_SCRIPT="${RENDER_SCRIPT:-/usr/local/bin/render.sh}"
 LITEFS_YML="${LITEFS_YML:-/run/litefs.yml}"
 LITEFS_MOUNT_DIR="${LITEFS_MOUNT_DIR:-/data}"
 LITEFS_DATA_DIR="${LITEFS_DATA_DIR:-/var/lib/litefs}"
@@ -29,21 +31,22 @@ REPO_ROOT="${REPO_ROOT:-/data/gitea/forgejo-repositories}"
 
 # Environment that the operator sets.
 PUBLIC_IP="${PUBLIC_IP:-}"
-CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-http://consul:8500}"
+CONSUL_ADDR="${CONSUL_ADDR:-http://consul:8500}"
 STACK_DOMAIN="${STACK_DOMAIN:-sh.lan}"
-CONSUL_ENABLED="${CONSUL_ENABLED:-0}"
 LITEFS_ENABLED="${LITEFS_ENABLED:-0}"
 OIDC_ENABLED="${OIDC_ENABLED:-0}"
 TLS_ENABLED="${TLS_ENABLED:-0}"
 
-readonly FORGEJO_SECRETS_DIR CONSUL_AGENT_HCL CONSUL_TEMPLATE_CONFIG
-readonly RENDER_DIR APP_INI RENDERED_HOOK APP_INI_TPL POST_RECEIVE_TPL
-readonly RENDER_SCRIPT LITEFS_YML
+readonly FORGEJO_SECRETS_DIR CONSUL_SECRETS_DIR CONSUL_AGENT_HCL
+readonly CONSUL_REMOTE_TOKEN CONSUL_TEMPLATE_CONFIG
+readonly RENDER_DIR APP_INI RENDERED_HOOK
+readonly LITEFS_YML
 readonly LITEFS_MOUNT_DIR LITEFS_DATA_DIR REPO_ROOT
-readonly CONSUL_HTTP_ADDR STACK_DOMAIN
-readonly CONSUL_ENABLED LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
+readonly CONSUL_ADDR STACK_DOMAIN
+readonly LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
 
 readonly TOKEN_FILE="${FORGEJO_SECRETS_DIR}/litefs-token"
+readonly RUNTIME_TOKEN_FILE="${RENDER_DIR}/consul-token"
 readonly POLICY_NAME="forgejo-litefs"
 # The rules grant write access to the lease key, the peer keys, and the
 # sessions. The peer keys hold the advertise URLs that the hook reads.
@@ -66,6 +69,45 @@ read_initial_management() {
   fi
   { grep -E '^[[:space:]]*initial_management[[:space:]]*=' "$CONSUL_AGENT_HCL" || true; } |
     head -n1 | cut -d'"' -f2
+}
+
+# Resolve the Consul management token. Print the token on stdout.
+# Local Consul: read the initial_management key from agent.hcl.
+# Remote Consul: read the remote-token file.
+# Print an error on stderr and return 1 when the token is missing or invalid.
+# Never print the token value.
+resolve_management_token() {
+  token=""
+  token_source=""
+  if [ "$consul_mode" = "local" ]; then
+    token_source="$CONSUL_AGENT_HCL"
+    if ! token="$(read_initial_management)"; then
+      err "the Consul agent secrets are not readable at $CONSUL_AGENT_HCL."
+      err "Run the root setup first: bash setup.sh"
+      return 1
+    fi
+    if [ -z "$token" ]; then
+      err "the initial_management key is missing or empty in $CONSUL_AGENT_HCL."
+      return 1
+    fi
+  else
+    token_source="$CONSUL_REMOTE_TOKEN"
+    if [ ! -r "$CONSUL_REMOTE_TOKEN" ]; then
+      err "the remote Consul token is not readable at $CONSUL_REMOTE_TOKEN."
+      err "Run the root setup first: bash setup.sh"
+      return 1
+    fi
+    token="$(cat "$CONSUL_REMOTE_TOKEN")"
+    if [ -z "$token" ]; then
+      err "the remote Consul token at $CONSUL_REMOTE_TOKEN is empty."
+      return 1
+    fi
+  fi
+  if ! is_token_chars "$token"; then
+    err "the Consul token from $token_source has unexpected characters."
+    return 1
+  fi
+  printf '%s' "$token"
 }
 
 # Print the value of one string field from a flat JSON response.
@@ -119,22 +161,13 @@ is_valid_ipv4() {
 # sessions. The function prints the token on stdout.
 # Return 1 with a message on stderr when any step fails.
 create_litefs_token() {
-  mgmt_token="$(read_initial_management)" || {
-    err "consul secrets not found at $CONSUL_AGENT_HCL."
-    err "Run the consul wizard first: bash setup.sh consul"
-    err "Then start consul: docker compose up -d consul"
-    err "For a remote consul, create a token with write access to the key"
-    err "\"forgejo/litefs\", the prefix \"forgejo/peers/\", and the sessions"
-    err "\"litefs\" and \"forgejo-peers\". Place it at"
-    err "config/forgejo/secrets/litefs-token."
-    return 1
-  }
+  mgmt_token="$1"
   if [ -z "$mgmt_token" ]; then
-    err "the initial_management key is missing or empty in $CONSUL_AGENT_HCL."
+    err "the Consul management token is empty."
     return 1
   fi
   if ! is_token_chars "$mgmt_token"; then
-    err "the initial_management value in $CONSUL_AGENT_HCL has unexpected characters."
+    err "the Consul management token has unexpected characters."
     return 1
   fi
 
@@ -143,7 +176,7 @@ create_litefs_token() {
   # Reuse the policy when it exists. Create it when it does not.
   policy_code="$(curl -fsS -o "$resp_file" -w '%{http_code}' \
     -H "X-Consul-Token: $mgmt_token" \
-    "$CONSUL_HTTP_ADDR/v1/acl/policy/name/$POLICY_NAME" 2>/dev/null || true)"
+    "$CONSUL_ADDR/v1/acl/policy/name/$POLICY_NAME" 2>/dev/null || true)"
   if [ "$policy_code" = "404" ]; then
     policy_body="$(printf '{"Name":"%s","Description":"LiteFS lease for the forgejo cluster","Rules":"%s"}' \
       "$POLICY_NAME" "$POLICY_RULES_JSON")"
@@ -151,7 +184,7 @@ create_litefs_token() {
       -X PUT -H "X-Consul-Token: $mgmt_token" \
       -H "Content-Type: application/json" \
       -d "$policy_body" \
-      "$CONSUL_HTTP_ADDR/v1/acl/policy" 2>/dev/null || true)"
+      "$CONSUL_ADDR/v1/acl/policy" 2>/dev/null || true)"
     if [ "$policy_code" != "200" ] && [ "$policy_code" != "201" ]; then
       err "could not create the consul policy $POLICY_NAME (HTTP $policy_code)."
       return 1
@@ -179,7 +212,7 @@ create_litefs_token() {
     -X PUT -H "X-Consul-Token: $mgmt_token" \
     -H "Content-Type: application/json" \
     -d "$token_body" \
-    "$CONSUL_HTTP_ADDR/v1/acl/token" 2>/dev/null || true)"
+    "$CONSUL_ADDR/v1/acl/token" 2>/dev/null || true)"
   if [ "$token_code" != "200" ] && [ "$token_code" != "201" ]; then
     err "could not create the consul token for litefs (HTTP $token_code)."
     return 1
@@ -208,12 +241,24 @@ write_token_file() {
   chmod 0600 "$TOKEN_FILE"
 }
 
+# Write the runtime token file for consul-template. It is readable only by root.
+write_runtime_token_file() {
+  mkdir -p "$RENDER_DIR"
+  chmod 0700 "$RENDER_DIR" 2>/dev/null || true
+  (
+    umask 077
+    printf '%s' "$1" >"${RUNTIME_TOKEN_FILE}.tmp"
+  )
+  mv "${RUNTIME_TOKEN_FILE}.tmp" "$RUNTIME_TOKEN_FILE"
+  chmod 0600 "$RUNTIME_TOKEN_FILE"
+}
+
 # Check that consul accepts the token for the lease key.
 # An authorized token sees the key or an empty key space (404).
 check_litefs_token() {
   code="$(curl -s -o /dev/null -w '%{http_code}' \
     -H "X-Consul-Token: $1" \
-    "$CONSUL_HTTP_ADDR/v1/kv/forgejo/litefs" 2>/dev/null || true)"
+    "$CONSUL_ADDR/v1/kv/forgejo/litefs" 2>/dev/null || true)"
   case "$code" in
   200 | 404)
     return 0
@@ -234,7 +279,7 @@ register_peer() {
   peer_code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
     -H "X-Consul-Token: $1" \
     --data-binary "$peer_json" \
-    "$CONSUL_HTTP_ADDR/v1/kv/forgejo/peers/$peer_name" 2>/dev/null || true)"
+    "$CONSUL_ADDR/v1/kv/forgejo/peers/$peer_name" 2>/dev/null || true)"
   case "$peer_code" in
   200)
     log "registered the peer data at forgejo/peers/$peer_name"
@@ -258,7 +303,7 @@ fix_rendered_files() {
   fi
 }
 
-# Render both templates once. Retry while consul starts.
+# Render both templates once. Retry while Consul starts.
 render_once() {
   tries=0
   max_tries=30
@@ -266,37 +311,16 @@ render_once() {
     tries=$((tries + 1))
     if [ "$tries" -ge "$max_tries" ]; then
       err "consul-template did not render after $max_tries tries."
-      err "Check the consul address and the token file in $CONSUL_TEMPLATE_CONFIG."
+      err "Check CONSUL_ADDR and the Consul token."
       return 1
     fi
-    log "consul does not answer yet (try $tries/$max_tries). Wait 2 s."
+    log "Consul does not answer yet (try $tries/$max_tries). Wait 2 s."
     sleep 2
   done
   for rendered_file in "$APP_INI" "$RENDERED_HOOK"; do
     if [ ! -s "$rendered_file" ]; then
       err "consul-template did not write $rendered_file."
       return 1
-    fi
-  done
-  fix_rendered_files
-}
-
-# Render both templates with the local renderer. No Consul agent is required.
-render_local() {
-  if [ ! -r "$APP_INI_TPL" ]; then
-    err "app.ini template not readable at $APP_INI_TPL."
-    exit 1
-  fi
-  if [ ! -r "$POST_RECEIVE_TPL" ]; then
-    err "post-receive template not readable at $POST_RECEIVE_TPL."
-    exit 1
-  fi
-  sh "$RENDER_SCRIPT" "$APP_INI_TPL" "$APP_INI"
-  sh "$RENDER_SCRIPT" "$POST_RECEIVE_TPL" "$RENDERED_HOOK"
-  for rendered_file in "$APP_INI" "$RENDERED_HOOK"; do
-    if [ ! -s "$rendered_file" ]; then
-      err "the local renderer did not write $rendered_file."
-      exit 1
     fi
   done
   fix_rendered_files
@@ -389,92 +413,117 @@ esac
 # Boot sequence
 # ---------------------------------------------------------------------------
 
-# LiteFS needs both the Consul lease and the LiteFS wrapper. Without either
-# flag, run Forgejo directly on local SQLite with built-in authentication.
+# LITEFS_ENABLED selects the LiteFS wrapper and peer replication.
 use_litefs=0
-if [ "$CONSUL_ENABLED" = "1" ] && [ "$LITEFS_ENABLED" = "1" ]; then
+if [ "$LITEFS_ENABLED" = "1" ]; then
   use_litefs=1
 fi
 
-if [ "$use_litefs" -eq 0 ]; then
-  PUBLIC_IP="${PUBLIC_IP:-127.0.0.1}"
-  if ! is_valid_ipv4 "$PUBLIC_IP"; then
-    err "PUBLIC_IP '$PUBLIC_IP' is not a valid IPv4 address."
-    exit 1
-  fi
-  export PUBLIC_IP STACK_DOMAIN CONSUL_ENABLED LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
-  log "starting Forgejo in standalone mode with local SQLite"
-  log "LiteFS and Consul are disabled"
-  mkdir -p "$RENDER_DIR" \
-    "$LITEFS_MOUNT_DIR/gitea/conf" \
-    "$LITEFS_MOUNT_DIR/gitea/log" \
-    "$LITEFS_MOUNT_DIR/gitea/home" \
-    "$LITEFS_MOUNT_DIR/gitea/tmp" \
-    "$LITEFS_MOUNT_DIR/git" \
-    "$LITEFS_MOUNT_DIR/gitea/forgejo-repositories"
-  chmod 0777 "$LITEFS_MOUNT_DIR" "$LITEFS_MOUNT_DIR/gitea" 2>/dev/null || true
-  render_local
-  log "rendered app.ini at $APP_INI"
-  exec gosu "${EXEC_UID}:${EXEC_GID}" "$EXEC_BINARY" web --config "$APP_INI"
-fi
-
-if [ -z "$PUBLIC_IP" ]; then
-  err "PUBLIC_IP is not set. Set it in the root .env or export it before starting the container."
-  exit 1
-fi
+PUBLIC_IP="${PUBLIC_IP:-127.0.0.1}"
 if ! is_valid_ipv4 "$PUBLIC_IP"; then
   err "PUBLIC_IP '$PUBLIC_IP' is not a valid IPv4 address."
   exit 1
 fi
+case "$CONSUL_ADDR" in
+http://* | https://*) ;;
+*)
+  err "CONSUL_ADDR '$CONSUL_ADDR' is not a valid Consul address."
+  err "Use a value that starts with http:// or https://."
+  exit 1
+  ;;
+esac
 if [ ! -r "$CONSUL_TEMPLATE_CONFIG" ]; then
   err "consul-template configuration not readable at $CONSUL_TEMPLATE_CONFIG."
   err "Generate it first: bash setup.sh forgejo"
   exit 1
 fi
-if ! curl -fsS -o /dev/null "$CONSUL_HTTP_ADDR/v1/status/leader" 2>/dev/null; then
-  err "consul is not reachable at $CONSUL_HTTP_ADDR."
-  err "Start consul first: docker compose up -d consul"
+
+# Select the token source by the Consul address.
+# One trailing slash does not change the comparison with the local address.
+normalized_consul_addr="${CONSUL_ADDR%/}"
+if [ "$normalized_consul_addr" = "http://consul:8500" ]; then
+  consul_mode="local"
+  token_source_path="$CONSUL_AGENT_HCL"
+else
+  consul_mode="remote"
+  token_source_path="$CONSUL_REMOTE_TOKEN"
+fi
+
+if ! curl -fsS -o /dev/null "$CONSUL_ADDR/v1/status/leader" 2>/dev/null; then
+  err "Consul is not reachable at $CONSUL_ADDR."
+  if [ "$consul_mode" = "local" ]; then
+    err "Start Consul first: docker compose up -d consul"
+  else
+    err "Check CONSUL_ADDR and the remote Consul."
+  fi
   exit 1
 fi
+log "using Consul at $CONSUL_ADDR ($consul_mode)"
+log "Consul token source: $token_source_path"
 log "using the stack domain $STACK_DOMAIN"
 
-# Resolve the LiteFS token. Reuse a stored token when it is still valid.
-if [ -s "$TOKEN_FILE" ]; then
-  token="$(cat "$TOKEN_FILE")"
-  if ! is_token_chars "$token"; then
-    err "the stored litefs token at $TOKEN_FILE has unexpected characters."
-    err "Delete the file and restart the container to create a new token."
-    exit 1
-  fi
-  if check_litefs_token "$token"; then
-    log "reusing the litefs token from $TOKEN_FILE"
+export PUBLIC_IP STACK_DOMAIN LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
+
+mkdir -p "$RENDER_DIR" \
+  "$LITEFS_MOUNT_DIR/gitea/conf" \
+  "$LITEFS_MOUNT_DIR/gitea/log" \
+  "$LITEFS_MOUNT_DIR/gitea/home" \
+  "$LITEFS_MOUNT_DIR/gitea/tmp" \
+  "$LITEFS_MOUNT_DIR/git" \
+  "$LITEFS_MOUNT_DIR/gitea/forgejo-repositories"
+chmod 0777 "$LITEFS_MOUNT_DIR" "$LITEFS_MOUNT_DIR/gitea" 2>/dev/null || true
+
+# Read the management token from the source that matches CONSUL_ADDR.
+mgmt_token="$(resolve_management_token)" || exit 1
+
+if [ "$use_litefs" -eq 1 ]; then
+  # Resolve the LiteFS token. Reuse a stored token when it is still valid.
+  if [ -s "$TOKEN_FILE" ]; then
+    token="$(cat "$TOKEN_FILE")"
+    if ! is_token_chars "$token"; then
+      err "the stored LiteFS token at $TOKEN_FILE has unexpected characters."
+      err "Delete the file and restart the container to create a new token."
+      exit 1
+    fi
+    if check_litefs_token "$token"; then
+      log "reusing the LiteFS token from $TOKEN_FILE"
+    else
+      err "the stored LiteFS token at $TOKEN_FILE was rejected by Consul."
+      err "Delete the file and restart the container to create a new token."
+      exit 1
+    fi
   else
-    err "the stored litefs token at $TOKEN_FILE was rejected by consul."
-    err "Delete the file and restart the container to create a new token."
-    exit 1
+    log "creating the Consul policy and token for the LiteFS lease"
+    token="$(create_litefs_token "$mgmt_token")"
+    if [ -z "$token" ]; then
+      err "no LiteFS token was created."
+      exit 1
+    fi
+    if ! check_litefs_token "$token"; then
+      err "the new LiteFS token does not work. Check the Consul ACLs."
+      exit 1
+    fi
+    write_token_file "$token"
+    log "stored the LiteFS token at $TOKEN_FILE"
   fi
+  consul_token="$token"
+  mkdir -p "$LITEFS_DATA_DIR"
 else
-  log "creating the consul policy and token for the litefs lease"
-  token="$(create_litefs_token)"
-  if [ -z "$token" ]; then
-    err "no litefs token was created."
-    exit 1
-  fi
-  if ! check_litefs_token "$token"; then
-    err "the new litefs token does not work. Check the consul ACLs."
-    exit 1
-  fi
-  write_token_file "$token"
-  log "stored the litefs token at $TOKEN_FILE"
+  log "starting Forgejo in standalone mode with local SQLite"
+  log "LiteFS is disabled. No peer replication runs."
+  consul_token="$mgmt_token"
 fi
 
-mkdir -p "$LITEFS_DATA_DIR" "$LITEFS_MOUNT_DIR" "$RENDER_DIR"
+write_runtime_token_file "$consul_token"
+export CONSUL_HTTP_TOKEN_FILE="$RUNTIME_TOKEN_FILE"
+unset mgmt_token token consul_token
 
-# Generate the LiteFS configuration. Values come from the container
-# environment. The file must not contain secrets. The token travels through
-# the CONSUL_HTTP_TOKEN_FILE environment variable instead.
-umask 077
-cat >"$LITEFS_YML" <<EOF
+if [ "$use_litefs" -eq 1 ]; then
+  # Generate the LiteFS configuration. Values come from the container
+  # environment. The file must not contain secrets. The token travels through
+  # the CONSUL_HTTP_TOKEN_FILE environment variable instead.
+  umask 077
+  cat >"$LITEFS_YML" <<EOF
 # Generated by state/forgejo/entrypoint.sh at container start.
 # Do not edit. The file is recreated on every start.
 fuse:
@@ -493,21 +542,20 @@ lease:
   hostname: "forgejo"
   candidate: true
   consul:
-    url: "$CONSUL_HTTP_ADDR"
+    url: "$CONSUL_ADDR"
     key: "forgejo/litefs"
     ttl: "10s"
     lock-delay: "1s"
 tracing:
   enabled: false
 EOF
-chmod 0600 "$LITEFS_YML"
+  chmod 0600 "$LITEFS_YML"
 
-log "starting litefs on $LITEFS_MOUNT_DIR (advertise-url http://$PUBLIC_IP:20202)"
-log "litefs internal data lives at $LITEFS_DATA_DIR (back this up)"
-log "the database and the git repositories are created on the elected primary"
-
-# Publish this node's peer data for the rendered git hook.
-register_peer "$token"
+  # Publish this node's peer data for the rendered git hook.
+  token="$(cat "$RUNTIME_TOKEN_FILE")"
+  register_peer "$token"
+  unset token
+fi
 
 # Render app.ini and the post-receive hook before Forgejo starts.
 render_once
@@ -521,11 +569,42 @@ ct_pid=$!
 install_hooks_loop &
 hook_pid=$!
 
+if [ "$use_litefs" -eq 0 ]; then
+  # Run Forgejo directly on local SQLite.
+  log "starting Forgejo on $LITEFS_MOUNT_DIR"
+  gosu "${EXEC_UID}:${EXEC_GID}" "$EXEC_BINARY" web --config "$APP_INI" &
+  forgejo_pid=$!
+
+  # Forward signals to Forgejo. Exit with the status of Forgejo.
+  # shellcheck disable=SC2329
+  on_signal() {
+    kill -TERM "$forgejo_pid" 2>/dev/null || true
+    kill -TERM "$ct_pid" 2>/dev/null || true
+    kill -TERM "$hook_pid" 2>/dev/null || true
+    set +e
+    wait "$forgejo_pid"
+    final_status=$?
+    exit "$final_status"
+  }
+  trap on_signal TERM INT
+
+  status=0
+  wait "$forgejo_pid" || status=$?
+  kill -TERM "$ct_pid" 2>/dev/null || true
+  kill -TERM "$hook_pid" 2>/dev/null || true
+  log "Forgejo exited with code $status"
+  exit "$status"
+fi
+
+log "starting LiteFS on $LITEFS_MOUNT_DIR (advertise-url http://$PUBLIC_IP:20202)"
+log "LiteFS internal data lives at $LITEFS_DATA_DIR (back this up)"
+log "the database and the git repositories are created on the elected primary"
+
 # Start LiteFS. It runs the --exec branch under gosu on the mounted data.
-CONSUL_HTTP_TOKEN_FILE="$TOKEN_FILE" litefs mount -config "$LITEFS_YML" &
+litefs mount -config "$LITEFS_YML" &
 litefs_pid=$!
 
-# Forward signals to litefs. Exit with the status of litefs.
+# Forward signals to LiteFS. Exit with the status of LiteFS.
 # shellcheck disable=SC2329
 on_signal() {
   kill -TERM "$litefs_pid" 2>/dev/null || true
@@ -543,7 +622,7 @@ mount_found=0
 i=0
 while [ "$i" -lt 30 ]; do
   if ! kill -0 "$litefs_pid" 2>/dev/null; then
-    err "litefs exited before the mount appeared."
+    err "LiteFS exited before the mount appeared."
     exit 1
   fi
   if grep -E "[[:space:]]${LITEFS_MOUNT_DIR}[[:space:]]fuse" /proc/mounts >/dev/null 2>&1; then
@@ -555,17 +634,17 @@ while [ "$i" -lt 30 ]; do
 done
 
 if [ "$mount_found" -ne 1 ]; then
-  err "the litefs mount did not appear at $LITEFS_MOUNT_DIR after 30 seconds."
+  err "the LiteFS mount did not appear at $LITEFS_MOUNT_DIR after 30 seconds."
   kill -TERM "$litefs_pid" 2>/dev/null || true
   exit 1
 fi
 
-log "litefs mounted at $LITEFS_MOUNT_DIR"
-log "waiting for the litefs-managed Forgejo process to exit"
+log "LiteFS mounted at $LITEFS_MOUNT_DIR"
+log "waiting for the LiteFS-managed Forgejo process to exit"
 
 status=0
 wait "$litefs_pid" || status=$?
 kill -TERM "$ct_pid" 2>/dev/null || true
 kill -TERM "$hook_pid" 2>/dev/null || true
-log "litefs exited with code $status"
+log "LiteFS exited with code $status"
 exit "$status"

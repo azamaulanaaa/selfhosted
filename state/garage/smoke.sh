@@ -113,6 +113,23 @@ assert_line() {
   fi
 }
 
+# Check that a file holds one expected secret line.
+# This check does not print the pattern when it fails.
+assert_secret_line() {
+  local file="$1"
+  local pattern="$2"
+  local description="$3"
+  if [ ! -f "$file" ]; then
+    fail "$description" "the file does not exist: $file"
+    return 0
+  fi
+  if grep -Fq -- "$pattern" "$file"; then
+    pass "$description"
+  else
+    fail "$description" 'the expected secret line is absent'
+  fi
+}
+
 # Check that a file does not hold a line.
 assert_no_line() {
   local file="$1"
@@ -302,7 +319,7 @@ check_standalone_token() {
     return 0
   fi
   local runtime="$tree/run/garage.toml"
-  assert_line "$runtime" "token = \"$token\"" 'entrypoint injects the standalone token file'
+  assert_secret_line "$runtime" "token = \"$token\"" 'entrypoint injects the standalone token file'
   assert_no_line "$runtime" '# __CONSUL_TOKEN__' 'entrypoint replaces the marker with the standalone token'
 
   secret_values+=("$token")
@@ -352,7 +369,7 @@ check_integrated_mode() {
     return 0
   fi
   local runtime="$tree/run/garage.toml"
-  assert_line "$runtime" "token = \"$management\"" 'entrypoint injects initial_management in integrated mode'
+  assert_secret_line "$runtime" "token = \"$management\"" 'entrypoint injects initial_management in integrated mode'
   assert_no_line "$runtime" '# __CONSUL_TOKEN__' 'entrypoint replaces the marker in integrated mode'
 
   secret_values+=("$management")

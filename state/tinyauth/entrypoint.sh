@@ -1,9 +1,10 @@
 #!/bin/sh
 # Boot the Tinyauth server.
+# Consul is always present. CONSUL_ADDR selects the Consul location.
 # In integrated mode, LiteFS wraps the app and replicates the SQLite database.
 # Integrated mode needs a Consul lease and a FUSE mount.
 # In standalone mode, the app runs directly on a local SQLite database.
-# Standalone mode needs no peer, no consul, no FUSE, and no LiteFS.
+# Standalone mode needs no peer, no FUSE, and no LiteFS. Consul is still required.
 # The script never prints secret values. It prints paths only.
 set -eu
 
@@ -11,7 +12,6 @@ set -eu
 # The tests override them with a scratch tree.
 TINYAUTH_SECRETS_DIR="${TINYAUTH_SECRETS_DIR:-/etc/tinyauth/secrets}"
 CONSUL_SECRETS_DIR="${CONSUL_SECRETS_DIR:-/etc/tinyauth/consul-secrets}"
-CONSUL_AGENT_HCL_FILE="${CONSUL_SECRETS_DIR}/agent.hcl"
 LITEFS_YML="${LITEFS_YML:-/run/litefs.yml}"
 LITEFS_MOUNT_DIR="${LITEFS_MOUNT_DIR:-/data}"
 LITEFS_DATA_DIR="${LITEFS_DATA_DIR:-/var/lib/litefs}"
@@ -20,23 +20,35 @@ TINYAUTH_RENDER_ONLY="${TINYAUTH_RENDER_ONLY:-0}"
 
 # Environment that the operator sets.
 PUBLIC_IP="${PUBLIC_IP:-}"
-CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-http://consul:8500}"
+CONSUL_ADDR="${CONSUL_ADDR:-http://consul:8500}"
 STACK_DOMAIN="${STACK_DOMAIN:-sh.lan}"
 
 # Capability flags. A value of 1 enables the matching feature.
-CONSUL_ENABLED="${CONSUL_ENABLED:-0}"
 LITEFS_ENABLED="${LITEFS_ENABLED:-0}"
 OIDC_ENABLED="${OIDC_ENABLED:-0}"
 TLS_ENABLED="${TLS_ENABLED:-0}"
 
-readonly TINYAUTH_SECRETS_DIR CONSUL_SECRETS_DIR CONSUL_AGENT_HCL_FILE LITEFS_YML
-readonly LITEFS_MOUNT_DIR LITEFS_DATA_DIR STANDALONE_RENDER_FILE TINYAUTH_RENDER_ONLY
-readonly PUBLIC_IP CONSUL_HTTP_ADDR STACK_DOMAIN
-readonly CONSUL_ENABLED LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
+# Select the Consul token file by the Consul location.
+# Local Consul writes the initial_management key to agent.hcl.
+# Remote Consul writes the token to remote-token.
+# One trailing slash does not change the comparison with the local address.
+readonly CONSUL_LOCAL_ADDR="http://consul:8500"
+consul_local=0
+CONSUL_TOKEN_FILE="${CONSUL_SECRETS_DIR}/remote-token"
+if [ "${CONSUL_ADDR%/}" = "$CONSUL_LOCAL_ADDR" ]; then
+  consul_local=1
+  CONSUL_TOKEN_FILE="${CONSUL_SECRETS_DIR}/agent.hcl"
+fi
 
-# Integrated mode needs both the consul and the LiteFS capability.
+readonly TINYAUTH_SECRETS_DIR CONSUL_SECRETS_DIR LITEFS_YML
+readonly LITEFS_MOUNT_DIR LITEFS_DATA_DIR STANDALONE_RENDER_FILE TINYAUTH_RENDER_ONLY
+readonly PUBLIC_IP CONSUL_ADDR STACK_DOMAIN
+readonly LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
+readonly consul_local CONSUL_TOKEN_FILE
+
+# Integrated mode needs LiteFS. Consul is always present.
 integrated=0
-if [ "$CONSUL_ENABLED" = "1" ] && [ "$LITEFS_ENABLED" = "1" ]; then
+if [ "$LITEFS_ENABLED" = "1" ]; then
   integrated=1
 fi
 readonly integrated
@@ -70,13 +82,18 @@ fi
 export TINYAUTH_APPURL TINYAUTH_DATABASE_PATH
 export TINYAUTH_OIDC_PRIVATEKEYPATH TINYAUTH_OIDC_PUBLICKEYPATH
 
-# Read the consul management token from the shared secret at container start.
-# The token is initial_management in the consul agent configuration.
-# Print the token on stdout. Return 1 when the file or the key is missing.
-read_consul_management() {
-  [ -r "$CONSUL_AGENT_HCL_FILE" ] || return 1
-  { grep -E '^[[:space:]]*initial_management[[:space:]]*=' "$CONSUL_AGENT_HCL_FILE" || true; } |
-    head -n1 | cut -d'"' -f2
+# Read the Consul ACL token from the selected token file at container start.
+# Local Consul: the initial_management key in agent.hcl.
+# Remote Consul: the raw value in remote-token.
+# Print the token on stdout. Return 1 when the file is missing.
+read_consul_token() {
+  [ -r "$CONSUL_TOKEN_FILE" ] || return 1
+  if [ "$consul_local" = "1" ]; then
+    { grep -E '^[[:space:]]*initial_management[[:space:]]*=' "$CONSUL_TOKEN_FILE" || true; } |
+      head -n1 | cut -d'"' -f2
+    return 0
+  fi
+  tr -d '\r\n' <"$CONSUL_TOKEN_FILE"
 }
 
 # Print the value of one string field from a flat JSON response.
@@ -104,18 +121,18 @@ is_token_chars() {
 # The function prints the token on stdout.
 # Return 1 with a message on stderr when any step fails.
 create_litefs_token() {
-  mgmt_token="$(read_consul_management)" || {
-    err "the consul management token is missing at $CONSUL_AGENT_HCL_FILE."
-    err "Run the consul wizard to create the file."
+  mgmt_token="$(read_consul_token)" || {
+    err "the Consul token is missing at $CONSUL_TOKEN_FILE."
+    err "Run the root setup.sh to write the Consul secret."
     err "You may write a prepared litefs token to ${TINYAUTH_SECRETS_DIR}/litefs-token."
     return 1
   }
   if [ -z "$mgmt_token" ]; then
-    err "the consul management token at $CONSUL_AGENT_HCL_FILE is empty."
+    err "the Consul token at $CONSUL_TOKEN_FILE is empty."
     return 1
   fi
   if ! is_token_chars "$mgmt_token"; then
-    err "the consul management token at $CONSUL_AGENT_HCL_FILE has unexpected characters."
+    err "the Consul token at $CONSUL_TOKEN_FILE has unexpected characters."
     return 1
   fi
 
@@ -124,7 +141,7 @@ create_litefs_token() {
   # Reuse the policy when it exists. Create it when it does not.
   policy_code="$(curl -fsS -o "$resp_file" -w '%{http_code}' \
     -H "X-Consul-Token: $mgmt_token" \
-    "$CONSUL_HTTP_ADDR/v1/acl/policy/name/$POLICY_NAME" 2>/dev/null || true)"
+    "$CONSUL_ADDR/v1/acl/policy/name/$POLICY_NAME" 2>/dev/null || true)"
   if [ "$policy_code" = "404" ]; then
     policy_body="$(printf '{"Name":"%s","Description":"LiteFS lease for the tinyauth cluster","Rules":"%s"}' \
       "$POLICY_NAME" "$POLICY_RULES_JSON")"
@@ -132,7 +149,7 @@ create_litefs_token() {
       -X PUT -H "X-Consul-Token: $mgmt_token" \
       -H "Content-Type: application/json" \
       -d "$policy_body" \
-      "$CONSUL_HTTP_ADDR/v1/acl/policy" 2>/dev/null || true)"
+      "$CONSUL_ADDR/v1/acl/policy" 2>/dev/null || true)"
     if [ "$policy_code" != "200" ] && [ "$policy_code" != "201" ]; then
       err "could not create the consul policy $POLICY_NAME (HTTP $policy_code)."
       return 1
@@ -160,7 +177,7 @@ create_litefs_token() {
     -X PUT -H "X-Consul-Token: $mgmt_token" \
     -H "Content-Type: application/json" \
     -d "$token_body" \
-    "$CONSUL_HTTP_ADDR/v1/acl/token" 2>/dev/null || true)"
+    "$CONSUL_ADDR/v1/acl/token" 2>/dev/null || true)"
   if [ "$token_code" != "200" ] && [ "$token_code" != "201" ]; then
     err "could not create the consul token for litefs (HTTP $token_code)."
     return 1
@@ -195,7 +212,7 @@ write_token_file() {
 check_litefs_token() {
   code="$(curl -s -o /dev/null -w '%{http_code}' \
     -H "X-Consul-Token: $1" \
-    "$CONSUL_HTTP_ADDR/v1/kv/tinyauth/litefs" 2>/dev/null || true)"
+    "$CONSUL_ADDR/v1/kv/tinyauth/litefs" 2>/dev/null || true)"
   case "$code" in
   200 | 404)
     return 0
@@ -233,7 +250,7 @@ lease:
   hostname: "tinyauth"
   candidate: true
   consul:
-    url: "$CONSUL_HTTP_ADDR"
+    url: "$CONSUL_ADDR"
     key: "tinyauth/litefs"
     ttl: "10s"
     lock-delay: "1s"
@@ -242,6 +259,7 @@ tracing:
 EOF
   chmod 0600 "$LITEFS_YML"
   log "rendered the litefs config at $LITEFS_YML"
+  log "consul token file: $CONSUL_TOKEN_FILE"
 }
 
 # Render the standalone app configuration. Tinyauth reads its settings from
@@ -257,7 +275,7 @@ TINYAUTH_APPURL=$TINYAUTH_APPURL
 TINYAUTH_DATABASE_PATH=$TINYAUTH_DATABASE_PATH
 TINYAUTH_OIDC_PRIVATEKEYPATH=$TINYAUTH_OIDC_PRIVATEKEYPATH
 TINYAUTH_OIDC_PUBLICKEYPATH=$TINYAUTH_OIDC_PUBLICKEYPATH
-CONSUL_ENABLED=$CONSUL_ENABLED
+CONSUL_ADDR=$CONSUL_ADDR
 LITEFS_ENABLED=$LITEFS_ENABLED
 OIDC_ENABLED=$OIDC_ENABLED
 TLS_ENABLED=$TLS_ENABLED
@@ -268,9 +286,9 @@ EOF
 
 # Start LiteFS and wait for its FUSE mount. LiteFS starts the app.
 start_integrated() {
-  if ! curl -fsS -o /dev/null "$CONSUL_HTTP_ADDR/v1/status/leader" 2>/dev/null; then
-    err "consul is not reachable at $CONSUL_HTTP_ADDR."
-    err "Start consul first: docker compose up -d consul"
+  if ! curl -fsS -o /dev/null "$CONSUL_ADDR/v1/status/leader" 2>/dev/null; then
+    err "consul is not reachable at $CONSUL_ADDR."
+    err "Start Consul at that address first."
     exit 1
   fi
 
@@ -349,7 +367,7 @@ start_integrated() {
 # Start the app directly on local SQLite. No peer process is required.
 start_standalone() {
   log "starting tinyauth on local SQLite at $TINYAUTH_DATABASE_PATH"
-  log "standalone mode needs no peer, consul, FUSE, or litefs."
+  log "standalone mode needs no LiteFS peer and no FUSE. Consul is still required."
 
   gosu "${EXEC_UID}:${EXEC_GID}" "${EXEC_BINARY}" &
   app_pid=$!

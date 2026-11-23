@@ -10,14 +10,19 @@
 #                                              Ask for confirmation unless --yes is given.
 #
 # Capability flags come from the root .env file. Each flag defaults to 0.
-# Integrated mode needs CONSUL_ENABLED=1 and LITEFS_ENABLED=1.
-# Standalone mode needs no flag at 1 and no peer.
-# The Consul management token stays in config/consul/secrets/agent.hcl. The
-# entrypoint reads it at container start. The wizard never copies the token.
+# LITEFS_ENABLED=1 enables LiteFS, a FUSE mount, and a Consul lease.
+# Consul is always present. This wizard never asks about Consul. The summary
+# reports the Consul location and the LiteFS state.
+# The container reads the Consul token at start. Local Consul uses the
+# initial_management key in config/consul/secrets/agent.hcl. Remote Consul uses
+# config/consul/secrets/remote-token. The wizard never copies the token.
 # The LDAP password is in config/ldap/secrets/user-pass. The wizard reads it
 # to create the observer. The entrypoint reads it at container start.
 #
 # Non-interactive environment variables:
+#   CONSUL_ADDR             Consul address. Read from the environment, then the root
+#                           .env, then http://consul:8500. The value http://consul:8500
+#                           selects local Consul. Any other value selects remote Consul.
 #   STACK_DOMAIN            Stack domain. The issuer becomes https://tinyauth.<domain>.
 #                           Read from the environment, then the root .env, then sh.lan.
 #   TINYAUTH_LDAP_LOCAL     yes to use the LLDAP service in this repo. Default: yes.
@@ -49,6 +54,9 @@ readonly OIDC_SECRETS_DIR="config/tinyauth/secrets/oidc"
 readonly ENV_FILE="config/tinyauth/tinyauth.env"
 readonly LDAP_SECRET_FILE="config/tinyauth/secrets/ldap-observer"
 readonly LDAP_PASSWORD_FILE="config/ldap/secrets/user-pass"
+
+readonly DEFAULT_CONSUL_ADDR="http://consul:8500"
+readonly CONSUL_SECRETS_DIR="config/consul/secrets"
 
 readonly DEFAULT_LDAP_ADDRESS="ldap://lldap:3890"
 readonly DEFAULT_STACK_DOMAIN="sh.lan"
@@ -123,11 +131,72 @@ resolve_stack_domain() {
   stack_domain_source="default"
 }
 
-# Resolve the four capability flags from the environment and the root .env.
+# Print the CONSUL_ADDR value from the root .env file.
+# Print nothing when the file or the line is missing.
+read_env_consul_addr() {
+  if [ ! -f .env ]; then
+    return 0
+  fi
+  { grep -E '^CONSUL_ADDR=' .env || true; } | tail -n1 | cut -d= -f2- |
+    sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\\1/" -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
+}
+
+# Return 0 when the argument is a valid Consul address.
+# A valid address starts with http:// or https://, has a host, and has no whitespace.
+is_valid_consul_addr() {
+  local addr="$1"
+  if [ -z "$addr" ] || [[ "$addr" =~ [[:space:]] ]]; then
+    return 1
+  fi
+  if [[ ! "$addr" =~ ^https?:// ]]; then
+    return 1
+  fi
+  local rest="${addr#*://}"
+  local host="${rest%%[/?#]*}"
+  if [ -z "$host" ] || [[ "$host" == :* ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# Print an STE error for an invalid Consul address and exit 1.
+consul_addr_invalid() {
+  echo "error: '$1' is not a valid Consul address. Use http:// or https://, a host, and no whitespace." >&2
+  echo "error: Fix CONSUL_ADDR in the environment or in the root .env." >&2
+  exit 1
+}
+
+# Resolve CONSUL_ADDR and set consul_addr, consul_mode, and consul_token_file.
+# The order is: the process environment, then the root .env, then the local default.
+# The value http://consul:8500 selects local Consul. Any other value selects remote Consul.
+# One trailing slash does not change the local comparison.
+# A service wizard does not ask about Consul.
+resolve_consul_addr() {
+  if [ -n "${CONSUL_ADDR:-}" ]; then
+    consul_addr="$CONSUL_ADDR"
+  else
+    consul_addr="$(read_env_consul_addr)"
+  fi
+  if [ -z "$consul_addr" ]; then
+    consul_addr="$DEFAULT_CONSUL_ADDR"
+  fi
+  if ! is_valid_consul_addr "$consul_addr"; then
+    consul_addr_invalid "$consul_addr"
+  fi
+  if [ "${consul_addr%/}" = "$DEFAULT_CONSUL_ADDR" ]; then
+    consul_mode="local"
+    consul_token_file="$CONSUL_SECRETS_DIR/agent.hcl"
+  else
+    consul_mode="remote"
+    consul_token_file="$CONSUL_SECRETS_DIR/remote-token"
+  fi
+}
+
+# Resolve the three capability flags from the environment and the root .env.
 # An environment value wins. A missing key defaults to 0.
 resolve_capability_flags() {
   local flag
-  for flag in CONSUL_ENABLED LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED; do
+  for flag in LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED; do
     local value="${!flag:-}"
     if [ -z "$value" ] && [ -f .env ]; then
       value="$(read_env_value "$flag" .env)"
@@ -137,7 +206,7 @@ resolve_capability_flags() {
     *) printf -v "$flag" '%s' 0 ;;
     esac
   done
-  readonly CONSUL_ENABLED LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
+  readonly LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
 }
 
 # Print an STE error for an invalid stack domain and exit 1.
@@ -436,18 +505,27 @@ if ! command -v openssl >/dev/null 2>&1; then
   exit 1
 fi
 
-# Step 2: resolve and validate the stack domain and the capability flags.
+# Step 2: resolve and validate the stack domain, the capability flags, and the
+# Consul location. Consul is always present.
 resolve_stack_domain
 if ! is_valid_stack_domain "$stack_domain"; then
   stack_domain_invalid
 fi
 resolve_capability_flags
-if [ "$CONSUL_ENABLED" = "1" ] && [ "$LITEFS_ENABLED" = "1" ]; then
+resolve_consul_addr
+readonly consul_addr consul_mode consul_token_file
+if [ "$LITEFS_ENABLED" = "1" ]; then
   integrated=1
 else
   integrated=0
 fi
 readonly integrated
+# The summary reports the LiteFS state.
+litefs_state="off"
+if [ "$integrated" -eq 1 ]; then
+  litefs_state="on"
+fi
+readonly litefs_state
 
 # A standalone instance without OIDC uses a local issuer.
 if [ "$OIDC_ENABLED" = "1" ]; then
@@ -586,9 +664,14 @@ fi
 chmod 0600 "$private_key" "$public_key"
 chown 1000:1000 "$private_key" "$public_key" 2>/dev/null || true
 
-# The Consul management token stays in the shared consul secrets tree.
-# The entrypoint reads initial_management at container start.
-# This wizard never copies the token into the tinyauth secrets tree.
+# The Consul token stays in the shared consul secrets tree. The wizard never
+# copies the token into the tinyauth secrets tree. The entrypoint reads the
+# token at container start. Local Consul uses agent.hcl, key initial_management.
+# Remote Consul uses remote-token.
+if [ ! -r "$consul_token_file" ]; then
+  echo "warning: the Consul token file is missing at $consul_token_file." >&2
+  echo "hint: run the root setup.sh to write the Consul secret." >&2
+fi
 
 observer_dn=""
 observer_password=""
@@ -602,7 +685,7 @@ else
   observer_dn="uid=${OBSERVER_USER},ou=people,${base_dn}"
   observer_password="$(openssl rand -hex 24)"
 
-  if [ "$integrated" -eq 1 ]; then
+  if [ "$local_ldap" -eq 1 ]; then
     admin_pass="$(read_ldap_admin_password)"
     if [ -z "$admin_pass" ] && [ "$observer_auto" -eq 1 ]; then
       echo "warning: the LDAP password at $LDAP_PASSWORD_FILE is missing." >&2
@@ -655,7 +738,7 @@ else
       fi
     fi
   else
-    echo "Standalone mode. Skipped the observer creation in LLDAP."
+    echo "External LDAP. Skipped the observer creation in LLDAP."
     echo "hint: register $OBSERVER_USER in your LDAP server when you enable LDAP."
   fi
   write_secret_file "$LDAP_SECRET_FILE" "$observer_password"
@@ -840,17 +923,20 @@ echo "Issuer: $ISSUER"
 echo "Discovery URL: $DISCOVERY_URL"
 echo "OIDC enabled: $OIDC_ENABLED"
 echo "TLS enabled: $TLS_ENABLED"
+echo "Consul: $consul_mode"
+echo "Consul address: $consul_addr"
+echo "Consul token file: $consul_token_file"
+echo "LiteFS: $litefs_state"
 echo "LDAP address: $ldap_address"
 echo "Base DN: $base_dn"
 if [ "$integrated" -eq 1 ]; then
-  echo "Mode: integrated. LiteFS and consul are enabled."
   echo "hint: LiteFS elects a primary through a consul lease (key tinyauth/litefs)."
   echo "hint: only the litefs primary can write the database."
   echo "hint: LiteFS replicates only the SQLite database."
   echo "hint: copy the same OIDC key files to every node before you start a second node."
 else
-  echo "Mode: standalone. No peer, consul, or LiteFS is required."
-  echo "hint: the app writes to a local SQLite database."
+  echo "hint: the app uses local SQLite and needs no LiteFS peer."
+  echo "hint: Consul is still required. The app does not use Consul without LiteFS."
 fi
 echo "hint: the OIDC key files live in the backed-up secrets tree at $OIDC_SECRETS_DIR (mounted at /etc/tinyauth/secrets/oidc)."
 echo "Next step: docker compose up -d tinyauth"

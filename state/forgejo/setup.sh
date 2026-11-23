@@ -35,6 +35,10 @@
 #                             LITEFS_ENABLED=1. Default 3000.
 #   FORGEJO_ROTATE_SECRETS    1 to replace the OIDC client secret and the Forgejo
 #                             secret key. Default 0.
+#   TLS_ENABLED               1 uses https://forgejo.<STACK_DOMAIN>/ as ROOT_URL.
+#                             0 uses http://<PUBLIC_IP>:3000/ as ROOT_URL.
+#                             For Caddy with the internal CA and the domain URL,
+#                             set TLS_ENABLED=1 and CADDY_TLS_MODE=internal.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"

@@ -282,8 +282,15 @@ See the [smolvm documentation](docs/smolvm.md) for the full list.
 - `mise.toml` contains the tool version constraints.
 - `LICENSE` contains the license text.
 
+## Services
+
+- `garage` is an S3-compatible object store. It uses Consul service
+  discovery in both modes. See the [Garage document](docs/garage.md).
+
 ## Documentation
 
+- The [Garage document](docs/garage.md) describes the object store modes,
+  ports, data directories, and the one-time layout assignment.
 - The [check pipeline](docs/ci.md) describes how the checks run and how
   to add a check.
 - The [release workflow](docs/release.md) describes the commit format

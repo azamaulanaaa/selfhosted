@@ -1,56 +1,65 @@
 # Garage
 
 Garage is an S3-compatible object store. This stack runs the official
-`dxflrs/garage` image. Garage always uses Consul service discovery. The
-wizard writes the `[consul_discovery]` section on every run.
+`dxflrs/garage` image. Garage always uses Consul service discovery.
+Garage has no Consul-free mode. The wizard writes the
+`[consul_discovery]` section on every run.
 
-The service has two modes. The `CONSUL_ENABLED` flag in the root `.env`
-file selects the mode.
+The root setup resolves Consul. The Garage wizard never asks for a Consul
+address and never asks for a Consul token. The root setup reads
+`CONSUL_ADDR` from the process environment, then from the root `.env`
+file. It writes the value to the root `.env` file before it runs the
+service wizards.
 
-## Standalone mode
+## Modes
 
-Set `CONSUL_ENABLED=0` in the root `.env` file. Run the wizard:
+`CONSUL_ADDR` selects the mode. No flag selects the mode. Run
+`bash setup.sh` once to resolve Consul and to run this wizard.
 
-```bash
-bash setup.sh garage
-```
+- `standalone` means remote Consul plus one service container.
+- `integrated` means local Consul in this stack.
 
-The wizard asks for the Consul HTTP address. The interactive default is
-`http://127.0.0.1:8500`. A non-interactive run must set
-`CONSUL_HTTP_ADDR`.
+Remove one trailing slash from `CONSUL_ADDR` before the comparison with
+`http://consul:8500`.
 
-The wizard validates the address. The value must start with `http://` or
-`https://` and must have a host. For example:
+### Standalone mode
 
-```bash
-CONSUL_HTTP_ADDR=http://192.0.2.10:8500 bash setup.sh garage
-```
-
-The wizard also asks for an optional Consul token. The prompt hides the
-value. A non-interactive run uses `CONSUL_HTTP_TOKEN`. The wizard writes a
-provided token to `config/garage/secrets/consul_token` with mode 600. It
-does not create the file when no token is given. The entrypoint never
-prints the token.
-
-## Integrated mode
-
-Set `CONSUL_ENABLED=1` in the root `.env` file. Run the wizard:
+Standalone mode uses remote Consul. Set `CONSUL_ADDR` to the remote
+address. For example:
 
 ```bash
-bash setup.sh garage
+CONSUL_ADDR=https://consul.example.test:8501 bash setup.sh
 ```
 
-The wizard uses `http://consul:8500`. It does not ask for an address. It
-does not ask for a token. It does not copy the Consul management token.
+The address must start with `http://` or `https://` and must have a host.
+The root setup writes the remote ACL token to
+`config/consul/secrets/remote-token` with mode 600. It never writes the
+token to the `.env` file.
 
-At container start the entrypoint reads `initial_management` from
-`config/consul/secrets/agent.hcl`. It renders the token into
-`/run/garage/garage.toml`. The mount is read-only. The token stays out of
-the Garage secret tree.
+### Integrated mode
 
-A `config/garage/secrets/consul_token` file wins over the management
-token in both modes. Remove that file when you move a node from standalone
-mode to integrated mode.
+Integrated mode uses local Consul. Set `CONSUL_ADDR` to
+`http://consul:8500`, or accept the default:
+
+```bash
+CONSUL_ADDR=http://consul:8500 bash setup.sh
+```
+
+The root setup enables the local `consul` service. The wizard does not
+copy the Consul management token.
+
+## Consul token
+
+At container start the entrypoint selects one token file. It compares
+`CONSUL_ADDR` to `http://consul:8500`.
+
+- Local Consul: the entrypoint reads `initial_management` from
+  `config/consul/secrets/agent.hcl`.
+- Remote Consul: the entrypoint reads `config/consul/secrets/remote-token`.
+
+The compose fragment mounts the whole `config/consul/secrets/` directory
+read-only at `/etc/garage/consul-secrets`. The entrypoint renders the
+token into `/run/garage/garage.toml`. It never prints the token.
 
 ## Ports
 
@@ -71,11 +80,9 @@ holds no secrets. The secret files are in `config/garage/secrets/`:
 - `rpc_secret`: 32 random bytes as hex.
 - `admin_token`: a random base64 token.
 - `metrics_token`: a random base64 token.
-- `consul_token`: optional. Standalone mode only.
 
 The wizard keeps existing secrets on a second run. Set
 `GARAGE_ROTATE_SECRETS=1` to create new RPC, admin, and metrics secrets.
-The wizard does not rotate the Consul token.
 
 The container stores metadata in `data/garage/meta` and object data in
 `data/garage/data`. Back up both directories. Back up the secrets
@@ -85,14 +92,27 @@ The S3 endpoint is `http://<PUBLIC_IP>:3900`. The S3 region is `garage`.
 The replication factor is 1 by default. Set `GARAGE_REPLICATION_FACTOR` to
 change it.
 
-## One-time layout assignment
+## Garage CLI
 
-Garage needs a cluster layout before it can store objects. Start the
-service first. Then assign a role to the node. Read the node ID from the
-status output:
+The wizard does not manage the cluster layout, the buckets, or the access
+keys. The operator uses the Garage CLI for these steps. Garage global
+flags come before the subcommand. The order `/garage -c <file> status` is
+correct. The order `/garage status -c <file>` does not work.
+
+Start the service first.
+
+### Layout
+
+Garage needs a cluster layout before it can store objects. Read the node
+ID from the status output:
 
 ```bash
 docker compose exec garage /garage -c /run/garage/garage.toml status
+```
+
+Assign a role to the node, then apply the layout:
+
+```bash
 docker compose exec garage /garage -c /run/garage/garage.toml \
   layout assign -z dc1 -c 1G <node-id>
 docker compose exec garage /garage -c /run/garage/garage.toml \
@@ -103,9 +123,26 @@ Use a capacity that matches the disk. The `-z dc1` value sets the zone.
 The `layout apply` command fails when another layout version exists. In
 that case, increment `--version`.
 
-Garage global flags come before the subcommand. The order
-`/garage -c <file> status` is correct. The order
-`/garage status -c <file>` does not work.
+### Buckets and access keys
+
+Create a bucket:
+
+```bash
+docker compose exec garage /garage -c /run/garage/garage.toml \
+  bucket create <bucket>
+```
+
+Create an access key and allow it on the bucket:
+
+```bash
+docker compose exec garage /garage -c /run/garage/garage.toml \
+  key create <key-name>
+docker compose exec garage /garage -c /run/garage/garage.toml \
+  bucket allow --read --write <bucket> --key <key-name>
+```
+
+The `key create` command prints the secret key. Store the secret in a safe
+place. It is not in the wizard files.
 
 ## Health check
 

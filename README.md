@@ -284,13 +284,13 @@ See the [smolvm documentation](docs/smolvm.md) for the full list.
 
 ## Services
 
-- `garage` is an S3-compatible object store. It uses Consul service
-  discovery in both modes. See the [Garage document](docs/garage.md).
+- `garage` is an S3-compatible object store. It always uses Consul
+  service discovery. See the [Garage document](docs/garage.md).
 
 ## Documentation
 
 - The [Garage document](docs/garage.md) describes the object store modes,
-  ports, data directories, and the one-time layout assignment.
+  ports, data directories, and the Garage CLI steps.
 - The [check pipeline](docs/ci.md) describes how the checks run and how
   to add a check.
 - The [release workflow](docs/release.md) describes the commit format

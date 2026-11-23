@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Check the tinyauth wizard and the entrypoint in both configuration modes.
+# Consul is always present. CONSUL_ADDR selects the Consul location.
 # The checks use a scratch tree. They need no Docker and no peer.
 set -euo pipefail
 
@@ -46,16 +47,28 @@ can_chown_to_app_uid() {
   return 1
 }
 
-# Build the scratch tree with copies of the two service scripts.
+# Build the scratch tree with copies of the two service scripts and a scratch
+# Consul secrets tree. The token values are test values. The checks never print
+# them.
 setup_tree() {
-  mkdir -p "$scratch/state/tinyauth"
+  mkdir -p "$scratch/state/tinyauth" "$scratch/config/consul/secrets"
   cp "$REPO_ROOT/state/tinyauth/setup.sh" "$scratch/state/tinyauth/setup.sh"
   cp "$REPO_ROOT/state/tinyauth/entrypoint.sh" "$scratch/state/tinyauth/entrypoint.sh"
+  cat >"$scratch/config/consul/secrets/agent.hcl" <<'EOF'
+acl {
+  tokens {
+    initial_management = "local-test-token"
+  }
+}
+EOF
+  printf 'remote-test-token\n' >"$scratch/config/consul/secrets/remote-token"
+  chmod 0600 "$scratch/config/consul/secrets/agent.hcl" "$scratch/config/consul/secrets/remote-token"
 }
 
-# Run the wizard with the given capability flags. Write the root .env first.
+# Run the wizard with the given Consul address and capability flags.
+# Write the root .env first.
 run_wizard() {
-  local consul="$1" litefs="$2" oidc="$3" tls="$4"
+  local consul_addr="$1" litefs="$2" oidc="$3" tls="$4"
   local observer_pass
   observer_pass="$(openssl rand -hex 8)"
   (
@@ -63,12 +76,13 @@ run_wizard() {
     {
       printf 'STACK_DOMAIN=sh.lan\n'
       printf 'PUBLIC_IP=127.0.0.1\n'
-      printf 'CONSUL_ENABLED=%s\n' "$consul"
+      printf 'CONSUL_ADDR=%s\n' "$consul_addr"
       printf 'LITEFS_ENABLED=%s\n' "$litefs"
       printf 'OIDC_ENABLED=%s\n' "$oidc"
       printf 'TLS_ENABLED=%s\n' "$tls"
     } >.env
-    TINYAUTH_LDAP_LOCAL=yes \
+    CONSUL_ADDR="$consul_addr" \
+      TINYAUTH_LDAP_LOCAL=yes \
       TINYAUTH_LDAP_BASEDN='dc=sh,dc=lan' \
       TINYAUTH_CLIENTS='demo:https://demo.sh.lan/callback' \
       TINYAUTH_OBSERVER_AUTO=no \
@@ -77,20 +91,21 @@ run_wizard() {
   ) >"$scratch/wizard.log" 2>&1
 }
 
-# Render the entrypoint config with the given flags. No process starts.
+# Render the entrypoint config with the given Consul address and flags.
+# No process starts.
 render_entrypoint() {
-  local consul="$1" litefs="$2" oidc="$3" tls="$4"
+  local consul_addr="$1" litefs="$2" oidc="$3" tls="$4"
   mkdir -p "$scratch/run" "$scratch/data/mount" "$scratch/data/store"
   (
     cd "$scratch"
     TINYAUTH_SECRETS_DIR="$scratch/secrets" \
-      CONSUL_SECRETS_DIR="$scratch/consul-secrets" \
+      CONSUL_SECRETS_DIR="$scratch/config/consul/secrets" \
       LITEFS_YML="$scratch/run/litefs.yml" \
       LITEFS_MOUNT_DIR="$scratch/data/mount" \
       LITEFS_DATA_DIR="$scratch/data/store" \
       STANDALONE_RENDER_FILE="$scratch/run/standalone.env" \
       TINYAUTH_RENDER_ONLY=1 \
-      CONSUL_ENABLED="$consul" \
+      CONSUL_ADDR="$consul_addr" \
       LITEFS_ENABLED="$litefs" \
       OIDC_ENABLED="$oidc" \
       TLS_ENABLED="$tls" \
@@ -105,6 +120,24 @@ file_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || printf 'unknown'
 }
 
+# Check that the removed CONSUL_ENABLED flag is not in the runtime files.
+# Consul is always present. CONSUL_ADDR selects the location.
+check_consul_flag_removed() {
+  local file
+  local -a files=(
+    "$REPO_ROOT/state/tinyauth/setup.sh"
+    "$REPO_ROOT/state/tinyauth/entrypoint.sh"
+    "$REPO_ROOT/compose/tinyauth.yaml"
+  )
+  for file in "${files[@]}"; do
+    if grep -q 'CONSUL_ENABLED' "$file"; then
+      fail "no CONSUL_ENABLED flag in $file" 'the file still holds the removed flag'
+      return 0
+    fi
+  done
+  pass 'no CONSUL_ENABLED flag in the wizard, the entrypoint, and the fragment'
+}
+
 # Check that a second wizard run keeps the generated files.
 check_wizard_idempotence() {
   local env_file="$scratch/config/tinyauth/tinyauth.env"
@@ -112,13 +145,13 @@ check_wizard_idempotence() {
   local snapshot="$scratch/snapshot"
   mkdir -p "$snapshot"
 
-  run_wizard 0 0 0 0
+  run_wizard 'https://consul.remote.example:8500' 0 0 0
   cp "$env_file" "$snapshot/env.first"
   cp "$secrets/ldap-observer" "$snapshot/observer.first"
   cp "$secrets/oidc/private.pem" "$snapshot/private.first"
   cp "$secrets/oidc/public.pem" "$snapshot/public.first"
 
-  run_wizard 0 0 0 0
+  run_wizard 'https://consul.remote.example:8500' 0 0 0
   if cmp -s "$snapshot/env.first" "$env_file" &&
     cmp -s "$snapshot/observer.first" "$secrets/ldap-observer" &&
     cmp -s "$snapshot/private.first" "$secrets/oidc/private.pem" &&
@@ -166,54 +199,142 @@ check_oidc_key_modes() {
   fi
 }
 
-# Check the wizard and the entrypoint in standalone and integrated mode.
-check_rendered_configuration_modes() {
+# Check the wizard in standalone mode with remote Consul.
+check_standalone_wizard() {
   local env_file="$scratch/config/tinyauth/tinyauth.env"
-  local rendered="$scratch/run/standalone.env"
-  local litefs="$scratch/run/litefs.yml"
 
-  run_wizard 0 0 0 0
-  if grep -q '^TINYAUTH_APPURL=http://127.0.0.1:3000$' "$env_file"; then
+  run_wizard 'https://consul.remote.example:8500' 0 0 0
+  if grep -qx 'TINYAUTH_APPURL=http://127.0.0.1:3000' "$env_file"; then
     pass 'standalone wizard writes a local issuer'
   else
     fail 'standalone wizard writes a local issuer' 'the APPURL line is not local'
   fi
-  if grep -q '^Mode: standalone' "$scratch/wizard.log"; then
-    pass 'standalone wizard reports standalone mode'
+  if grep -qx 'Consul: remote' "$scratch/wizard.log"; then
+    pass 'standalone wizard reports remote Consul'
   else
-    fail 'standalone wizard reports standalone mode' 'the mode line is missing'
+    fail 'standalone wizard reports remote Consul' 'the Consul line is wrong'
   fi
-  if [ -e "$scratch/config/tinyauth/secrets/consul-management-token" ]; then
-    fail 'wizard does not copy the consul token' 'a copied token exists'
+  if grep -qx 'LiteFS: off' "$scratch/wizard.log"; then
+    pass 'standalone wizard reports LiteFS off'
   else
-    pass 'wizard does not copy the consul token'
+    fail 'standalone wizard reports LiteFS off' 'the LiteFS line is wrong'
   fi
+  if grep -qx 'Consul address: https://consul.remote.example:8500' "$scratch/wizard.log"; then
+    pass 'standalone wizard prints the Consul address'
+  else
+    fail 'standalone wizard prints the Consul address' 'the Consul address line is wrong'
+  fi
+  if grep -q '^Consul token file: config/consul/secrets/remote-token$' "$scratch/wizard.log"; then
+    pass 'standalone wizard names the remote token file'
+  else
+    fail 'standalone wizard names the remote token file' 'the token file line is wrong'
+  fi
+  if [ -e "$scratch/config/tinyauth/secrets/consul-management-token" ] ||
+    [ -e "$scratch/config/tinyauth/secrets/remote-token" ] ||
+    [ -e "$scratch/config/tinyauth/secrets/agent.hcl" ]; then
+    fail 'wizard does not copy the Consul token' 'a copied token exists'
+  else
+    pass 'wizard does not copy the Consul token'
+  fi
+  if grep -q 'CONSUL_ENABLED' "$scratch/wizard.log"; then
+    fail 'standalone wizard log names no removed flag' 'the log holds CONSUL_ENABLED'
+  else
+    pass 'standalone wizard log names no removed flag'
+  fi
+}
 
-  run_wizard 1 1 1 1
-  if grep -q '^TINYAUTH_APPURL=https://tinyauth.sh.lan$' "$env_file"; then
+# Check the wizard in integrated mode with local Consul and a trailing slash.
+check_integrated_wizard() {
+  local env_file="$scratch/config/tinyauth/tinyauth.env"
+
+  run_wizard 'http://consul:8500/' 1 1 1
+  if grep -qx 'TINYAUTH_APPURL=https://tinyauth.sh.lan' "$env_file"; then
     pass 'integrated wizard writes the stack domain issuer'
   else
     fail 'integrated wizard writes the stack domain issuer' 'the APPURL line is wrong'
   fi
-  if grep -q '^Mode: integrated' "$scratch/wizard.log"; then
-    pass 'integrated wizard reports integrated mode'
+  if grep -qx 'Consul: local' "$scratch/wizard.log"; then
+    pass 'integrated wizard reports local Consul'
   else
-    fail 'integrated wizard reports integrated mode' 'the mode line is missing'
+    fail 'integrated wizard reports local Consul' 'the Consul line is wrong'
   fi
+  if grep -qx 'LiteFS: on' "$scratch/wizard.log"; then
+    pass 'integrated wizard reports LiteFS on'
+  else
+    fail 'integrated wizard reports LiteFS on' 'the LiteFS line is wrong'
+  fi
+  if grep -qx 'Consul address: http://consul:8500/' "$scratch/wizard.log"; then
+    pass 'integrated wizard ignores one trailing slash'
+  else
+    fail 'integrated wizard ignores one trailing slash' 'the Consul line is wrong'
+  fi
+  if grep -qx 'Consul token file: config/consul/secrets/agent.hcl' "$scratch/wizard.log"; then
+    pass 'integrated wizard names the local token file'
+  else
+    fail 'integrated wizard names the local token file' 'the token file line is wrong'
+  fi
+}
 
-  render_entrypoint 0 0 0 0
-  if grep -q '^TINYAUTH_APPURL=http://127.0.0.1:3000$' "$rendered"; then
+# Check local Consul with LiteFS off.
+# The summary must not use the stack word standalone for this case.
+check_local_consul_litefs_off() {
+  run_wizard 'http://consul:8500' 0 0 0
+  if grep -qx 'Consul: local' "$scratch/wizard.log"; then
+    pass 'local Consul wizard reports local Consul'
+  else
+    fail 'local Consul wizard reports local Consul' 'the Consul line is wrong'
+  fi
+  if grep -qx 'LiteFS: off' "$scratch/wizard.log"; then
+    pass 'local Consul wizard reports LiteFS off'
+  else
+    fail 'local Consul wizard reports LiteFS off' 'the LiteFS line is wrong'
+  fi
+  if grep -qi 'standalone' "$scratch/wizard.log"; then
+    fail 'local Consul with LiteFS off never says standalone' 'the summary says standalone'
+  else
+    pass 'local Consul with LiteFS off never says standalone'
+  fi
+  if grep -q '^Mode:' "$scratch/wizard.log"; then
+    fail 'summary has no mode line' 'a Mode line is present'
+  else
+    pass 'summary has no mode line'
+  fi
+}
+
+# Check the entrypoint in standalone mode with remote Consul.
+check_standalone_entrypoint() {
+  local rendered="$scratch/run/standalone.env"
+  local litefs="$scratch/run/litefs.yml"
+
+  rm -f "$litefs"
+  render_entrypoint 'https://consul.remote.example:8500' 0 0 0
+  if grep -qx 'TINYAUTH_APPURL=http://127.0.0.1:3000' "$rendered"; then
     pass 'standalone entrypoint renders a local issuer'
   else
     fail 'standalone entrypoint renders a local issuer' 'the APPURL line is not local'
+  fi
+  if grep -qx 'CONSUL_ADDR=https://consul.remote.example:8500' "$rendered"; then
+    pass 'standalone entrypoint records CONSUL_ADDR'
+  else
+    fail 'standalone entrypoint records CONSUL_ADDR' 'the CONSUL_ADDR line is wrong'
   fi
   if [ ! -e "$litefs" ]; then
     pass 'standalone entrypoint renders no litefs config'
   else
     fail 'standalone entrypoint renders no litefs config' 'a litefs config exists'
   fi
+  if grep -q 'CONSUL_ENABLED' "$rendered" "$scratch/entrypoint.log"; then
+    fail 'standalone entrypoint names no removed flag' 'CONSUL_ENABLED is present'
+  else
+    pass 'standalone entrypoint names no removed flag'
+  fi
+}
 
-  render_entrypoint 1 1 1 1
+# Check the entrypoint in integrated mode with local Consul.
+check_integrated_entrypoint() {
+  local litefs="$scratch/run/litefs.yml"
+
+  render_entrypoint 'http://consul:8500' 1 1 1
   if grep -q 'type: "consul"' "$litefs"; then
     pass 'integrated entrypoint renders a consul lease'
   else
@@ -224,13 +345,49 @@ check_rendered_configuration_modes() {
   else
     fail 'integrated entrypoint renders the peer port' 'the peer port is missing'
   fi
+  if grep -q 'url: "http://consul:8500"' "$litefs"; then
+    pass 'integrated entrypoint uses CONSUL_ADDR for the lease'
+  else
+    fail 'integrated entrypoint uses CONSUL_ADDR for the lease' 'the lease URL is wrong'
+  fi
+  if grep -q "consul token file: $scratch/config/consul/secrets/agent.hcl" "$scratch/entrypoint.log"; then
+    pass 'integrated entrypoint selects the local token file'
+  else
+    fail 'integrated entrypoint selects the local token file' 'the token file line is wrong'
+  fi
+  if grep -q 'local-test-token' "$scratch/entrypoint.log"; then
+    fail 'entrypoint does not print the local token' 'the token value is in the log'
+  else
+    pass 'entrypoint does not print the local token'
+  fi
+}
+
+# Check that the entrypoint selects the remote token file for remote Consul.
+check_remote_token_selection() {
+  render_entrypoint 'https://consul.remote.example:8500' 1 0 0
+  if grep -q "consul token file: $scratch/config/consul/secrets/remote-token" "$scratch/entrypoint.log"; then
+    pass 'integrated entrypoint selects the remote token file'
+  else
+    fail 'integrated entrypoint selects the remote token file' 'the token file line is wrong'
+  fi
+  if grep -q 'remote-test-token' "$scratch/entrypoint.log"; then
+    fail 'entrypoint does not print the remote token' 'the token value is in the log'
+  else
+    pass 'entrypoint does not print the remote token'
+  fi
 }
 
 scratch="$(mktemp -d /tmp/tinyauth-smoke.XXXXXX)"
 setup_tree
+check_consul_flag_removed
 check_wizard_idempotence
 check_oidc_key_modes
-check_rendered_configuration_modes
+check_standalone_wizard
+check_integrated_wizard
+check_local_consul_litefs_off
+check_standalone_entrypoint
+check_integrated_entrypoint
+check_remote_token_selection
 
 printf 'smoke checks: %d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then

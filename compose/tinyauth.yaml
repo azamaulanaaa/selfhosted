@@ -4,9 +4,11 @@ services:
   # key files. The keys live in the backed-up secrets tree at
   # /etc/tinyauth/secrets/oidc. Copy the same keys to every node before you
   # start a second node. A single node is the LiteFS primary. Only the primary
-  # can write the database. Consul ACLs protect the litefs lease (key
-  # "tinyauth/litefs"). The entrypoint creates the token. In standalone mode,
-  # the app runs directly on local SQLite with no peer, consul, or FUSE.
+  # can write the database. Consul is always present. CONSUL_ADDR selects the
+  # location: http://consul:8500 is local, any other value is remote. Consul
+  # ACLs protect the litefs lease (key "tinyauth/litefs"). The entrypoint
+  # creates the token. In standalone mode, the app runs directly on local
+  # SQLite with no LiteFS peer and no FUSE.
   # Caddy proxies tinyauth:3000 on the shared network at
   # tinyauth.<STACK_DOMAIN>. Port 20202 is published for LiteFS peers.
   # The LDAP port is not published.
@@ -23,17 +25,17 @@ services:
       # start a second node. The directory needs write access so the
       # entrypoint can store the token.
       - ./config/tinyauth/secrets:/etc/tinyauth/secrets:rw
-      # The consul management token stays in the shared consul secrets tree.
-      # The entrypoint reads initial_management from agent.hcl at container start.
+      # The Consul secrets tree stays read-only. The entrypoint reads
+      # initial_management from agent.hcl for local Consul. It reads the token
+      # in remote-token for remote Consul.
       - ./config/consul/secrets:/etc/tinyauth/consul-secrets:ro
       # LiteFS internal data (LTX files). Back this up.
       - ./data/tinyauth/store:/var/lib/litefs:rw
     environment:
       - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
       - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
-      - CONSUL_HTTP_ADDR=${CONSUL_HTTP_ADDR:-http://consul:8500}
-      # Capability flags. Every flag at 0 gives standalone mode with no peer.
-      - CONSUL_ENABLED=${CONSUL_ENABLED:-0}
+      - CONSUL_ADDR=${CONSUL_ADDR:-http://consul:8500}
+      # Capability flags. LITEFS_ENABLED=1 selects integrated mode.
       - LITEFS_ENABLED=${LITEFS_ENABLED:-0}
       - OIDC_ENABLED=${OIDC_ENABLED:-0}
       - TLS_ENABLED=${TLS_ENABLED:-0}

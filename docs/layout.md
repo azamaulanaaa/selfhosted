@@ -115,9 +115,22 @@ A per-application directory set has this form:
 ## Wizards and cleanup
 
 The root `setup.sh` is a dispatcher. It holds no service-specific
-logic. It finds the services by scanning `state/*/setup.sh`. It asks
-the stack-wide questions (for example `PUBLIC_IP`). It asks which
-services to enable. Then it calls each selected service wizard in turn.
+logic. It finds the services by scanning `state/*/setup.sh`. It resolves
+Consul first. Then it asks for `PUBLIC_IP`. It asks which services to
+enable. Then it calls each selected service wizard in turn. Consul is
+mandatory. A service wizard never asks about Consul.
+
+The root wizard uses this order:
+
+1. Create `.env` when it is missing.
+2. Regenerate `compose.yaml` with `scripts/compose-assemble.sh`.
+3. Resolve `CONSUL_ADDR`.
+4. Remote: resolve and write the remote token. Local: ask for the peers,
+    then ask for `bootstrap_expect`.
+5. Run the service enable loop.
+6. Resolve `PUBLIC_IP`.
+7. Write `.env`.
+8. Run each enabled service wizard in sorted order.
 
 Each service owns one wizard at `state/<app>/setup.sh`. The service
 wizard asks the service-specific questions. It generates the service
@@ -170,23 +183,106 @@ contains its fragment and its `state/<service>/` tree. Fragments do not
 reference each other. All cross-service references work through the
 shared Docker network.
 
+The root wizard prints the `docker compose up -d` command for the enabled
+services. In remote mode, that command does not include `consul`.
+
+## Consul control plane
+
+Consul is mandatory. Every service uses Consul. Consul runs in this stack
+(local) or outside it (remote). A service never asks about Consul.
+
+`CONSUL_ADDR` selects the location. The root wizard reads it from the
+process environment first, then from the root `.env` file. When the value
+is present, the root wizard does not ask for the address.
+
+- `http://consul:8500` selects local Consul. The root wizard removes one
+  trailing slash before the comparison.
+- Any other value selects remote Consul.
+- A valid value starts with `http://` or `https://`, has a host, and has
+  no whitespace.
+
+The root wizard rejects an empty value. It also rejects a malformed value
+and a value with whitespace.
+
+### Remote Consul
+
+- The local `consul` service is not deployed.
+- The root wizard asks for the remote ACL token with a hidden prompt.
+- The token file is `config/consul/secrets/remote-token`. The file is
+  mode 600. The directory is mode 700.
+- Non-interactive input is `CONSUL_HTTP_TOKEN`. The root wizard keeps an
+  existing token file by default.
+- The root wizard removes `consul` from the enabled services. When
+  `SETUP_SERVICES` explicitly names `consul`, the root wizard exits with
+  an error.
+- The root wizard never writes the remote token to `.env`.
+
+### Local Consul
+
+- The root wizard asks for the peer list on every run:
+  `Peer IPs, comma-separated? [<current>]`.
+- The root wizard asks for `bootstrap_expect` on every run:
+  `Consul bootstrap_expect? [<current>]`.
+- The answers are stored in the root `.env` as `CONSUL_JOIN_IPS` and
+  `CONSUL_BOOTSTRAP_EXPECT`.
+- The root wizard exports both values to the `consul` service wizard.
+- The root wizard forces `consul` into the enabled services. This applies
+  when the user answers no and when `SETUP_SERVICES=none`.
+- A missing `state/consul/setup.sh` is an error.
+
+The root wizard rejects a peer list with an invalid IPv4 entry. An empty
+peer list is valid. The root wizard trims the whitespace around each
+entry. An invalid octet is an error.
+
+The root wizard rejects a `bootstrap_expect` value that is not a number
+from 1 to 99.
+
+### Root `.env`
+
+The root wizard owns these keys:
+
+- `CONSUL_ADDR`
+- `CONSUL_JOIN_IPS` (local mode)
+- `CONSUL_BOOTSTRAP_EXPECT` (local mode)
+- `PUBLIC_IP`
+
+The root wizard preserves every other line. It writes the file with mode
+0640. In remote mode, it removes `CONSUL_JOIN_IPS` and
+`CONSUL_BOOTSTRAP_EXPECT`.
+
+### Non-interactive input
+
+These values come from the environment:
+
+- `CONSUL_ADDR`
+- `CONSUL_JOIN_IPS`
+- `CONSUL_BOOTSTRAP_EXPECT`
+- `CONSUL_HTTP_TOKEN`
+- `SETUP_SERVICES`
+- `PUBLIC_IP`
+
+When `CONSUL_ADDR` is absent and stdin is not a TTY, the root wizard uses
+`http://consul:8500` (local). The root wizard does not prompt when stdin
+is not a TTY.
+
 ## Standalone and integrated modes
 
-This section defines the shared contract for every service. Each service
-follows these rules. The root `.env` file holds the shared values. See
-`.env.example` for the keys and their default values.
+`standalone` means remote Consul plus one service container. Consul is
+still required.
+
+`integrated` means local Consul.
+
+Optional capability flags do not define standalone or integrated mode.
 
 ### Capability flags
 
-Four capability flags control optional peers and features:
+Three capability flags control optional peers and features:
 
-- `CONSUL_ENABLED`
 - `LITEFS_ENABLED`
 - `OIDC_ENABLED`
 - `TLS_ENABLED`
 
-Each flag defaults to `0`. A service with every flag at `0` is in standalone
-mode. That service must start, serve, and stop with no peer.
+Each flag defaults to `0`. A flag does not select the Consul location.
 
 ### Stack domain
 
@@ -208,10 +304,10 @@ The assembler owns the root `compose.yaml`. `scripts/compose-assemble.sh`
 generates the file. A service adds one fragment under `compose/`. A service
 never edits the root `compose.yaml` or `scripts/compose-assemble.sh`.
 
-### Integrated mode
+### Mode selection
 
-To use integrated mode, set the capability flags to `1` in the root `.env`.
-Then run `setup.sh` once. The assembler regenerates `compose.yaml` from the
+`CONSUL_ADDR` selects the mode. No capability flag selects the mode. Run
+`setup.sh` once. The assembler regenerates `compose.yaml` from the
 fragments.
 
 ## Out of scope

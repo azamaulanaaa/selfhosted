@@ -2,10 +2,10 @@
 # Render the Garage runtime config and start the Garage server.
 # Garage always uses Consul service discovery. The wizard writes the
 # [consul_discovery] section and a token marker line.
-# This script resolves the Consul token at container start and replaces the
-# marker. It reads the token from the Garage secrets tree first. In integrated
-# mode it reads initial_management from the stack Consul agent secrets.
-# The script never prints secret values. It prints paths only.
+# This script selects the Consul token file at container start and replaces
+# the marker. Local Consul uses initial_management from agent.hcl. Remote
+# Consul uses the remote-token file. The script never prints secret values.
+# It prints paths only.
 set -eu
 
 # These variables point at the runtime paths. The defaults match the image.
@@ -16,16 +16,17 @@ GARAGE_RUNTIME_DIR="${GARAGE_RUNTIME_DIR:-/run/garage}"
 GARAGE_SECRETS_DIR="${GARAGE_SECRETS_DIR:-/etc/garage/secrets}"
 CONSUL_SECRETS_DIR="${CONSUL_SECRETS_DIR:-/etc/garage/consul-secrets}"
 CONSUL_AGENT_HCL_FILE="${CONSUL_AGENT_HCL_FILE:-${CONSUL_SECRETS_DIR}/agent.hcl}"
+CONSUL_REMOTE_TOKEN_FILE="${CONSUL_REMOTE_TOKEN_FILE:-${CONSUL_SECRETS_DIR}/remote-token}"
 GARAGE_RENDER_ONLY="${GARAGE_RENDER_ONLY:-0}"
 
 # Environment that the operator sets.
-CONSUL_ENABLED="${CONSUL_ENABLED:-0}"
+CONSUL_ADDR="${CONSUL_ADDR:-}"
 
 readonly GARAGE_CONFIG_TEMPLATE GARAGE_RUNTIME_CONFIG GARAGE_RUNTIME_DIR
 readonly GARAGE_SECRETS_DIR CONSUL_SECRETS_DIR CONSUL_AGENT_HCL_FILE
-readonly GARAGE_RENDER_ONLY CONSUL_ENABLED
+readonly CONSUL_REMOTE_TOKEN_FILE GARAGE_RENDER_ONLY CONSUL_ADDR
 
-readonly CONSUL_TOKEN_FILE="${GARAGE_SECRETS_DIR}/consul_token"
+readonly LOCAL_CONSUL_ADDR="http://consul:8500"
 readonly TOKEN_MARKER='# __CONSUL_TOKEN__'
 
 log() { echo "garage: $1" >&2; }
@@ -46,6 +47,12 @@ read_initial_management() {
   fi
   { grep -E '^[[:space:]]*initial_management[[:space:]]*=' "$CONSUL_AGENT_HCL_FILE" || true; } |
     head -n1 | cut -d'"' -f2
+}
+
+# Return 0 when CONSUL_ADDR selects local Consul.
+# Remove one trailing slash before the comparison.
+is_local_consul() {
+  [ "${CONSUL_ADDR%/}" = "$LOCAL_CONSUL_ADDR" ]
 }
 
 # Return 0 when the value can sit in a quoted TOML string.
@@ -93,6 +100,12 @@ render_config() {
 # Boot sequence
 # ---------------------------------------------------------------------------
 
+if [ -z "$CONSUL_ADDR" ]; then
+  err "CONSUL_ADDR is not set. Consul is required."
+  err "Run setup.sh again to write CONSUL_ADDR to the root .env file."
+  exit 1
+fi
+
 if [ ! -r "$GARAGE_CONFIG_TEMPLATE" ]; then
   err "Garage configuration not readable at $GARAGE_CONFIG_TEMPLATE."
   err "Generate it first: bash setup.sh garage"
@@ -105,20 +118,16 @@ if ! grep -Fq -- "$TOKEN_MARKER" "$GARAGE_CONFIG_TEMPLATE"; then
   exit 1
 fi
 
-# Resolve the token. The Garage token file wins. In integrated mode, read the
-# stack Consul management token when the file is absent.
+# Resolve the token. Local Consul reads initial_management from agent.hcl.
+# Remote Consul reads the remote-token file.
 consul_token=""
-token_source="none"
-if [ -s "$CONSUL_TOKEN_FILE" ]; then
-  consul_token="$(read_secret_file "$CONSUL_TOKEN_FILE")"
-  if [ -n "$consul_token" ]; then
-    token_source="file"
-  fi
-elif [ "$CONSUL_ENABLED" = "1" ]; then
+token_source=""
+if is_local_consul; then
   consul_token="$(read_initial_management)"
-  if [ -n "$consul_token" ]; then
-    token_source="agent"
-  fi
+  token_source="$CONSUL_AGENT_HCL_FILE"
+else
+  consul_token="$(read_secret_file "$CONSUL_REMOTE_TOKEN_FILE")"
+  token_source="$CONSUL_REMOTE_TOKEN_FILE"
 fi
 
 if [ -n "$consul_token" ] && ! is_safe_toml_string "$consul_token"; then
@@ -126,24 +135,18 @@ if [ -n "$consul_token" ] && ! is_safe_toml_string "$consul_token"; then
   exit 1
 fi
 
-if [ "$CONSUL_ENABLED" = "1" ] && [ -z "$consul_token" ]; then
-  log "warning: no Consul token found at $CONSUL_AGENT_HCL_FILE."
-  log "warning: Garage cannot register with the stack Consul without a token."
+if [ -z "$consul_token" ]; then
+  log "warning: no Consul token found at $token_source."
+  log "warning: Garage cannot register with Consul without a token."
 fi
 
 render_config "$consul_token"
 
-case "$token_source" in
-file)
-  log "using the Consul token from $CONSUL_TOKEN_FILE"
-  ;;
-agent)
-  log "using the Consul management token from $CONSUL_AGENT_HCL_FILE"
-  ;;
-*)
+if [ -n "$consul_token" ]; then
+  log "using the Consul token from $token_source"
+else
   log "no Consul token is configured"
-  ;;
-esac
+fi
 
 if [ "$GARAGE_RENDER_ONLY" = "1" ]; then
   log "render-only mode. No process was started."

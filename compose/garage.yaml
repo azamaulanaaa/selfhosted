@@ -2,10 +2,9 @@
 # The root compose.yaml owns the project name. This file is an included fragment.
 services:
   # Garage is an S3-compatible object store. Consul service discovery is always
-  # enabled. In standalone mode the wizard asks for an external Consul address.
-  # In integrated mode Garage uses the stack Consul at http://consul:8500 and
-  # reads the management token at container start. Ports are published on
-  # PUBLIC_IP, which defaults to 127.0.0.1.
+  # enabled. CONSUL_ADDR selects local or remote Consul. The entrypoint selects
+  # the Consul token file at container start. Ports are published on PUBLIC_IP,
+  # which defaults to 127.0.0.1.
   garage:
     image: garage-consul:local
     build:
@@ -16,10 +15,10 @@ services:
       # Wizard configuration. The entrypoint renders /run/garage/garage.toml
       # from this file. Read-only.
       - ./config/garage/garage.toml:/etc/garage/garage.toml:ro
-      # RPC, admin, metrics, and optional Consul token files. Read-only.
+      # RPC, admin, and metrics secret files. Read-only.
       - ./config/garage/secrets:/etc/garage/secrets:ro
-      # Consul agent secrets. The entrypoint reads initial_management at start.
-      # The wizard never copies the token into the Garage secret tree.
+      # Consul secrets. The entrypoint reads agent.hcl in local mode and
+      # remote-token in remote mode. Read-only. Do not mount only agent.hcl.
       - ./config/consul/secrets:/etc/garage/consul-secrets:ro
       # Garage metadata and object data. Back both up.
       - ./data/garage/meta:/var/lib/garage/meta:rw
@@ -27,7 +26,7 @@ services:
     environment:
       - STACK_DOMAIN=${STACK_DOMAIN:-sh.lan}
       - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
-      - CONSUL_ENABLED=${CONSUL_ENABLED:-0}
+      - CONSUL_ADDR=${CONSUL_ADDR:-http://consul:8500}
     ports:
       # S3 API. Trusted LAN only.
       - target: 3900

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Generate the Garage wizard files for this stack.
 # Garage always uses Consul service discovery. The wizard writes the
-# [consul_discovery] section on every run.
-# In standalone mode the wizard asks for the Consul HTTP address and an
-# optional token. In integrated mode it uses the stack Consul at
-# http://consul:8500 and reads the management token at container start.
+# [consul_discovery] section on every run from CONSUL_ADDR.
+# The root setup.sh resolves Consul first and writes CONSUL_ADDR to the root
+# .env file. This wizard never asks about Consul. The container selects the
+# Consul token file from CONSUL_ADDR at start time.
 # Safe to run again: it rewrites garage.toml and keeps the secret files unless
 # GARAGE_ROTATE_SECRETS=1 is set. It never prints secret values. It prints
 # paths only.
@@ -20,17 +20,14 @@
 #                             root .env, then sh.lan.
 #   PUBLIC_IP                 Public or LAN IPv4. Read from the environment,
 #                             then the root .env, then 127.0.0.1.
-#   CONSUL_ENABLED            Capability flag. Read from the environment, then
-#                             the root .env, then 0. At 1 the wizard uses the
-#                             stack Consul at http://consul:8500.
-#   CONSUL_HTTP_ADDR          Consul HTTP address. Required in standalone mode
-#                             when stdin is not a TTY. Interactive default:
-#                             http://127.0.0.1:8500.
-#   CONSUL_HTTP_TOKEN         Optional Consul token. Used in standalone mode only.
-#                             An empty value keeps a token file that already exists.
+#   CONSUL_ADDR               Consul address. Read from the environment, then
+#                             the root .env. The value is required. It must
+#                             start with http:// or https:// and must hold a
+#                             host. http://consul:8500 means local Consul. Any
+#                             other value means remote Consul.
 #   GARAGE_REPLICATION_FACTOR Replication factor. Default 1.
 #   GARAGE_ROTATE_SECRETS     Set to 1 to create new RPC, admin, and metrics
-#                             secrets. Default 0. The Consul token is not rotated.
+#                             secrets. Default 0.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -44,12 +41,10 @@ readonly CONFIG_FILE="config/garage/garage.toml"
 readonly RPC_SECRET_FILE="${SECRETS_DIR}/rpc_secret"
 readonly ADMIN_TOKEN_FILE="${SECRETS_DIR}/admin_token"
 readonly METRICS_TOKEN_FILE="${SECRETS_DIR}/metrics_token"
-readonly CONSUL_TOKEN_FILE="${SECRETS_DIR}/consul_token"
 
 readonly DEFAULT_STACK_DOMAIN="sh.lan"
 readonly DEFAULT_PUBLIC_IP="127.0.0.1"
-readonly DEFAULT_CONSUL_HTTP_ADDR="http://127.0.0.1:8500"
-readonly STACK_CONSUL_HTTP_ADDR="http://consul:8500"
+readonly LOCAL_CONSUL_ADDR="http://consul:8500"
 readonly DEFAULT_REPLICATION_FACTOR="1"
 
 # Container paths. The compose fragment mounts the matching host paths.
@@ -112,18 +107,6 @@ is_valid_consul_http_addr() {
 # Return 0 when the argument is a valid replication factor. A positive integer.
 is_valid_replication_factor() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
-}
-
-# Return 0 when the value can sit in a quoted TOML string.
-# Reject a double quote, a backslash, and control characters.
-is_safe_toml_string() {
-  case "$1" in
-  *'"'* | *\\*) return 1 ;;
-  esac
-  if printf '%s' "$1" | grep -q '[[:cntrl:]]'; then
-    return 1
-  fi
-  return 0
 }
 
 # Print the value of one key from an environment file.
@@ -208,33 +191,44 @@ public_ip_invalid() {
   exit 1
 }
 
-# Resolve the Consul capability flag. Set consul_enabled to 0 or 1.
-# The order is: CONSUL_ENABLED from the environment, then the root .env, then 0.
-resolve_consul_enabled() {
-  local candidate="${CONSUL_ENABLED:-}"
-  if [ -z "$candidate" ]; then
-    candidate="$(read_env_value CONSUL_ENABLED .env)"
+# Resolve CONSUL_ADDR. Set consul_addr and consul_mode.
+# The order is: the process environment, then the root .env file.
+# The value is required. This wizard never asks about Consul.
+# One trailing slash does not change the comparison with the local address.
+resolve_consul_addr() {
+  local candidate=""
+  local source="none"
+  if [ -n "${CONSUL_ADDR+x}" ]; then
+    candidate="$CONSUL_ADDR"
+    source="env"
+  elif [ -f .env ] && grep -qE '^CONSUL_ADDR=' .env; then
+    candidate="$(read_env_value CONSUL_ADDR .env)"
+    source="envfile"
   fi
-  case "${candidate:-0}" in
-  0)
-    consul_enabled=0
-    ;;
-  1)
-    consul_enabled=1
-    ;;
-  *)
-    echo "error: CONSUL_ENABLED must be 0 or 1." >&2
+  if [ "$source" = "none" ]; then
+    echo "error: CONSUL_ADDR is not set. Consul is required." >&2
+    echo "error: Run 'bash setup.sh' first, or set CONSUL_ADDR." >&2
     exit 1
-    ;;
-  esac
-}
-
-# Print the contents of one secret file.
-# Print nothing when the file is missing or empty.
-read_secret_file() {
-  local path="$1"
-  [ -s "$path" ] || return 0
-  cat "$path"
+  fi
+  if ! is_valid_consul_http_addr "$candidate"; then
+    case "$source" in
+    env)
+      echo "error: CONSUL_ADDR '$candidate' is not valid. Use http:// or https://, a host, and no whitespace." >&2
+      ;;
+    envfile)
+      echo "error: The root .env holds the invalid CONSUL_ADDR '$candidate'." >&2
+      echo "error: Fix .env by hand or set CONSUL_ADDR." >&2
+      ;;
+    esac
+    exit 1
+  fi
+  candidate="${candidate%/}"
+  consul_addr="$candidate"
+  if [ "$consul_addr" = "$LOCAL_CONSUL_ADDR" ]; then
+    consul_mode="local"
+  else
+    consul_mode="remote"
+  fi
 }
 
 # Write one secret to a file with mode 600.
@@ -414,10 +408,21 @@ resolve_public_ip
 if ! is_valid_ipv4 "$public_ip"; then
   public_ip_invalid
 fi
-resolve_consul_enabled
+resolve_consul_addr
+
 readonly STACK_DOMAIN_RESOLVED="$stack_domain"
 readonly PUBLIC_IP_RESOLVED="$public_ip"
-readonly CONSUL_ENABLED_RESOLVED="$consul_enabled"
+readonly CONSUL_ADDR_RESOLVED="$consul_addr"
+case "$consul_mode" in
+local)
+  readonly MODE="integrated"
+  readonly CONSUL_TOKEN_HINT="config/consul/secrets/agent.hcl"
+  ;;
+remote)
+  readonly MODE="standalone"
+  readonly CONSUL_TOKEN_HINT="config/consul/secrets/remote-token"
+  ;;
+esac
 
 replication_factor="${GARAGE_REPLICATION_FACTOR:-$DEFAULT_REPLICATION_FACTOR}"
 if ! is_valid_replication_factor "$replication_factor"; then
@@ -434,90 +439,12 @@ case "$rotate" in
   ;;
 esac
 
-# Step 3: resolve the Consul address.
-# Integrated mode uses the stack Consul. Standalone mode asks for the address.
-consul_http_addr=""
-mode=""
-if [ "$CONSUL_ENABLED_RESOLVED" -eq 1 ]; then
-  mode="integrated"
-  consul_http_addr="$STACK_CONSUL_HTTP_ADDR"
-else
-  mode="standalone"
-  if [ -t 0 ]; then
-    if ! read -r -p "Consul HTTP address? [$DEFAULT_CONSUL_HTTP_ADDR] " answer; then
-      answer=""
-    fi
-    consul_http_addr="${answer:-$DEFAULT_CONSUL_HTTP_ADDR}"
-  else
-    consul_http_addr="${CONSUL_HTTP_ADDR:-}"
-    if [ -z "$consul_http_addr" ]; then
-      echo "error: CONSUL_HTTP_ADDR is not set." >&2
-      echo "error: Set it to the Consul HTTP address, for example http://127.0.0.1:8500." >&2
-      exit 1
-    fi
-  fi
-  if ! is_valid_consul_http_addr "$consul_http_addr"; then
-    echo "error: '$consul_http_addr' is not a valid Consul HTTP address." >&2
-    echo "error: Use http://host:port or https://host:port." >&2
-    exit 1
-  fi
-  consul_http_addr="${consul_http_addr%/}"
-fi
-readonly CONSUL_HTTP_ADDR_RESOLVED="$consul_http_addr"
-readonly MODE="$mode"
-
-# Step 4: resolve the optional standalone Consul token.
-# In integrated mode the entrypoint reads initial_management at container start.
-# The wizard never copies that token.
-existing_consul_token="$(read_secret_file "$CONSUL_TOKEN_FILE")"
-consul_token="$existing_consul_token"
-if [ "$CONSUL_ENABLED_RESOLVED" -eq 1 ]; then
-  if [ -n "$existing_consul_token" ]; then
-    echo "warning: '$CONSUL_TOKEN_FILE' exists." >&2
-    echo "warning: The entrypoint uses this file before the stack management token." >&2
-    echo "warning: Remove the file to use the stack management token." >&2
-  fi
-elif [ -t 0 ]; then
-  prompt="Consul HTTP token? (optional) "
-  if [ -n "$existing_consul_token" ]; then
-    prompt="Consul HTTP token? [keep the existing token] "
-  fi
-  if ! read -r -s -p "$prompt" answer; then
-    echo >&2
-    answer=""
-  fi
-  echo >&2
-  if [ -n "$answer" ]; then
-    consul_token="$answer"
-  fi
-else
-  if [ -n "${CONSUL_HTTP_TOKEN:-}" ]; then
-    consul_token="$CONSUL_HTTP_TOKEN"
-  fi
-fi
-if [ -n "$consul_token" ] && ! is_safe_toml_string "$consul_token"; then
-  echo "error: The Consul token has a double quote, a backslash, or a control character." >&2
-  echo "error: Use a token that has none of these characters." >&2
-  exit 1
-fi
-readonly CONSUL_TOKEN_RESOLVED="$consul_token"
-
-# Step 5: create the config directories with strict modes.
+# Step 3: create the config directories with strict modes.
 mkdir -p "$SECRETS_DIR"
 chmod 0700 "$CONFIG_DIR"
 chmod 0700 "$SECRETS_DIR"
 
-# Step 6: write the standalone token only when one is available.
-# Never create an empty file.
-if [ -n "$CONSUL_TOKEN_RESOLVED" ]; then
-  write_secret_file "$CONSUL_TOKEN_FILE" "$CONSUL_TOKEN_RESOLVED"
-  token_state="set"
-else
-  rm -f -- "$CONSUL_TOKEN_FILE"
-  token_state="not set"
-fi
-
-# Step 7: reuse the generated secrets. Create or rotate them when needed.
+# Step 4: reuse the generated secrets. Create or rotate them when needed.
 rpc_state="kept"
 if [ "$rotate" -eq 1 ] || [ ! -s "$RPC_SECRET_FILE" ]; then
   if [ -s "$RPC_SECRET_FILE" ]; then
@@ -554,7 +481,7 @@ else
   chmod 0600 "$METRICS_TOKEN_FILE"
 fi
 
-# Step 8: write the config file. It holds no secrets.
+# Step 5: write the config file. It holds no secrets.
 # The marker line tells the entrypoint where to add the Consul token.
 tmp_config="$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")"
 {
@@ -574,7 +501,7 @@ tmp_config="$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")"
   printf '\n'
   printf '[consul_discovery]\n'
   printf 'api = "catalog"\n'
-  printf 'consul_http_addr = "%s"\n' "$CONSUL_HTTP_ADDR_RESOLVED"
+  printf 'consul_http_addr = "%s"\n' "$CONSUL_ADDR_RESOLVED"
   printf 'service_name = "garage"\n'
   printf 'tls_skip_verify = false\n'
   printf '# __CONSUL_TOKEN__\n'
@@ -595,18 +522,13 @@ tmp_config="$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")"
 chmod 0600 "$tmp_config"
 mv "$tmp_config" "$CONFIG_FILE"
 
-# Step 9: print the summary. Never print secret values.
+# Step 6: print the summary. Never print secret values.
 echo "Configured the Garage configuration:"
 echo "  $CONFIG_FILE"
 echo "  $SECRETS_DIR"
 echo "Mode: $MODE"
-echo "Consul HTTP address: $CONSUL_HTTP_ADDR_RESOLVED"
-if [ "$CONSUL_ENABLED_RESOLVED" -eq 1 ]; then
-  echo "Consul token: read at container start from config/consul/secrets/agent.hcl"
-  echo "hint: The entrypoint uses a standalone token file first when one exists."
-else
-  echo "Consul token: $token_state ($CONSUL_TOKEN_FILE)"
-fi
+echo "Consul address: $CONSUL_ADDR_RESOLVED"
+echo "Consul token: read at container start from $CONSUL_TOKEN_HINT"
 echo "RPC secret: $RPC_SECRET_FILE ($rpc_state)"
 echo "Admin token: $ADMIN_TOKEN_FILE ($admin_state)"
 echo "Metrics token: $METRICS_TOKEN_FILE ($metrics_state)"
@@ -614,5 +536,5 @@ echo "Replication factor: $replication_factor"
 echo "RPC public address: ${PUBLIC_IP_RESOLVED}:3901"
 echo "S3 endpoint: http://${PUBLIC_IP_RESOLVED}:3900"
 echo "hint: The metadata and data directories are data/garage/meta and data/garage/data."
-echo "hint: Run the one-time layout assign after the first start. See docs/garage.md."
+echo "hint: Use the Garage CLI for the layout, the buckets, and the access keys. See docs/garage.md."
 echo "Next step: docker compose up -d garage"

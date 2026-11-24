@@ -39,6 +39,10 @@ services:
       - LITEFS_ENABLED=${LITEFS_ENABLED:-0}
       - OIDC_ENABLED=${OIDC_ENABLED:-0}
       - TLS_ENABLED=${TLS_ENABLED:-0}
+      # Run identity. Rootless nerdctl sets both values to 0, so container root
+      # maps to the host user that owns the mounted files.
+      - EXEC_UID=${STACK_UID:-1000}
+      - EXEC_GID=${STACK_GID:-1000}
     env_file:
       # Wizard-generated. Holds TINYAUTH_* keys and *_FILE paths only.
       - ./config/tinyauth/tinyauth.env

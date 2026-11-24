@@ -29,6 +29,13 @@
 #                           selects local Consul. Any other value selects remote Consul.
 #   STACK_DOMAIN            Stack domain. The issuer becomes https://tinyauth.<domain>.
 #                           Read from the environment, then the root .env, then sh.lan.
+#   STACK_ROOTLESS          1 runs the app as container root for rootless nerdctl.
+#                           0 runs it as uid STACK_UID and gid STACK_GID.
+#                           Read from the environment, then the root .env, then 0.
+#   STACK_UID               Container user id. Read from the environment, then the
+#                           root .env, then 1000.
+#   STACK_GID               Container group id. Read from the environment, then the
+#                           root .env, then 1000.
 #   TINYAUTH_LDAP_LOCAL     yes to use the LLDAP service in this repo. Default: yes.
 #   TINYAUTH_LDAP_ADDRESS   LDAP URL. Required when TINYAUTH_LDAP_LOCAL=no.
 #                           Interactive default for local LLDAP: ldap://lldap:3890.
@@ -211,6 +218,63 @@ resolve_capability_flags() {
     esac
   done
   readonly LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
+}
+
+# Return 0 when the argument is 0 or 1.
+is_valid_rootless() {
+  [ "$1" = "0" ] || [ "$1" = "1" ]
+}
+
+# Return 0 when the argument is 0 or a positive integer.
+is_valid_identity_id() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# Print an STE error for an invalid stack identity value and exit 1.
+# The message names the key and the rule.
+stack_identity_invalid() {
+  local key="$1" value="$2" rule="$3"
+  echo "error: $key '$value' is not valid. $rule" >&2
+  exit 1
+}
+
+# Resolve the container runtime identity from the environment and the root .env.
+# An environment value wins. The defaults are 0, 1000, and 1000.
+# STACK_ROOTLESS=1 selects rootless nerdctl.
+resolve_stack_identity() {
+  local value
+
+  value="${STACK_ROOTLESS:-}"
+  if [ -z "$value" ] && [ -f .env ]; then
+    value="$(read_env_value STACK_ROOTLESS .env)"
+  fi
+  value="${value:-0}"
+  if ! is_valid_rootless "$value"; then
+    stack_identity_invalid STACK_ROOTLESS "$value" "Use 0 or 1."
+  fi
+  STACK_ROOTLESS="$value"
+
+  value="${STACK_UID:-}"
+  if [ -z "$value" ] && [ -f .env ]; then
+    value="$(read_env_value STACK_UID .env)"
+  fi
+  value="${value:-1000}"
+  if ! is_valid_identity_id "$value"; then
+    stack_identity_invalid STACK_UID "$value" "Use 0 or a positive integer."
+  fi
+  STACK_UID="$value"
+
+  value="${STACK_GID:-}"
+  if [ -z "$value" ] && [ -f .env ]; then
+    value="$(read_env_value STACK_GID .env)"
+  fi
+  value="${value:-1000}"
+  if ! is_valid_identity_id "$value"; then
+    stack_identity_invalid STACK_GID "$value" "Use 0 or a positive integer."
+  fi
+  STACK_GID="$value"
+
+  readonly STACK_ROOTLESS STACK_UID STACK_GID
 }
 
 # Print an STE error for an invalid stack domain and exit 1.
@@ -557,6 +621,7 @@ if ! is_valid_stack_domain "$stack_domain"; then
   stack_domain_invalid
 fi
 resolve_capability_flags
+resolve_stack_identity
 resolve_consul_addr
 readonly consul_addr consul_mode consul_token_file
 if [ "$LITEFS_ENABLED" = "1" ]; then
@@ -688,8 +753,10 @@ mkdir -p "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
 chmod 0700 "$CONFIG_DIR" "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
 
 # Create the OIDC signing keys. Do not rely on the app to create them at boot.
-# A re-run keeps the existing keys. The app runs as uid 1000 and needs write
-# access on the key files, so set the owner and the mode on every run.
+# A re-run keeps the existing keys. The app needs write access on the key files.
+# Rootful mode: set the owner to STACK_UID:STACK_GID and set the mode.
+# Rootless mode: the host user owns the files and container root reads them.
+# The wizard skips the chown in rootless mode.
 private_key="$OIDC_SECRETS_DIR/private.pem"
 public_key="$OIDC_SECRETS_DIR/public.pem"
 if [ ! -s "$private_key" ]; then
@@ -707,7 +774,12 @@ if [ ! -s "$public_key" ]; then
   echo "Created the OIDC public key at $public_key."
 fi
 chmod 0600 "$private_key" "$public_key"
-chown 1000:1000 "$private_key" "$public_key" 2>/dev/null || true
+if [ "$STACK_ROOTLESS" != "1" ]; then
+  current_owner="$(stat -c '%u:%g' "$private_key" 2>/dev/null || true)"
+  if [ "$current_owner" != "${STACK_UID}:${STACK_GID}" ]; then
+    chown "${STACK_UID}:${STACK_GID}" "$private_key" "$public_key" 2>/dev/null || true
+  fi
+fi
 
 # The Consul token stays in the shared consul secrets tree. The wizard never
 # copies the token into the tinyauth secrets tree. The entrypoint reads the

@@ -448,6 +448,27 @@ check_remote_token_selection() {
   fi
 }
 
+# Check that the entrypoint passes the Consul token value to LiteFS.
+# LiteFS reads CONSUL_HTTP_TOKEN and ignores CONSUL_HTTP_TOKEN_FILE.
+check_litefs_consul_token() {
+  local entrypoint="$REPO_ROOT/state/tinyauth/entrypoint.sh"
+  local start_line
+
+  start_line="$(grep -F 'litefs mount -config' "$entrypoint" || true)"
+  # The expected text is literal script text, not a shell variable.
+  # shellcheck disable=SC2016
+  if printf '%s\n' "$start_line" | grep -qF 'CONSUL_HTTP_TOKEN="$token"'; then
+    pass 'entrypoint passes CONSUL_HTTP_TOKEN to litefs'
+  else
+    fail 'entrypoint passes CONSUL_HTTP_TOKEN to litefs' 'the litefs start line does not set CONSUL_HTTP_TOKEN'
+  fi
+  if printf '%s\n' "$start_line" | grep -qF 'CONSUL_HTTP_TOKEN_FILE'; then
+    fail 'entrypoint does not pass CONSUL_HTTP_TOKEN_FILE to litefs' 'the litefs start line still sets CONSUL_HTTP_TOKEN_FILE'
+  else
+    pass 'entrypoint does not pass CONSUL_HTTP_TOKEN_FILE to litefs'
+  fi
+}
+
 # Check the Caddy vhost descriptor. The descriptor sends writes to the LiteFS
 # primary. The file holds no secret values.
 check_vhost_descriptor() {
@@ -646,6 +667,7 @@ check_local_consul_litefs_off
 check_standalone_entrypoint
 check_integrated_entrypoint
 check_remote_token_selection
+check_litefs_consul_token
 
 printf 'smoke checks: %d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then

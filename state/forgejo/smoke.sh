@@ -1,9 +1,9 @@
 #!/bin/sh
 # Check that the Forgejo templates render in the standalone and integrated modes.
 # Check that the wizard, the entrypoint, and the compose fragment follow the
-# Consul-first contract. Check that the vhost descriptor names forgejo and holds
-# no secret values. Each render writes into a scratch tree. No Consul agent is
-# required.
+# Consul-first contract. Check that the rootless identity reaches the entrypoint.
+# Check that the vhost descriptor names forgejo and holds no secret values.
+# Each render writes into a scratch tree. No Consul agent is required.
 set -eu
 
 REPO_ROOT="$(cd -- "$(dirname -- "$0")/../.." && pwd)"
@@ -169,6 +169,21 @@ check_compose_consul_contract() {
   echo "smoke: compose Consul contract passed."
 }
 
+# Check that the rootless identity reaches the entrypoint.
+# The wizard reads STACK_ROOTLESS, and the compose fragment maps STACK_UID and
+# STACK_GID to EXEC_UID and EXEC_GID.
+check_rootless_contract() {
+  block="$scratch/forgejo-rootless-check.yaml"
+  service_block forgejo >"$block"
+  expect_contains "$ENTRYPOINT" "EXEC_UID=\"\${EXEC_UID:-1000}\"" "entrypoint"
+  expect_contains "$ENTRYPOINT" "EXEC_GID=\"\${EXEC_GID:-1000}\"" "entrypoint"
+  expect_line "$block" "      - EXEC_UID=\${STACK_UID:-1000}" "forgejo service"
+  expect_line "$block" "      - EXEC_GID=\${STACK_GID:-1000}" "forgejo service"
+  expect_contains "$WIZARD" 'resolve_flag STACK_ROOTLESS' "wizard"
+  expect_no_text "$WIZARD" 'chown ' "wizard"
+  echo "smoke: rootless contract passed."
+}
+
 # Check that the vhost descriptor exists and names forgejo as a static vhost.
 check_vhost_descriptor() {
   if [ ! -f "$VHOST" ]; then
@@ -325,6 +340,7 @@ check_peer_service_no_build
 check_consul_contract
 check_template_gates
 check_compose_consul_contract
+check_rootless_contract
 check_vhost_descriptor
 check_vhost_no_secrets
 echo "smoke: all checks passed."

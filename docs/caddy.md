@@ -72,6 +72,8 @@ TLS does not depend on the Consul location.
 - `lldap.<STACK_DOMAIN>` proxies to `lldap:17170`.
 - `tinyauth.<STACK_DOMAIN>` proxies to `tinyauth:3000`.
 - `forgejo.<STACK_DOMAIN>` proxies to `forgejo:3000`.
+- `vaultwarden.<STACK_DOMAIN>` proxies to `vaultwarden:80`. It sets the
+  `X-Real-IP` header for rate limiting.
 
 ## Checks
 

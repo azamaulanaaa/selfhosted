@@ -2,7 +2,8 @@
 # The expected patterns use single quotes on purpose.
 # shellcheck disable=SC2016
 # Smoke check for lldap with and without LiteFS.
-# The check verifies the compose fragment, the entrypoint, and the wizard.
+# The check verifies the compose fragment, the entrypoint, the wizard, and
+# the vhost descriptor.
 # Names and messages use short active sentences.
 set -euo pipefail
 
@@ -14,6 +15,7 @@ readonly COMPOSE_FRAGMENT="compose/lldap.yaml"
 readonly ENTRYPOINT="state/lldap/entrypoint.sh"
 readonly WIZARD="state/lldap/setup.sh"
 readonly ASSEMBLED_COMPOSE="compose.yaml"
+readonly VHOST_DESCRIPTOR="state/lldap/vhost.json"
 
 SANDBOX="$(mktemp -d)"
 readonly SANDBOX
@@ -41,6 +43,16 @@ assert_no_line() {
   local description="$3"
   if grep -Fq -- "$pattern" "$file"; then
     smoke_error "$description Unexpected: $pattern"
+  fi
+}
+
+# Check that a file matches one expected regular expression.
+assert_match() {
+  local file="$1"
+  local pattern="$2"
+  local description="$3"
+  if ! grep -Eq -- "$pattern" "$file"; then
+    smoke_error "$description Expected match: $pattern"
   fi
 }
 
@@ -76,6 +88,22 @@ check_entrypoint_modes() {
 check_assembled_compose() {
   echo "smoke: checking the assembled compose file"
   assert_line "$ASSEMBLED_COMPOSE" 'path: compose/lldap.yaml' 'The assembled compose file lacks the lldap fragment.'
+}
+
+# Check the vhost descriptor for the LiteFS primary upstream.
+# The descriptor holds no secret value.
+check_vhost_descriptor() {
+  echo "smoke: checking the vhost descriptor"
+  if [ ! -f "$VHOST_DESCRIPTOR" ]; then
+    smoke_error "The vhost descriptor is missing. Expected: $VHOST_DESCRIPTOR"
+  fi
+  assert_match "$VHOST_DESCRIPTOR" '"name"[[:space:]]*:[[:space:]]*"lldap"' 'The vhost descriptor does not name lldap.'
+  assert_match "$VHOST_DESCRIPTOR" '"mode"[[:space:]]*:[[:space:]]*"litefs"' 'The vhost descriptor mode is not litefs.'
+  assert_match "$VHOST_DESCRIPTOR" '"upstream"[[:space:]]*:[[:space:]]*"http://lldap:17170"' 'The vhost descriptor upstream is not http://lldap:17170.'
+  assert_match "$VHOST_DESCRIPTOR" '"redirect_paths"[[:space:]]*:[[:space:]]*"\[\]"' 'The vhost descriptor redirect_paths is not empty.'
+  if grep -Eqi -- '(secret|password|passwd|token|passphrase|credential|private[ _-]?key|api[ _-]?key)' "$VHOST_DESCRIPTOR"; then
+    smoke_error "The vhost descriptor holds a secret value."
+  fi
 }
 
 # Print the checksum lines of the wizard secret files.
@@ -160,6 +188,7 @@ check_wizard_token_hint() {
 check_compose_fragment
 check_entrypoint_modes
 check_assembled_compose
+check_vhost_descriptor
 check_wizard_idempotence
 check_wizard_token_hint
 

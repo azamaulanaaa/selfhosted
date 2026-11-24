@@ -273,6 +273,27 @@ The OIDC client secret files have the client name as the file name. They
 live in `config/tinyauth/secrets/oidc/`. Each file is a shared secret with
 mode 600.
 
+### Vaultwarden paths
+
+Vaultwarden is single-node. The shared file is the OIDC client secret. The
+SQLite data directory is node-local. Do not copy it to a second node, and do
+not start two nodes on one SQLite file.
+
+<!-- markdownlint-disable MD013 -->
+| Path                                             | Mode | Scope      | When | Purpose                                    |
+| ------------------------------------------------ | ---- | ---------- | ---- | ------------------------------------------ |
+| `config/vaultwarden/vaultwarden.env`             | 600  | node-local | both | Wizard answers and secret file paths.      |
+| `config/vaultwarden/secrets`                     | 700  | shared     | both | Vaultwarden secret directory.              |
+| `config/vaultwarden/secrets/oidc-client-secret`  | 600  | shared     | both | OIDC client secret.                        |
+| `config/vaultwarden/secrets/admin_token`         | 600  | shared     | both | Optional admin token.                      |
+| `config/vaultwarden/secrets/smtp_password`       | 600  | shared     | both | Optional SMTP password.                    |
+| `data/vaultwarden/store`                         | 700  | node-local | both | SQLite database and signing keys.          |
+<!-- markdownlint-enable MD013 -->
+
+The OIDC client secret must match the Tinyauth client on every node. A
+shared secret does not make the database safe to share. The data store holds
+the SQLite database and the signing keys. Keep it on the node that made it.
+
 ## How to run the checker
 
 The checker needs the repository and the node directories. It reads

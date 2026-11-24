@@ -187,49 +187,44 @@ check_rootless_entrypoint() {
   fi
 }
 
-# Check that the init command is one line and keeps the rootless branch.
-check_rootless_init_command() {
+# Check that the data init script exists, is executable, and keeps the rootless branch.
+check_data_init_script() {
+  local script="state/consul/data-init.sh"
+  [ -f "$script" ] || fail "$script is missing."
+  [ -x "$script" ] || fail "$script is not executable."
+  grep -q 'mkdir -p /consul/data' "$script" ||
+    fail "$script does not create /consul/data."
+  grep -q 'STACK_ROOTLESS' "$script" ||
+    fail "$script does not read STACK_ROOTLESS."
+  if ! awk '
+    /STACK_ROOTLESS/ { rootless = 1 }
+    /^[[:space:]]*if / { in_if = 1 }
+    /^[[:space:]]*else/ { in_else = 1 }
+    in_if && !in_else && /chmod 0700 \/consul\/data/ { chmod_rootless = 1 }
+    in_else && /chown 100:1000 \/consul\/data/ { chown_rootful = 1 }
+    in_else && /chmod 0700 \/consul\/data/ { chmod_rootful = 1 }
+    END { exit !(rootless && chmod_rootless && chown_rootful && chmod_rootful) }
+  ' "$script"; then
+    fail "$script does not keep the rootless branch."
+  fi
+}
+
+# Check that compose runs the data init from the mounted script.
+check_data_init_mount() {
   local fragment="$REPO_ROOT/compose/consul.yaml"
-  local command_line continuation_count chmod_count chown_count
-  grep -q 'STACK_ROOTLESS' "$fragment" ||
-    fail "compose/consul.yaml does not read STACK_ROOTLESS."
-  command_line="$(awk '
-    /^  consul-data-init:[[:space:]]*$/ { in_init = 1; next }
-    in_init && /^[[:space:]]*command:/ {
-      sub(/^[[:space:]]*command:[[:space:]]*/, "")
-      print
-      exit
-    }
-  ' "$fragment")"
-  [ -n "$command_line" ] || fail "compose/consul.yaml has no init command."
-  case "$command_line" in
-  "|" | ">" | "|-" | ">-")
-    fail "The init command is a block scalar. Use one line."
-    ;;
-  esac
-  printf '%s\n' "$command_line" | grep -q 'mkdir -p /consul/data' ||
-    fail "The init command does not create /consul/data on every path."
-  printf '%s\n' "$command_line" | grep -q 'STACK_ROOTLESS' ||
-    fail "The init command does not use the rootless branch."
-  printf '%s\n' "$command_line" | grep -q 'then chmod 0700 /consul/data' ||
-    fail "The init command does not set mode 0700 on the rootless path."
-  printf '%s\n' "$command_line" | grep -q 'else chown 100:1000 /consul/data' ||
-    fail "The init command does not keep the rootful chown in the else branch."
-  chmod_count="$(printf '%s\n' "$command_line" | grep -o 'chmod 0700 /consul/data' | wc -l | tr -d '[:space:]')"
-  [ "$chmod_count" -eq 2 ] ||
-    fail "The init command does not set mode 0700 on both paths."
-  chown_count="$(printf '%s\n' "$command_line" | grep -o 'chown 100:1000 /consul/data' | wc -l | tr -d '[:space:]')"
-  [ "$chown_count" -eq 1 ] ||
-    fail "The init command does not keep one rootful chown."
-  continuation_count="$(awk '
-    /^  consul-data-init:[[:space:]]*$/ { in_init = 1; next }
-    in_init && /^[[:space:]]*command:/ { in_command = 1; count = 0; next }
-    in_command && /^[[:space:]]*entrypoint:/ { print count; done = 1; exit }
-    in_command { count++ }
-    END { if (!done) print count }
-  ' "$fragment")"
-  [ "$continuation_count" = "0" ] ||
-    fail "The init command uses $continuation_count continuation lines. Use one line."
+  grep -q 'state/consul/data-init.sh:/data-init.sh:ro' "$fragment" ||
+    fail "compose/consul.yaml does not mount the data init script."
+  grep -qE '^[[:space:]]*entrypoint:[[:space:]]*\["/bin/sh"\]' "$fragment" ||
+    fail "compose/consul.yaml does not use /bin/sh as the init entrypoint."
+  grep -qE '^[[:space:]]*command:[[:space:]]*\["/data-init.sh"\]' "$fragment" ||
+    fail "compose/consul.yaml does not run /data-init.sh."
+  grep -qF -- "- STACK_ROOTLESS=\${STACK_ROOTLESS:-0}" "$fragment" ||
+    fail "compose/consul.yaml does not pass STACK_ROOTLESS."
+  grep -qE '^[[:space:]]*user:[[:space:]]*"0:0"' "$fragment" ||
+    fail "compose/consul.yaml does not run the init as root."
+  if grep -q 'mkdir -p /consul/data' "$fragment"; then
+    fail "compose/consul.yaml holds an inline init command."
+  fi
 }
 
 # Check that grant_read_access has the rootless branch.
@@ -331,7 +326,8 @@ main() {
   check_rootless_run "$rootless_env_tree"
 
   check_rootless_entrypoint
-  check_rootless_init_command
+  check_data_init_script
+  check_data_init_mount
   check_grant_read_access_rootless
   check_bootstrap_mount
   check_vhost_descriptor

@@ -469,6 +469,25 @@ check_litefs_consul_token() {
   fi
 }
 
+# Check that the LiteFS policy allows the hostname-based session name.
+# LiteFS creates a Consul session named after the hostname, not "litefs".
+check_litefs_policy_rules() {
+  local entrypoint="$REPO_ROOT/state/tinyauth/entrypoint.sh"
+  local rules
+
+  rules="$(grep -F 'POLICY_RULES_JSON=' "$entrypoint" || true)"
+  if printf '%s\n' "$rules" | grep -qF 'session_prefix \"\"'; then
+    pass 'litefs policy uses session_prefix'
+  else
+    fail 'litefs policy uses session_prefix' 'the policy rules do not use session_prefix'
+  fi
+  if printf '%s\n' "$rules" | grep -qF 'session \"litefs\"'; then
+    fail 'litefs policy no longer names the litefs session' 'the policy rules still name the litefs session'
+  else
+    pass 'litefs policy no longer names the litefs session'
+  fi
+}
+
 # Check the Caddy vhost descriptor. The descriptor sends writes to the LiteFS
 # primary. The file holds no secret values.
 check_vhost_descriptor() {
@@ -668,6 +687,7 @@ check_standalone_entrypoint
 check_integrated_entrypoint
 check_remote_token_selection
 check_litefs_consul_token
+check_litefs_policy_rules
 
 printf 'smoke checks: %d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then

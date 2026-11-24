@@ -55,8 +55,9 @@ readonly integrated
 
 readonly TOKEN_FILE="${TINYAUTH_SECRETS_DIR}/litefs-token"
 readonly POLICY_NAME="tinyauth-litefs"
-# The rules grant write access to the lease key and to the session.
-readonly POLICY_RULES_JSON='key \"tinyauth/litefs\" { policy = \"write\" } session \"litefs\" { policy = \"write\" }'
+# The rules grant write access to the lease key and to every session name.
+# LiteFS names its Consul session after the hostname.
+readonly POLICY_RULES_JSON='key \"tinyauth/litefs\" { policy = \"write\" } session_prefix \"\" { policy = \"write\" }'
 
 # The base image creates the tinyauth user with uid 1000 and gid 1000.
 # The base image keeps the binary in /tinyauth. It does not set USER, so the
@@ -119,7 +120,8 @@ is_token_chars() {
 }
 
 # Create or reuse the consul policy and token for the LiteFS lease.
-# The policy grants write access to the lease key and to the session.
+# The policy grants write access to the lease key and to every session name.
+# LiteFS names its session after the hostname, so the token needs a prefix.
 # The function prints the token on stdout.
 # Return 1 with a message on stderr when any step fails.
 create_litefs_token() {

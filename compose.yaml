@@ -19,3 +19,6 @@ include:
   - path: compose/tinyauth.yaml
     project_directory: .
     env_file: .env
+  - path: compose/vaultwarden.yaml
+    project_directory: .
+    env_file: .env

@@ -67,6 +67,8 @@ check_compose_fragment() {
   assert_line "$COMPOSE_FRAGMENT" './data/lldap/store/db:/data:rw' 'The compose fragment lacks the database mount.'
   assert_line "$COMPOSE_FRAGMENT" './data/lldap/store/litefs:/var/lib/litefs:rw' 'The compose fragment lacks the LiteFS data mount.'
   assert_line "$COMPOSE_FRAGMENT" './config/consul/secrets:/etc/consul/secrets:ro' 'The compose fragment lacks the Consul secrets mount.'
+  assert_line "$COMPOSE_FRAGMENT" 'UID=${STACK_UID:-1000}' 'The compose fragment lacks the UID value.'
+  assert_line "$COMPOSE_FRAGMENT" 'GID=${STACK_GID:-1000}' 'The compose fragment lacks the GID value.'
   assert_no_line "$COMPOSE_FRAGMENT" 'CONSUL_HTTP_ADDR' 'The compose fragment still holds the old Consul address key.'
 }
 

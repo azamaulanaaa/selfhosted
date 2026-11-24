@@ -123,15 +123,17 @@ mandatory. A service wizard never asks about Consul.
 The root wizard uses this order:
 
 1. Create `.env` when it is missing.
-2. Regenerate `compose.yaml` with `scripts/compose-assemble.sh`.
-3. Resolve `CONSUL_ADDR`.
-4. Remote: resolve and write the remote token. Local: ask for the peers,
+2. Resolve the container runtime identity.
+3. Regenerate `compose.yaml` with `scripts/compose-assemble.sh`.
+4. Resolve `CONSUL_ADDR`.
+5. Remote: resolve and write the remote token. Local: ask for the peers,
     then ask for `bootstrap_expect`.
-5. Run the service enable loop for the other services.
-6. When `caddy` is enabled, assemble the vhost registry.
-7. Resolve `PUBLIC_IP`.
-8. Write `.env`.
-9. Run each enabled service wizard in sorted order.
+6. Run the service enable loop for the other services.
+7. When `caddy` is enabled, assemble the vhost registry.
+8. Resolve `PUBLIC_IP`.
+9. Write `.env`.
+10. Run each enabled service wizard in sorted order.
+11. Generate the Compose environment override.
 
 `CONSUL_ADDR` decides Consul. The service enable loop asks only the other
 services.
@@ -225,7 +227,47 @@ reference each other. All cross-service references work through the
 shared Docker network.
 
 The root wizard prints the `docker compose up -d` command for the enabled
-services. In remote mode, that command does not include `consul`.
+services. In rootless mode, it prints the `nerdctl compose` form instead.
+See [Rootless container runtime](#rootless-container-runtime). In remote
+mode, that command does not include `consul`.
+
+## Rootless container runtime
+
+Rootless nerdctl maps container user 0 to the unprivileged host user.
+A file that the host user owns is readable by container root. A file
+that container uid 1000 owns may not be readable by the host user.
+
+Three shared keys select the mode. `.env.example` lists them:
+
+- `STACK_ROOTLESS`: `1` selects rootless nerdctl. `0` selects rootful
+  Docker.
+- `STACK_UID`: the container user id. Use `0` for rootless nerdctl.
+- `STACK_GID`: the container group id. Use `0` for rootless nerdctl.
+
+The default values are `0`, `1000`, and `1000`. The root wizard reads
+each value from the process environment first, then from the root `.env`
+file. It validates the values and exports them to every service wizard.
+
+In rootless mode, the setup does not chown files to uid 1000. The host
+user owns the files under `config/` and `data/`. Container root reads
+them. Each service runs as container root (`0:0`), not as uid 1000.
+Caddy and Consul already run as `0:0`.
+
+nerdctl compose version 2.4.2 ignores `env_file`. After the service
+wizards finish, the root wizard runs `scripts/compose-env.sh`. The script
+reads `config/<service>/<service>.env` and writes
+`config/compose.env.yaml` with mode 600. The file is a Compose override.
+`config/` is gitignored, so the override is not committed.
+
+Start the stack with both files:
+
+```text
+nerdctl compose -f compose.yaml -f config/compose.env.yaml up -d <services>
+```
+
+Rootful Docker keeps the current behavior. It reads `env_file` from the
+compose fragments. The root wizard prints the `docker compose up -d`
+command.
 
 ## Consul control plane
 
@@ -301,6 +343,9 @@ These values come from the environment:
 - `CONSUL_HTTP_TOKEN`
 - `SETUP_SERVICES`
 - `PUBLIC_IP`
+- `STACK_ROOTLESS`
+- `STACK_UID`
+- `STACK_GID`
 
 When `CONSUL_ADDR` is absent and stdin is not a TTY, the root wizard uses
 `http://consul:8500` (local). The root wizard does not prompt when stdin

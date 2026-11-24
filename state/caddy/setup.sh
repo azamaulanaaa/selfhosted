@@ -9,6 +9,13 @@
 # from state/caddy/Caddyfile.tpl and caddy reloads on change
 # (caddy run --watch). There is no sidecar service.
 #
+# The root setup.sh assembles the vhost registry from the enabled
+# state/<service>/vhost.json descriptors into config/caddy/vhosts.json and
+# config/caddy/vhosts.txt. Caddy renders one vhost per descriptor. This
+# wizard reads the TLS certificate vhost list from config/caddy/vhosts.txt.
+# When the registry is empty, the wizard and the template use the fallback
+# list: consul lldap tinyauth forgejo vaultwarden.
+#
 # The wizard never writes a consul token. The entrypoint reads the token
 # from config/consul/secrets at container start: agent.hcl in local mode,
 # remote-token in remote mode. The local address is http://consul:8500.
@@ -50,6 +57,10 @@
 #                                                              config/caddy/certs/<vhost>
 #                           When unset, the existing certs under config/caddy/certs are
 #                           kept; when nothing is present, the run fails.
+#
+# The wizard creates config/caddy/vhosts.json with [] and an empty
+# config/caddy/vhosts.txt when the files are missing. It never overwrites an
+# existing registry. The root setup.sh writes the registry.
 #
 # The rendered vhost label is computed at render time by consul-template.
 # STACK_DOMAIN is not a secret; compose passes it to the caddy container as an
@@ -96,17 +107,28 @@ read_capability_flag() {
   esac
 }
 
-# Print one vhost name per discovered service. Each service with a web UI
-# ships a compose fragment. The caddy fragment is the proxy, not a vhost.
-discover_vhosts() {
-  local fragment service
-  for fragment in compose/*.yaml; do
-    [ -f "$fragment" ] || continue
-    service="$(basename -- "$fragment" .yaml)"
-    if [ "$service" != "caddy" ]; then
-      printf '%s\n' "$service"
-    fi
-  done
+# Print the vhost names from the registry, one per line.
+# Trim the surrounding whitespace. Skip blank lines.
+read_vhost_names() {
+  local file="config/caddy/vhosts.txt"
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' "$file" | grep -v '^$' || true
+}
+
+# Create the registry files when they are missing. Never overwrite them.
+# The JSON file starts as an empty array. The names file starts empty.
+ensure_vhost_registry() {
+  mkdir -p config/caddy
+  if [ ! -e config/caddy/vhosts.json ]; then
+    printf '[]\n' >config/caddy/vhosts.json
+    chmod 0640 config/caddy/vhosts.json
+  fi
+  if [ ! -e config/caddy/vhosts.txt ]; then
+    : >config/caddy/vhosts.txt
+    chmod 0640 config/caddy/vhosts.txt
+  fi
 }
 
 # Resolve the default stack domain. Set stack_domain and stack_domain_source.
@@ -483,10 +505,13 @@ else
   esac
 fi
 
-# Build the vhost list from the compose fragments. Keep a safe fallback for
-# standalone checkouts that hold only the caddy fragment.
-discovered_vhosts="$(discover_vhosts | tr '\n' ' ')"
-TLS_VHOSTS="${discovered_vhosts% }"
+# Build the vhost list from the registry. The root wizard writes
+# config/caddy/vhosts.txt from the enabled state/<service>/vhost.json files.
+# Create the registry files when they are missing. A standalone checkout with
+# no registry uses the fallback list.
+ensure_vhost_registry
+registered_vhosts="$(read_vhost_names | tr '\n' ' ')"
+TLS_VHOSTS="${registered_vhosts% }"
 if [ -z "$TLS_VHOSTS" ]; then
   TLS_VHOSTS="consul lldap tinyauth forgejo vaultwarden"
 fi
@@ -631,7 +656,8 @@ if [ "$tls_mode" = "existing" ]; then
             fi
           done
           if [ "$vhost_ok" -eq 0 ]; then
-            echo "error: CADDY_TLS_CERTS contains the unknown vhost '$vhost'. Use $TLS_VHOSTS_LIST." >&2
+            echo "error: The vhost '$vhost' is not in the registry." >&2
+            echo "error: Use one of these vhosts: $TLS_VHOSTS_LIST." >&2
             exit 1
           fi
           if [ -z "$fc_path" ] || [ -z "$key_path" ] || [ "$fc_path" = "$pair_rest" ] || [ ! -r "$fc_path" ] || [ ! -r "$key_path" ]; then
@@ -725,7 +751,14 @@ else
   echo "note: the entrypoint reads the ACL token from config/consul/secrets/remote-token."
 fi
 echo "note: mount config/consul/secrets into the caddy container before you start it."
-echo "caddy vhosts: https://consul.$stack_domain (all consul nodes, :8500), https://lldap.$stack_domain, https://tinyauth.$stack_domain, https://forgejo.$stack_domain, https://vaultwarden.$stack_domain"
+caddy_vhost_urls=""
+for vhost in $TLS_VHOSTS; do
+  if [ -n "$caddy_vhost_urls" ]; then
+    caddy_vhost_urls+=", "
+  fi
+  caddy_vhost_urls+="https://$vhost.$stack_domain"
+done
+echo "caddy vhosts: $caddy_vhost_urls"
 case "$tls_mode" in
 internal)
   echo "TLS mode: internal. caddy issues certificates from its internal CA."

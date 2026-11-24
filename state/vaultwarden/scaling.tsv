@@ -1,0 +1,7 @@
+# Vaultwarden scaling files. The columns are path, mode, scope, when, presence, purpose.
+config/vaultwarden/vaultwarden.env	600	node-local	both	required	Wizard answers and secret file paths. The wizard creates it on each node.
+config/vaultwarden/secrets/oidc-client-secret	600	shared	both	required	OIDC client secret. It must match the Tinyauth client on every node.
+config/vaultwarden/secrets/admin_token	600	shared	both	optional	Optional admin token. The wizard writes it when VAULTWARDEN_ADMIN_TOKEN is set.
+config/vaultwarden/secrets/smtp_password	600	shared	both	optional	Optional SMTP password. The wizard writes it when VAULTWARDEN_SMTP_PASSWORD is set.
+config/vaultwarden/secrets	700	shared	both	required	Vaultwarden secret directory.
+data/vaultwarden/store	700	node-local	both	required	SQLite database and signing keys. Single-node only. Do not copy.

@@ -19,6 +19,9 @@
 #   STACK_DOMAIN      Stack domain. The HTTP URL becomes http://lldap.<domain>.
 #                     Read from the environment, then from the root .env, then
 #                     from the built-in default (sh.lan).
+#   STACK_ROOTLESS    1 selects rootless nerdctl. The wizard never calls chown.
+#                     Read from the environment, then from the root .env, then
+#                     from the built-in default (0).
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -44,6 +47,7 @@ readonly DB_PATH="sqlite:///data/lldap.sqlite?mode=rwc"
 readonly DEFAULT_BASE_DN="dc=sh,dc=lan"
 readonly DEFAULT_ADMIN_USER="admin"
 readonly DEFAULT_STACK_DOMAIN="sh.lan"
+readonly DEFAULT_STACK_ROOTLESS="0"
 
 # Return 0 when the argument is a valid LDAP base DN.
 # The value is a comma-separated list of components. Each component is
@@ -76,6 +80,16 @@ read_env_consul_addr() {
     return 0
   fi
   { grep -E '^CONSUL_ADDR=' .env || true; } | tail -n1 | cut -d= -f2- |
+    sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\\1/" -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
+}
+
+# Print the STACK_ROOTLESS value from the root .env file. Print nothing when
+# the file or the line is missing.
+read_env_stack_rootless() {
+  if [ ! -f .env ]; then
+    return 0
+  fi
+  { grep -E '^STACK_ROOTLESS=' .env || true; } | tail -n1 | cut -d= -f2- |
     sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\\1/" -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
 }
 
@@ -135,6 +149,48 @@ stack_domain_invalid() {
 # Letters, digits, dots, and hyphens. At least one character.
 is_valid_stack_domain() {
   [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,252})$ ]]
+}
+
+# Return 0 when the argument selects rootless mode or rootful mode.
+is_valid_stack_rootless() {
+  [ "$1" = "0" ] || [ "$1" = "1" ]
+}
+
+# Resolve the rootless flag. Set stack_rootless and stack_rootless_source.
+# The order is: STACK_ROOTLESS from the environment, then the root .env, then
+# the built-in default. The compose file uses the same default.
+# The wizard never calls chown. In rootless mode the host user owns config/.
+# Container root reads those files.
+resolve_stack_rootless() {
+  if [ -n "${STACK_ROOTLESS:-}" ]; then
+    stack_rootless="$STACK_ROOTLESS"
+    stack_rootless_source="env"
+    return 0
+  fi
+  local candidate
+  candidate="$(read_env_stack_rootless)"
+  if [ -n "$candidate" ]; then
+    stack_rootless="$candidate"
+    stack_rootless_source="envfile"
+    return 0
+  fi
+  stack_rootless="$DEFAULT_STACK_ROOTLESS"
+  stack_rootless_source="default"
+}
+
+# Print an STE error for an invalid STACK_ROOTLESS value and exit 1.
+stack_rootless_invalid() {
+  echo "error: '$stack_rootless' is not a valid STACK_ROOTLESS value. Use 0 or 1." >&2
+  case "$stack_rootless_source" in
+  env)
+    echo "error: STACK_ROOTLESS came from the environment." >&2
+    ;;
+  envfile)
+    echo "error: The root .env holds the invalid STACK_ROOTLESS." >&2
+    echo "error: Fix .env by hand or set STACK_ROOTLESS." >&2
+    ;;
+  esac
+  exit 1
 }
 
 # Print the contents of one secret file.
@@ -314,13 +370,20 @@ if ! command -v openssl >/dev/null 2>&1; then
   exit 1
 fi
 
-# Step 2: resolve the stack domain before anything is written.
+# Step 2: resolve the stack domain and the rootless flag before anything is
+# written.
 resolve_stack_domain
 if ! is_valid_stack_domain "$stack_domain"; then
   stack_domain_invalid
 fi
 readonly STACK_DOMAIN_RESOLVED="$stack_domain"
 readonly HTTP_URL="http://lldap.${STACK_DOMAIN_RESOLVED}"
+
+resolve_stack_rootless
+if ! is_valid_stack_rootless "$stack_rootless"; then
+  stack_rootless_invalid
+fi
+readonly STACK_ROOTLESS_RESOLVED="$stack_rootless"
 
 # Step 3: collect the answers. Use the environment when stdin is not a TTY.
 # Nothing is written before every answer has been validated.
@@ -455,5 +518,10 @@ echo "hint: Only the litefs primary can write the database."
 echo "hint: LLDAP reads its secrets from files in $SECRETS_DIR. Back that directory up."
 echo "hint: The entrypoint reads the Consul token from $(consul_token_path)."
 echo "hint: LLDAP must run on the elected primary when LiteFS is enabled."
-echo "Next step: docker compose up -d lldap"
+if [ "$STACK_ROOTLESS_RESOLVED" = "1" ]; then
+  echo "hint: Rootless mode. The host user owns config/lldap. The wizard does not call chown."
+  echo "Next step: nerdctl compose -f compose.yaml -f config/compose.env.yaml up -d lldap"
+else
+  echo "Next step: docker compose up -d lldap"
+fi
 echo "Next step: open $HTTP_URL (needs the caddy service)"

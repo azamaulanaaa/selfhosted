@@ -92,12 +92,18 @@ run_wizard() {
 }
 
 # Render the entrypoint config with the given Consul address and flags.
-# No process starts.
+# No process starts. The optional exec uid and gid override EXEC_UID and
+# EXEC_GID. An empty value keeps the entrypoint default.
 render_entrypoint() {
   local consul_addr="$1" litefs="$2" oidc="$3" tls="$4"
+  local exec_uid="${5:-}" exec_gid="${6:-}"
   mkdir -p "$scratch/run" "$scratch/data/mount" "$scratch/data/store"
   (
     cd "$scratch"
+    if [ -n "$exec_uid" ]; then
+      export EXEC_UID="$exec_uid"
+      export EXEC_GID="$exec_gid"
+    fi
     TINYAUTH_SECRETS_DIR="$scratch/secrets" \
       CONSUL_SECRETS_DIR="$scratch/config/consul/secrets" \
       LITEFS_YML="$scratch/run/litefs.yml" \
@@ -427,6 +433,96 @@ check_vhost_descriptor() {
   fi
 }
 
+# Check that the entrypoint takes the run identity from the environment.
+# Rootless nerdctl sets both values to 0.
+check_entrypoint_exec_identity() {
+  local litefs="$scratch/run/litefs.yml"
+
+  render_entrypoint 'http://consul:8500' 1 0 0 0 0
+  if grep -qx 'exec: "gosu 0:0 /tinyauth/tinyauth"' "$litefs"; then
+    pass 'entrypoint takes EXEC_UID and EXEC_GID from the environment'
+  else
+    fail 'entrypoint takes EXEC_UID and EXEC_GID from the environment' 'the exec line is not gosu 0:0'
+  fi
+}
+
+# Check that the compose fragment passes the stack identity to the app.
+check_compose_exec_identity() {
+  local fragment="$REPO_ROOT/compose/tinyauth.yaml"
+
+  # The grep pattern is literal script text, not a shell variable.
+  # shellcheck disable=SC2016
+  if grep -qF 'EXEC_UID=${STACK_UID:-1000}' "$fragment"; then
+    pass 'compose fragment passes STACK_UID to EXEC_UID'
+  else
+    fail 'compose fragment passes STACK_UID to EXEC_UID' 'the EXEC_UID line is missing'
+  fi
+  # shellcheck disable=SC2016
+  if grep -qF 'EXEC_GID=${STACK_GID:-1000}' "$fragment"; then
+    pass 'compose fragment passes STACK_GID to EXEC_GID'
+  else
+    fail 'compose fragment passes STACK_GID to EXEC_GID' 'the EXEC_GID line is missing'
+  fi
+}
+
+# Run the wizard with a fake chown that records each call.
+# The fake chown returns success and changes no real file owner.
+run_wizard_with_identity() {
+  local rootless="$1" uid="$2" gid="$3" log="$4"
+  local observer_pass
+  observer_pass="$(openssl rand -hex 8)"
+  : >"$scratch/chown.calls"
+  (
+    cd "$scratch"
+    CHOWN_LOG="$scratch/chown.calls" \
+      PATH="$scratch/fake-chown-bin:$PATH" \
+      STACK_ROOTLESS="$rootless" \
+      STACK_UID="$uid" \
+      STACK_GID="$gid" \
+      CONSUL_ADDR='https://consul.remote.example:8500' \
+      TINYAUTH_LDAP_LOCAL=yes \
+      TINYAUTH_LDAP_BASEDN='dc=sh,dc=lan' \
+      TINYAUTH_CLIENTS='demo:https://demo.sh.lan/callback' \
+      TINYAUTH_OBSERVER_AUTO=no \
+      TINYAUTH_LDAP_BINDPASSWORD="$observer_pass" \
+      bash "$scratch/state/tinyauth/setup.sh"
+  ) >"$log" 2>&1
+}
+
+# Check that the wizard skips the OIDC key chown in rootless mode and uses the
+# stack identity in rootful mode.
+check_rootless_wizard_ownership() {
+  local fake_bin="$scratch/fake-chown-bin"
+  local calls="$scratch/chown.calls"
+
+  mkdir -p "$fake_bin"
+  cat >"$fake_bin/chown" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${CHOWN_LOG:?}"
+EOF
+  chmod +x "$fake_bin/chown"
+
+  if ! run_wizard_with_identity 1 0 0 "$scratch/wizard-rootless.log"; then
+    fail 'rootless wizard runs' 'the wizard exited with an error'
+    return 0
+  fi
+  if [ -s "$calls" ]; then
+    fail 'rootless wizard skips the OIDC key chown' 'the wizard called chown'
+  else
+    pass 'rootless wizard skips the OIDC key chown'
+  fi
+
+  if ! run_wizard_with_identity 0 1234 1235 "$scratch/wizard-rootful.log"; then
+    fail 'rootful wizard runs' 'the wizard exited with an error'
+    return 0
+  fi
+  if grep -qF '1234:1235' "$calls"; then
+    pass 'rootful wizard chowns the OIDC keys to STACK_UID:STACK_GID'
+  else
+    fail 'rootful wizard chowns the OIDC keys to STACK_UID:STACK_GID' 'the chown target is wrong'
+  fi
+}
+
 # Check the engine diagnostic and the engine selection in the wizard.
 check_engine_selection() {
   local fake_bin="$scratch/fake-bin"
@@ -472,8 +568,11 @@ setup_tree
 check_vhost_descriptor
 check_consul_flag_removed
 check_engine_selection
+check_entrypoint_exec_identity
+check_compose_exec_identity
 check_wizard_idempotence
 check_oidc_key_modes
+check_rootless_wizard_ownership
 check_standalone_wizard
 check_integrated_wizard
 check_local_consul_litefs_off

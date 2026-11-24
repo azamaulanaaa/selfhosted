@@ -50,7 +50,9 @@ readonly RUNTIME_TOKEN_FILE="${RENDER_DIR}/consul-token"
 readonly POLICY_NAME="forgejo-litefs"
 # The rules grant write access to the lease key, the peer keys, and the
 # sessions. The peer keys hold the advertise URLs that the hook reads.
-readonly POLICY_RULES_JSON='key \"forgejo/litefs\" { policy = \"write\" } key \"forgejo/peers/\" { policy = \"write\" } session \"litefs\" { policy = \"write\" } session \"forgejo-peers\" { policy = \"write\" }'
+# LiteFS names its session after the hostname, so the session rule uses a
+# prefix and not one fixed name.
+readonly POLICY_RULES_JSON='key \"forgejo/litefs\" { policy = \"write\" } key \"forgejo/peers/\" { policy = \"write\" } session_prefix \"\" { policy = \"write\" } session \"forgejo-peers\" { policy = \"write\" }'
 
 # Forgejo runs as uid 1000 and gid 1000 in the pinned base image.
 # Rootless nerdctl sets both values to 0. Container root maps to the host user,

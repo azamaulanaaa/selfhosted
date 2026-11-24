@@ -57,8 +57,9 @@ fi
 readonly litefs_mode
 
 readonly POLICY_NAME="lldap-litefs"
-# The rules grant write access to the lease key and to the session.
-readonly POLICY_RULES_JSON='key \"lldap/litefs\" { policy = \"write\" } session \"litefs\" { policy = \"write\" }'
+# The rules grant write access to the lease key and to any Consul session.
+# The LiteFS lease names its session after the hostname, which is "lldap".
+readonly POLICY_RULES_JSON='key \"lldap/litefs\" { policy = \"write\" } session_prefix \"\" { policy = \"write\" }'
 
 # The base image exports UID and GID as the lldap runtime ids.
 # Rootless nerdctl uses UID=0 and GID=0. Container root maps to the host user,
@@ -112,7 +113,7 @@ is_token_chars() {
 }
 
 # Create or reuse the Consul policy and token for the LiteFS lease.
-# The policy grants write access to the lease key and to the session.
+# The policy grants write access to the lease key and to any Consul session.
 # The function prints the token on stdout.
 # Return 1 with a message on stderr when any step fails.
 create_litefs_token() {

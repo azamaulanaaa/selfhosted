@@ -5,6 +5,7 @@
 #
 # Usage:
 #   setup.sh tinyauth                          Run the Tinyauth wizard.
+#   setup.sh tinyauth engine                   Print the selected container engine.
 #   setup.sh tinyauth clean [--data] [--yes]   Remove the tinyauth configuration.
 #                                              With --data also remove the tinyauth data.
 #                                              Ask for confirmation unless --yes is given.
@@ -20,6 +21,9 @@
 # to create the observer. The entrypoint reads it at container start.
 #
 # Non-interactive environment variables:
+#   CONTAINER_ENGINE        Container engine for the observer password step.
+#                           Default: docker, then nerdctl, then
+#                           $HOME/.local/bin/nerdctl.
 #   CONSUL_ADDR             Consul address. Read from the environment, then the root
 #                           .env, then http://consul:8500. The value http://consul:8500
 #                           selects local Consul. Any other value selects remote Consul.
@@ -32,7 +36,7 @@
 #                           the default is derived from STACK_DOMAIN.
 #   TINYAUTH_OBSERVER_AUTO  yes to create the observer in LLDAP automatically. Default: yes.
 #                           Falls back to manual instructions when the local admin
-#                           password, the API, or docker is not available.
+#                           password, the API, or a container engine is not available.
 #   TINYAUTH_LDAP_BINDDN    Observer bind DN for manual mode.
 #   TINYAUTH_LDAP_BINDPASSWORD  Observer bind password for manual mode.
 #   LLDAP_HTTP_URL          LLDAP HTTP base URL for the GraphQL API.
@@ -409,13 +413,38 @@ graphql_ok() {
   return 0
 }
 
+# Print the container engine to use. Return 1 when none is available.
+# CONTAINER_ENGINE wins. Then try docker, then nerdctl on PATH.
+# Last, try the nerdctl binary in the user local bin directory.
+container_engine() {
+  if [ -n "${CONTAINER_ENGINE:-}" ]; then
+    printf '%s\n' "$CONTAINER_ENGINE"
+    return 0
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    printf 'docker\n'
+    return 0
+  fi
+  if command -v nerdctl >/dev/null 2>&1; then
+    printf 'nerdctl\n'
+    return 0
+  fi
+  local home="${HOME:-}"
+  if [ -n "$home" ] && [ -x "$home/.local/bin/nerdctl" ]; then
+    printf '%s\n' "$home/.local/bin/nerdctl"
+    return 0
+  fi
+  return 1
+}
+
 # Create the observer in LLDAP through the GraphQL API and set its password.
 # Return 1 when any step fails. The caller then uses the manual path.
 auto_create_observer() {
   local admin_user="$1" admin_pass="$2" base_dn="$3"
   command -v curl >/dev/null 2>&1 || return 1
   command -v python3 >/dev/null 2>&1 || return 1
-  command -v docker >/dev/null 2>&1 || return 1
+  local engine
+  engine="$(container_engine)" || return 1
   [ -n "$admin_pass" ] || return 1
 
   local token login_response observer_email group_id body response
@@ -457,10 +486,10 @@ except Exception:
 
   # The upstream helper sets the password through the OPAQUE endpoints.
   # It lives in the LLDAP image. Pass the value through the environment so
-  # it does not appear in the docker command line.
+  # the container engine command line does not show it.
   if ! (
     export LLDAP_USER_PASSWORD="$observer_password"
-    docker compose exec -T -e LLDAP_USER_PASSWORD \
+    "$engine" compose exec -T -e LLDAP_USER_PASSWORD \
       lldap /app/lldap_set_password \
       --base-url http://127.0.0.1:17170 \
       --token "$token" \
@@ -491,6 +520,22 @@ is_managed_key() {
   *) return 1 ;;
   esac
 }
+
+# The engine subcommand prints the selected container engine.
+if [ "${1:-}" = "engine" ]; then
+  shift
+  if [ "$#" -ne 0 ]; then
+    echo "error: The engine subcommand takes no arguments." >&2
+    exit 2
+  fi
+  if ! engine="$(container_engine)"; then
+    echo "error: No container engine found." >&2
+    echo "error: Install docker or nerdctl, or set CONTAINER_ENGINE." >&2
+    exit 1
+  fi
+  printf '%s\n' "$engine"
+  exit 0
+fi
 
 # The clean subcommand removes the tinyauth configuration and data.
 if [ "${1:-}" = "clean" ]; then
@@ -939,5 +984,6 @@ else
   echo "hint: Consul is still required. The app does not use Consul without LiteFS."
 fi
 echo "hint: the OIDC key files live in the backed-up secrets tree at $OIDC_SECRETS_DIR (mounted at /etc/tinyauth/secrets/oidc)."
-echo "Next step: docker compose up -d tinyauth"
+next_engine="$(container_engine)" || next_engine="docker"
+echo "Next step: $next_engine compose up -d tinyauth"
 echo "hint: the caddy service owns the virtual host for tinyauth.$stack_domain."

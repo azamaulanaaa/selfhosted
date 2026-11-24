@@ -10,6 +10,12 @@
 # automatic HTTPS. The vhost labels come from STACK_DOMAIN. Caddy never
 # decides them. consul-template rewrites this file; caddy reloads itself on
 # change (--watch).
+#
+# The vhost registry is a JSON array. The root setup.sh assembles it from the
+# enabled state/<service>/vhost.json descriptors into config/caddy/vhosts.json.
+# The container mounts that file at /etc/consul-template/vhosts.json. Set
+# CADDY_VHOSTS_FILE to read another path. An empty array renders the fallback
+# vhosts so a standalone checkout still works.
 
 {{ define "smart_proxy" }}
   {{ $name := index . 0 }}
@@ -91,44 +97,59 @@
 {{- end }}
 {{ end }}
 
-# The consul web UI. Renders once a DC exists with at least one server registered.
-https://consul.{{ env "STACK_DOMAIN" }} {
-{{ template "tls_for" "consul" }}
-	reverse_proxy {{ range service "consul" }}{{ .Address }}:8500 {{ end }} {
+# Emit one vhost for one registry descriptor. Argument: the descriptor object.
+# A descriptor has one of three modes:
+#   catalog  range the Consul service and append the port
+#   litefs   route through the smart_proxy template
+#   static   reverse_proxy the fixed upstream, with optional X-Real-IP
+# parseJSON returns interface{} values. The image exposes the sprig helpers
+# with the sprig_ prefix, so sprig_toString converts a value to a string.
+{{ define "render_vhost" }}
+	{{ $name := index . "name" }}
+	{{ $mode := index . "mode" }}
+	{{ $upstream := index . "upstream" }}
+	{{ $service := index . "service" }}
+	{{ $port := index . "port" }}
+	{{ $redirect_paths := index . "redirect_paths" }}
+	{{ $x_real_ip := index . "x_real_ip" }}
+https://{{ $name }}.{{ env "STACK_DOMAIN" }} {
+{{ template "tls_for" (sprig_toString $name) }}
+	{{ if eq (sprig_toString $mode) "catalog" }}
+	reverse_proxy {{ range service (sprig_toString $service) }}{{ .Address }}:{{ $port }} {{ end }} {
 	}
-}
-
-# The LLDAP UI. Rendered only when an lldap primary is elected:
-#   - key lldap/litefs exists in the consul KV with {"advertise-url": ...}.
-# Until a primary is elected the vhost renders with no handlers and caddy
-# answers an empty 200.
-https://lldap.{{ env "STACK_DOMAIN" }} {
-{{ template "tls_for" "lldap" }}
-	{{ template "smart_proxy" (sprig_list "lldap" "http://lldap:17170" "[]") }}
-}
-
-# The tinyauth OIDC provider. Rendered only when a tinyauth primary is elected:
-#   - key tinyauth/litefs exists in the consul KV with {"advertise-url": ...}.
-# Until a primary is elected the vhost renders with no handlers and caddy
-# answers an empty 200.
-https://tinyauth.{{ env "STACK_DOMAIN" }} {
-{{ template "tls_for" "tinyauth" }}
-	{{ template "smart_proxy" (sprig_list "tinyauth" "http://tinyauth:3000" "[]") }}
-}
-
-# The forgejo code forge. It has a static upstream and no LiteFS primary.
-https://forgejo.{{ env "STACK_DOMAIN" }} {
-{{ template "tls_for" "forgejo" }}
-	reverse_proxy http://forgejo:3000 {
+	{{ else if eq (sprig_toString $mode) "litefs" }}
+	{{ if $redirect_paths }}
+	{{ template "smart_proxy" (sprig_list (sprig_toString $name) (sprig_toString $upstream) (sprig_toString $redirect_paths)) }}
+	{{ else }}
+	{{ template "smart_proxy" (sprig_list (sprig_toString $name) (sprig_toString $upstream) "[]") }}
+	{{ end }}
+	{{ else if eq (sprig_toString $mode) "static" }}
+	reverse_proxy {{ sprig_toString $upstream }} {
 		header_up Host {host}
-	}
-}
-
-# The Vaultwarden password manager. It uses SSO through Tinyauth.
-https://vaultwarden.{{ env "STACK_DOMAIN" }} {
-{{ template "tls_for" "vaultwarden" }}
-	reverse_proxy http://vaultwarden:80 {
-		header_up Host {host}
+		{{ if $x_real_ip }}
 		header_up X-Real-IP {remote_host}
+		{{ end }}
 	}
+	{{ end }}
 }
+{{ end }}
+
+# The registry path. CADDY_VHOSTS_FILE wins. The default is the compose mount.
+{{ $vhosts_file := env "CADDY_VHOSTS_FILE" }}
+{{ if not $vhosts_file }}{{ $vhosts_file = "/etc/consul-template/vhosts.json" }}{{ end }}
+{{ $registry := parseJSON (file $vhosts_file) }}
+
+# The fallback descriptors. The template uses them when the registry is empty.
+{{ $fallback := parseJSON `
+[
+  {"name":"consul","mode":"catalog","service":"consul","port":8500},
+  {"name":"lldap","mode":"litefs","upstream":"http://lldap:17170","redirect_paths":"[]"},
+  {"name":"tinyauth","mode":"litefs","upstream":"http://tinyauth:3000","redirect_paths":"[]"},
+  {"name":"forgejo","mode":"static","upstream":"http://forgejo:3000"},
+  {"name":"vaultwarden","mode":"static","upstream":"http://vaultwarden:80","x_real_ip":true}
+]` }}
+
+{{ $vhosts := $fallback }}
+{{ if gt (len $registry) 0 }}{{ $vhosts = $registry }}{{ end }}
+{{ range $vhosts }}{{ template "render_vhost" . }}
+{{ end }}

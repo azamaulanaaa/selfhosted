@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Render the caddy template into a scratch tree and check the output.
-# Check the vhosts, the local and remote token selection, and the
-# consul-template address.
+# Check the caddy template and the caddy wizard.
+# Check the vhost registry, the fallback vhosts, the TLS vhost list, the token
+# selection, and the consul-template address.
 # Run this script from any directory. It finds the repository root on its own.
+# shellcheck disable=SC2016
+# The checked strings hold Go template variables. Do not expand them.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -15,17 +17,12 @@ trap 'rm -rf -- "$scratch"' EXIT
 test_domain="example.test"
 test_local_addr="http://consul:8500"
 test_remote_addr="https://consul.example.test:8501"
+template="state/caddy/Caddyfile.tpl"
 
 # Exit with the given STE message when a check fails.
 fail() {
   echo "error: $1" >&2
   exit 1
-}
-
-# Render the template with the substitution from the entrypoint.
-render_template() {
-  sed "s|{{ env \"STACK_DOMAIN\" }}|$test_domain|g" \
-    state/caddy/Caddyfile.tpl >"$scratch/Caddyfile"
 }
 
 # Check that a file contains the given text.
@@ -46,6 +43,7 @@ check_lacks() {
 
 # Load the entrypoint functions without starting the container.
 # shellcheck source=state/caddy/entrypoint.sh
+# shellcheck disable=SC1091
 CADDY_ENTRYPOINT_LIB=1 . state/caddy/entrypoint.sh
 
 # Check the local and remote token file selection.
@@ -59,7 +57,10 @@ CADDY_ENTRYPOINT_LIB=1 . state/caddy/entrypoint.sh
 # Check that the token reader selects the file for the address.
 printf '%s\n' 'agent {' '  initial_management = "local-test-token"' '}' >"$scratch/agent.hcl"
 printf '%s\n' 'remote-test-token' >"$scratch/remote-token"
+# The sourced entrypoint reads these paths in its token helpers.
+# shellcheck disable=SC2034
 MANAGEMENT_FILE="$scratch/agent.hcl"
+# shellcheck disable=SC2034
 REMOTE_TOKEN_FILE="$scratch/remote-token"
 consul_addr="$test_local_addr"
 [ "$(read_management_token)" = "local-test-token" ] ||
@@ -67,6 +68,45 @@ consul_addr="$test_local_addr"
 consul_addr="$test_remote_addr"
 [ "$(read_management_token)" = "remote-test-token" ] ||
   fail "The token reader does not read remote-token in remote mode."
+
+# Check the template definitions and the three descriptor modes.
+check_contains "$template" '{{ define "smart_proxy" }}'
+check_contains "$template" '{{ define "tls_for" }}'
+check_contains "$template" '{{ define "render_vhost" }}'
+check_contains "$template" 'eq (sprig_toString $mode) "catalog"'
+check_contains "$template" 'range service (sprig_toString $service)'
+check_contains "$template" ':{{ $port }}'
+check_contains "$template" 'eq (sprig_toString $mode) "litefs"'
+check_contains "$template" 'template "smart_proxy" (sprig_list'
+check_contains "$template" 'eq (sprig_toString $mode) "static"'
+check_contains "$template" 'reverse_proxy {{ sprig_toString $upstream }} {'
+check_contains "$template" 'header_up Host {host}'
+check_contains "$template" 'header_up X-Real-IP {remote_host}'
+
+# Check the registry file selection and the vhost block header.
+check_contains "$template" 'env "CADDY_VHOSTS_FILE"'
+check_contains "$template" '/etc/consul-template/vhosts.json'
+check_contains "$template" 'parseJSON (file $vhosts_file)'
+check_contains "$template" 'https://{{ $name }}.{{ env "STACK_DOMAIN" }} {'
+
+# Check the fallback descriptors. The empty registry renders these vhosts.
+check_contains "$template" '"name":"consul","mode":"catalog","service":"consul","port":8500'
+check_contains "$template" '"name":"lldap","mode":"litefs","upstream":"http://lldap:17170","redirect_paths":"[]"'
+check_contains "$template" '"name":"tinyauth","mode":"litefs","upstream":"http://tinyauth:3000","redirect_paths":"[]"'
+check_contains "$template" '"name":"forgejo","mode":"static","upstream":"http://forgejo:3000"'
+check_contains "$template" '"name":"vaultwarden","mode":"static","upstream":"http://vaultwarden:80","x_real_ip":true'
+check_lacks "$template" 'garage'
+
+# Check that no vhost block is hard-coded outside the render definition.
+check_lacks "$template" 'https://consul.{{ env "STACK_DOMAIN" }} {'
+check_lacks "$template" 'https://lldap.{{ env "STACK_DOMAIN" }} {'
+check_lacks "$template" 'https://tinyauth.{{ env "STACK_DOMAIN" }} {'
+check_lacks "$template" 'https://forgejo.{{ env "STACK_DOMAIN" }} {'
+check_lacks "$template" 'https://vaultwarden.{{ env "STACK_DOMAIN" }} {'
+
+# Check that the caddy compose fragment mounts the registry.
+check_contains compose/caddy.yaml \
+  './config/caddy/vhosts.json:/etc/consul-template/vhosts.json:ro'
 
 # Render the wizard into a scratch tree and check the consul-template address.
 wizard_root="$scratch/repo"
@@ -84,6 +124,17 @@ run_wizard "$test_local_addr"
 check_contains "$wizard_root/config/caddy/consul-template.hcl" \
   "address = \"$test_local_addr\""
 
+# The wizard creates an empty registry when the files are missing.
+[ -f "$wizard_root/config/caddy/vhosts.json" ] ||
+  fail "The caddy wizard did not create the registry JSON file."
+[ "$(cat "$wizard_root/config/caddy/vhosts.json")" = "[]" ] ||
+  fail "The caddy wizard did not write the empty registry array."
+[ -f "$wizard_root/config/caddy/vhosts.txt" ] ||
+  fail "The caddy wizard did not create the vhost names file."
+if [ -s "$wizard_root/config/caddy/vhosts.txt" ]; then
+  fail "The caddy wizard did not create an empty vhost names file."
+fi
+
 run_wizard "$test_remote_addr"
 check_contains "$wizard_root/config/caddy/consul-template.hcl" \
   "address = \"$test_remote_addr\""
@@ -95,21 +146,16 @@ env -u CONSUL_ADDR STACK_DOMAIN="$test_domain" TLS_ENABLED=0 \
 check_contains "$wizard_root/config/caddy/consul-template.hcl" \
   "address = \"$test_remote_addr\""
 
-render_template
-check_contains "$scratch/Caddyfile" "https://forgejo.$test_domain {"
-check_contains "$scratch/Caddyfile" "reverse_proxy http://forgejo:3000"
-check_contains "$scratch/Caddyfile" 'template "tls_for" "forgejo"'
-check_contains "$scratch/Caddyfile" 'service "consul"'
-check_lacks "$scratch/Caddyfile" "https://lan."
+# The wizard keeps an existing registry. Write catalog, litefs, and static
+# descriptors, then run the wizard again.
+vhosts_json='[{"name":"consul","mode":"catalog","service":"consul","port":8500},{"name":"forgejo","mode":"static","upstream":"http://forgejo:3000"},{"name":"vaultwarden","mode":"static","upstream":"http://vaultwarden:80","x_real_ip":true}]'
+printf '%s\n' "$vhosts_json" >"$wizard_root/config/caddy/vhosts.json"
+printf '%s\n' 'consul' 'forgejo' 'vaultwarden' >"$wizard_root/config/caddy/vhosts.txt"
+run_wizard "$test_local_addr"
+[ "$(cat "$wizard_root/config/caddy/vhosts.json")" = "$vhosts_json" ] ||
+  fail "The caddy wizard overwrote the existing registry."
 
-# The scratch tree has no compose fragments. The vaultwarden vhost must
-# render from the template alone.
-check_contains "$scratch/Caddyfile" "https://vaultwarden.$test_domain {"
-check_contains "$scratch/Caddyfile" "reverse_proxy http://vaultwarden:80"
-check_contains "$scratch/Caddyfile" "header_up X-Real-IP {remote_host}"
-check_contains "$scratch/Caddyfile" 'template "tls_for" "vaultwarden"'
-
-# Check that a per-vhost certificate request lists vaultwarden.
+# The TLS vhost list comes from vhosts.txt. The fallback list must not appear.
 cert_dir="$scratch/certs"
 mkdir -p "$cert_dir"
 printf 'test-fullchain\n' >"$cert_dir/fullchain.pem"
@@ -121,7 +167,49 @@ CADDY_TLS_MODE=existing TLS_ENABLED=1 \
   bash "$wizard_root/state/caddy/setup.sh" </dev/null >"$scratch/tls-error.txt" 2>&1 ||
   tls_status=$?
 [ "$tls_status" -ne 0 ] ||
-  fail "The wizard must reject a per-vhost certificate list with no vaultwarden pair."
-check_contains "$scratch/tls-error.txt" "vaultwarden:<fullchain>:<key>"
+  fail "The wizard must reject a per-vhost certificate list with no consul pair."
+check_contains "$scratch/tls-error.txt" "consul:<fullchain>:<key>,forgejo:<fullchain>:<key>,vaultwarden:<fullchain>:<key>"
+check_lacks "$scratch/tls-error.txt" "lldap"
+check_lacks "$scratch/tls-error.txt" "garage"
 
-echo "Checked the caddy template, token selection, and consul-template address."
+# The wizard rejects a vhost name that the registry does not name. The
+# fallback list must not accept garage.
+tls_status=0
+CADDY_TLS_MODE=existing TLS_ENABLED=1 \
+  CADDY_TLS_CERTS="garage:$cert_dir/fullchain.pem:$cert_dir/privkey.pem" \
+  CONSUL_ADDR="$test_local_addr" STACK_DOMAIN="$test_domain" \
+  bash "$wizard_root/state/caddy/setup.sh" </dev/null >"$scratch/garage-error.txt" 2>&1 ||
+  tls_status=$?
+[ "$tls_status" -ne 0 ] ||
+  fail "The wizard must reject the garage vhost when the registry does not name it."
+check_contains "$scratch/garage-error.txt" "The vhost 'garage' is not in the registry."
+check_contains "$scratch/garage-error.txt" "Use one of these vhosts: consul, forgejo, vaultwarden."
+check_lacks "$scratch/garage-error.txt" "lldap"
+
+# An empty registry renders the fallback list. The wizard creates the registry
+# files before the TLS validation and then fails on the missing certificates.
+fresh_root="$scratch/fresh"
+mkdir -p "$fresh_root/state/caddy"
+cp state/caddy/setup.sh "$fresh_root/state/caddy/setup.sh"
+tls_status=0
+CADDY_TLS_MODE=existing TLS_ENABLED=1 \
+  CONSUL_ADDR="$test_local_addr" STACK_DOMAIN="$test_domain" \
+  bash "$fresh_root/state/caddy/setup.sh" </dev/null >"$scratch/fallback-error.txt" 2>&1 ||
+  tls_status=$?
+[ "$tls_status" -ne 0 ] ||
+  fail "The wizard must fail when existing TLS has no certificates."
+[ -f "$fresh_root/config/caddy/vhosts.json" ] ||
+  fail "The wizard did not create the registry before the TLS validation."
+[ "$(cat "$fresh_root/config/caddy/vhosts.json")" = "[]" ] ||
+  fail "The wizard did not write the empty registry array before the TLS validation."
+[ -f "$fresh_root/config/caddy/vhosts.txt" ] ||
+  fail "The wizard did not create the vhost names file before the TLS validation."
+if [ -s "$fresh_root/config/caddy/vhosts.txt" ]; then
+  fail "The wizard did not create an empty vhost names file before the TLS validation."
+fi
+check_contains "$scratch/fallback-error.txt" \
+  "Missing per-vhost certificates: consul lldap tinyauth forgejo vaultwarden."
+check_contains "$scratch/fallback-error.txt" "vaultwarden:<fullchain>:<key>"
+check_lacks "$scratch/fallback-error.txt" "garage"
+
+echo "Checked the caddy template, vhost registry, fallback vhosts, TLS list, token selection, and consul-template address."

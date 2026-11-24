@@ -18,6 +18,7 @@ services:
     container_name: caddy
     volumes:
       - ./state/caddy/Caddyfile.tpl:/etc/consul-template/templates/Caddyfile.tpl:ro
+      - ./config/caddy/vhosts.json:/etc/consul-template/vhosts.json:ro
       - ./config/caddy/consul-template.hcl:/etc/consul-template/config.hcl:ro
       - ./config/caddy/secrets:/etc/consul-template/secrets:ro
       - ./config/caddy/certs:/etc/caddy/certs:ro

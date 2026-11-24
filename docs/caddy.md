@@ -68,14 +68,42 @@ TLS does not depend on the Consul location.
 
 ## Virtual hosts
 
-- `consul.<STACK_DOMAIN>` proxies to `consul:8500`.
+Caddy renders one virtual host per descriptor in the vhost registry. The
+root `setup.sh` assembles `config/caddy/vhosts.json` from the enabled
+`state/<service>/vhost.json` descriptors. The caddy container mounts that
+file read-only at `/etc/consul-template/vhosts.json`. The template reads
+`CADDY_VHOSTS_FILE` when it is set and uses
+`/etc/consul-template/vhosts.json` otherwise.
+
+The root wizard also writes `config/caddy/vhosts.txt` with one vhost name
+per line. The caddy wizard reads this file for the TLS certificate list and
+for the per-vhost certificate validation.
+
+A descriptor has one of three modes:
+
+- `catalog`: `range service <service>` and append `:<port>`.
+- `litefs`: the `smart_proxy` template with the upstream and the redirect
+  paths.
+- `static`: `reverse_proxy <upstream>` with the `Host` header. When
+  `x_real_ip` is true, it also sets the `X-Real-IP` header.
+
+The descriptor schema is in [layout](layout.md#vhost-registry).
+
+When the registry is empty, Caddy renders the fallback vhosts:
+
+- `consul.<STACK_DOMAIN>` proxies to the `consul` service on port 8500.
 - `lldap.<STACK_DOMAIN>` proxies to `lldap:17170`.
 - `tinyauth.<STACK_DOMAIN>` proxies to `tinyauth:3000`.
 - `forgejo.<STACK_DOMAIN>` proxies to `forgejo:3000`.
 - `vaultwarden.<STACK_DOMAIN>` proxies to `vaultwarden:80`. It sets the
   `X-Real-IP` header for rate limiting.
 
+When the registry is not empty, Caddy renders only the descriptors in it.
+Garage has no descriptor and gets no vhost. After the enabled service set
+changes, rerun `setup.sh` and restart caddy.
+
 ## Checks
 
-Run `bash state/caddy/smoke.sh` to render the template and check the local and
-remote token selection and the consul-template address.
+Run `bash state/caddy/smoke.sh` to check the template, the vhost registry, the
+fallback vhosts, the TLS vhost list, the token selection, and the
+consul-template address.

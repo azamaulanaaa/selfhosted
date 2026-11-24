@@ -77,11 +77,34 @@ check_strict_modes() {
   done
 }
 
-# Check that the wizard creates a management token.
+# Check that the wizard creates a management token and the agent token key.
+# The old initial_agent key is not valid for the pinned image.
 check_management_token() {
   local tree="$1"
-  grep -q '^[[:space:]]*initial_management[[:space:]]*=' "$tree/config/consul/secrets/agent.hcl" ||
+  local file="$tree/config/consul/secrets/agent.hcl"
+  grep -q '^[[:space:]]*initial_management[[:space:]]*=' "$file" ||
     fail "The secret file does not hold a management token."
+  grep -q '^[[:space:]]*agent[[:space:]]*=' "$file" ||
+    fail "The secret file does not hold the agent token key."
+  if grep -q '^[[:space:]]*initial_agent[[:space:]]*=' "$file"; then
+    fail "The secret file holds the old initial_agent key."
+  fi
+}
+
+# Check that a rerun migrates the old initial_agent key and keeps its value.
+check_agent_token_migration() {
+  local tree="$1"
+  local file="$tree/config/consul/secrets/agent.hcl"
+  local old_value="test-agent-token-value"
+  sed -i -E "s/^([[:space:]]*)agent([[:space:]]*)=.*/\1initial_agent\2= \"$old_value\"/" "$file"
+  grep -q '^[[:space:]]*initial_agent[[:space:]]*=' "$file" ||
+    fail "The migration check did not write the old initial_agent key."
+  run_wizard "$tree"
+  grep -q "^[[:space:]]*agent[[:space:]]*=[[:space:]]*\"$old_value\"" "$file" ||
+    fail "The wizard did not migrate the old initial_agent value to the agent key."
+  if grep -q '^[[:space:]]*initial_agent[[:space:]]*=' "$file"; then
+    fail "The wizard kept the old initial_agent key."
+  fi
 }
 
 # Check that peers.txt and join.hcl hold the peer list from CONSUL_JOIN_IPS.
@@ -135,19 +158,17 @@ check_bootstrap_mount() {
     fail "compose/consul.yaml does not load config/consul/bootstrap.hcl."
 }
 
-# Check that the vhost descriptor selects the Consul catalog on port 8500.
+# Check that the vhost descriptor uses the static upstream for the single node.
 # The descriptor must not hold a secret.
 check_vhost_descriptor() {
   local file="state/consul/vhost.json"
   [ -f "$file" ] || fail "state/consul/vhost.json is missing."
   grep -q '"name":"consul"' "$file" ||
     fail "state/consul/vhost.json does not name consul."
-  grep -q '"mode":"catalog"' "$file" ||
-    fail "state/consul/vhost.json does not use catalog mode."
-  grep -q '"service":"consul"' "$file" ||
-    fail "state/consul/vhost.json does not select the consul service."
-  grep -q '"port":8500' "$file" ||
-    fail "state/consul/vhost.json does not use port 8500."
+  grep -q '"mode":"static"' "$file" ||
+    fail "state/consul/vhost.json does not use static mode."
+  grep -q '"upstream":"http://consul:8500"' "$file" ||
+    fail "state/consul/vhost.json does not use the consul upstream."
   if grep -qiE '"(token|password|secret|credential|api[_-]?key|private[_-]?key)"' "$file"; then
     fail "state/consul/vhost.json holds a secret field."
   fi
@@ -166,33 +187,49 @@ check_rootless_entrypoint() {
   fi
 }
 
-# Check that the init command skips chown when STACK_ROOTLESS is 1.
+# Check that the init command is one line and keeps the rootless branch.
 check_rootless_init_command() {
   local fragment="$REPO_ROOT/compose/consul.yaml"
-  local chmod_count chown_count
+  local command_line continuation_count chmod_count chown_count
   grep -q 'STACK_ROOTLESS' "$fragment" ||
     fail "compose/consul.yaml does not read STACK_ROOTLESS."
-  grep -q 'mkdir -p /consul/data' "$fragment" ||
-    fail "The init command does not create /consul/data on every path."
-  awk '
-    /^[[:space:]]*command:[[:space:]]*[|][[:space:]]*$/ { in_command = 1; next }
-    in_command && /^[[:space:]]*entrypoint:/ { in_command = 0 }
-    in_command && /else/ { in_else = 1 }
-    in_command && /chown/ {
-      if (!in_else) {
-        print "chown outside the rootful branch"
-        bad = 1
-      }
+  command_line="$(awk '
+    /^  consul-data-init:[[:space:]]*$/ { in_init = 1; next }
+    in_init && /^[[:space:]]*command:/ {
+      sub(/^[[:space:]]*command:[[:space:]]*/, "")
+      print
+      exit
     }
-    END { exit bad }
-  ' "$fragment" ||
-    fail "The init command runs chown outside the rootful branch."
-  chmod_count="$(grep -c 'chmod 0700 /consul/data' "$fragment")"
+  ' "$fragment")"
+  [ -n "$command_line" ] || fail "compose/consul.yaml has no init command."
+  case "$command_line" in
+  "|" | ">" | "|-" | ">-")
+    fail "The init command is a block scalar. Use one line."
+    ;;
+  esac
+  printf '%s\n' "$command_line" | grep -q 'mkdir -p /consul/data' ||
+    fail "The init command does not create /consul/data on every path."
+  printf '%s\n' "$command_line" | grep -q 'STACK_ROOTLESS' ||
+    fail "The init command does not use the rootless branch."
+  printf '%s\n' "$command_line" | grep -q 'then chmod 0700 /consul/data' ||
+    fail "The init command does not set mode 0700 on the rootless path."
+  printf '%s\n' "$command_line" | grep -q 'else chown 100:1000 /consul/data' ||
+    fail "The init command does not keep the rootful chown in the else branch."
+  chmod_count="$(printf '%s\n' "$command_line" | grep -o 'chmod 0700 /consul/data' | wc -l | tr -d '[:space:]')"
   [ "$chmod_count" -eq 2 ] ||
     fail "The init command does not set mode 0700 on both paths."
-  chown_count="$(grep -c 'chown 100:1000 /consul/data' "$fragment")"
+  chown_count="$(printf '%s\n' "$command_line" | grep -o 'chown 100:1000 /consul/data' | wc -l | tr -d '[:space:]')"
   [ "$chown_count" -eq 1 ] ||
     fail "The init command does not keep one rootful chown."
+  continuation_count="$(awk '
+    /^  consul-data-init:[[:space:]]*$/ { in_init = 1; next }
+    in_init && /^[[:space:]]*command:/ { in_command = 1; count = 0; next }
+    in_command && /^[[:space:]]*entrypoint:/ { print count; done = 1; exit }
+    in_command { count++ }
+    END { if (!done) print count }
+  ' "$fragment")"
+  [ "$continuation_count" = "0" ] ||
+    fail "The init command uses $continuation_count continuation lines. Use one line."
 }
 
 # Check that grant_read_access has the rootless branch.
@@ -282,6 +319,7 @@ main() {
   check_bootstrap_expect "$env_file_tree" 2
   check_single_bootstrap_expect "$env_file_tree"
   check_idempotent_run "$env_file_tree"
+  check_agent_token_migration "$env_file_tree"
 
   rootless_tree="$(new_scratch_tree)"
   run_wizard "$rootless_tree" "STACK_ROOTLESS=1"

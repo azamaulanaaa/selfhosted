@@ -128,9 +128,10 @@ The root wizard uses this order:
 4. Remote: resolve and write the remote token. Local: ask for the peers,
     then ask for `bootstrap_expect`.
 5. Run the service enable loop for the other services.
-6. Resolve `PUBLIC_IP`.
-7. Write `.env`.
-8. Run each enabled service wizard in sorted order.
+6. When `caddy` is enabled, assemble the vhost registry.
+7. Resolve `PUBLIC_IP`.
+8. Write `.env`.
+9. Run each enabled service wizard in sorted order.
 
 `CONSUL_ADDR` decides Consul. The service enable loop asks only the other
 services.
@@ -170,6 +171,43 @@ Each service wizard supports `clean`.
 - After a cleanup, run the service wizard again to regenerate the
   files. A service that was part of a cluster may need its own admin
   commands to leave the cluster cleanly.
+
+## Vhost registry
+
+A service that has a web vhost commits one descriptor at
+`state/<service>/vhost.json`. The file is a single JSON object. A service
+without a descriptor gets no vhost. For example, Garage has no web vhost.
+
+The descriptor has one of three modes:
+
+- `static`: one fixed upstream. Fields: `name`, `mode`, `upstream`.
+  Optional `x_real_ip` boolean.
+- `litefs`: LiteFS primary routing. Fields: `name`, `mode`, `upstream`,
+  `redirect_paths`. `redirect_paths` is a JSON string such as `"[]"`.
+- `catalog`: all healthy Consul instances. Fields: `name`, `mode`,
+  `service`, `port`.
+
+Examples:
+
+```json
+{"name":"consul","mode":"catalog","service":"consul","port":8500}
+{"name":"forgejo","mode":"static","upstream":"http://forgejo:3000"}
+{"name":"vaultwarden","mode":"static","upstream":"http://vaultwarden:80","x_real_ip":true}
+{"name":"tinyauth","mode":"litefs","upstream":"http://tinyauth:3000","redirect_paths":"[]"}
+```
+
+The root wizard reads only the descriptor of an enabled service. It keeps
+the enabled service order. It writes `config/caddy/vhosts.json` as a JSON
+array and `config/caddy/vhosts.txt` with one vhost name per line. The
+directory is mode 750. Both files are mode 640. When no enabled service
+has a descriptor, the array is `[]` and `vhosts.txt` is empty.
+
+Caddy renders one vhost per descriptor.
+
+After the enabled service set changes, rerun `setup.sh` and restart caddy.
+
+The registry is for Caddy only. It does not replace the Consul service
+catalog.
 
 ## Compose files
 

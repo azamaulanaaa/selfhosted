@@ -16,11 +16,16 @@ services:
       # The container reads /run/secrets/vaultwarden/oidc-client-secret, the
       # optional admin_token, and the optional smtp_password.
       - ./config/vaultwarden/secrets:/run/secrets/vaultwarden:ro
+      # Caddy internal CA bundle. The bundle holds the intermediate and the
+      # root. The entrypoint writes it after caddy starts.
+      - ./data/caddy/store/caddy/ca-bundle.crt:/etc/ssl/certs/caddy-ca.pem:ro
       # SQLite database and signing keys. Back it up.
       - ./data/vaultwarden/store:/data:rw
     environment:
       # The OIDC client secret reaches the container as a file path.
       - SSO_CLIENT_SECRET_FILE=/run/secrets/vaultwarden/oidc-client-secret
+      # The app trusts the caddy internal CA for the HTTPS vhosts.
+      - SSL_CERT_FILE=/etc/ssl/certs/caddy-ca.pem
     env_file:
       # Wizard-generated. Holds non-secret settings and _FILE paths.
       - ./config/vaultwarden/vaultwarden.env

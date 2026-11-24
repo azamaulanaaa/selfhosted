@@ -28,6 +28,9 @@ services:
       # agent.hcl for local Consul and the token from remote-token for remote
       # Consul. Mount the whole directory so both files are available.
       - ./config/consul/secrets:/config/consul/secrets:ro
+      # Caddy internal CA bundle. The bundle holds the intermediate and the
+      # root. The entrypoint writes it after caddy starts.
+      - ./data/caddy/store/caddy/ca-bundle.crt:/etc/ssl/certs/caddy-ca.pem:ro
       # Local SQLite and git data in standalone mode. LiteFS overlays /data in
       # integrated mode. Back up the whole store tree.
       - ./data/forgejo/store:/data:rw
@@ -40,6 +43,8 @@ services:
       - LITEFS_ENABLED=${LITEFS_ENABLED:-0}
       - OIDC_ENABLED=${OIDC_ENABLED:-0}
       - TLS_ENABLED=${TLS_ENABLED:-0}
+      # The app trusts the caddy internal CA for the HTTPS vhosts.
+      - SSL_CERT_FILE=/etc/ssl/certs/caddy-ca.pem
       # Rootless nerdctl sets STACK_UID and STACK_GID to 0. Container root
       # maps to the host user, and that mapping can read the host files.
       - EXEC_UID=${STACK_UID:-1000}

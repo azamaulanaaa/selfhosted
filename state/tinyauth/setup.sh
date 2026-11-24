@@ -5,6 +5,7 @@
 #
 # Usage:
 #   setup.sh tinyauth                          Run the Tinyauth wizard.
+#   setup.sh tinyauth engine                   Print the selected container engine.
 #   setup.sh tinyauth clean [--data] [--yes]   Remove the tinyauth configuration.
 #                                              With --data also remove the tinyauth data.
 #                                              Ask for confirmation unless --yes is given.
@@ -20,11 +21,21 @@
 # to create the observer. The entrypoint reads it at container start.
 #
 # Non-interactive environment variables:
+#   CONTAINER_ENGINE        Container engine for the observer password step.
+#                           Default: docker, then nerdctl, then
+#                           $HOME/.local/bin/nerdctl.
 #   CONSUL_ADDR             Consul address. Read from the environment, then the root
 #                           .env, then http://consul:8500. The value http://consul:8500
 #                           selects local Consul. Any other value selects remote Consul.
 #   STACK_DOMAIN            Stack domain. The issuer becomes https://tinyauth.<domain>.
 #                           Read from the environment, then the root .env, then sh.lan.
+#   STACK_ROOTLESS          1 runs the app as container root for rootless nerdctl.
+#                           0 runs it as uid STACK_UID and gid STACK_GID.
+#                           Read from the environment, then the root .env, then 0.
+#   STACK_UID               Container user id. Read from the environment, then the
+#                           root .env, then 1000.
+#   STACK_GID               Container group id. Read from the environment, then the
+#                           root .env, then 1000.
 #   TINYAUTH_LDAP_LOCAL     yes to use the LLDAP service in this repo. Default: yes.
 #   TINYAUTH_LDAP_ADDRESS   LDAP URL. Required when TINYAUTH_LDAP_LOCAL=no.
 #                           Interactive default for local LLDAP: ldap://lldap:3890.
@@ -32,7 +43,7 @@
 #                           the default is derived from STACK_DOMAIN.
 #   TINYAUTH_OBSERVER_AUTO  yes to create the observer in LLDAP automatically. Default: yes.
 #                           Falls back to manual instructions when the local admin
-#                           password, the API, or docker is not available.
+#                           password, the API, or a container engine is not available.
 #   TINYAUTH_LDAP_BINDDN    Observer bind DN for manual mode.
 #   TINYAUTH_LDAP_BINDPASSWORD  Observer bind password for manual mode.
 #   LLDAP_HTTP_URL          LLDAP HTTP base URL for the GraphQL API.
@@ -207,6 +218,63 @@ resolve_capability_flags() {
     esac
   done
   readonly LITEFS_ENABLED OIDC_ENABLED TLS_ENABLED
+}
+
+# Return 0 when the argument is 0 or 1.
+is_valid_rootless() {
+  [ "$1" = "0" ] || [ "$1" = "1" ]
+}
+
+# Return 0 when the argument is 0 or a positive integer.
+is_valid_identity_id() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# Print an STE error for an invalid stack identity value and exit 1.
+# The message names the key and the rule.
+stack_identity_invalid() {
+  local key="$1" value="$2" rule="$3"
+  echo "error: $key '$value' is not valid. $rule" >&2
+  exit 1
+}
+
+# Resolve the container runtime identity from the environment and the root .env.
+# An environment value wins. The defaults are 0, 1000, and 1000.
+# STACK_ROOTLESS=1 selects rootless nerdctl.
+resolve_stack_identity() {
+  local value
+
+  value="${STACK_ROOTLESS:-}"
+  if [ -z "$value" ] && [ -f .env ]; then
+    value="$(read_env_value STACK_ROOTLESS .env)"
+  fi
+  value="${value:-0}"
+  if ! is_valid_rootless "$value"; then
+    stack_identity_invalid STACK_ROOTLESS "$value" "Use 0 or 1."
+  fi
+  STACK_ROOTLESS="$value"
+
+  value="${STACK_UID:-}"
+  if [ -z "$value" ] && [ -f .env ]; then
+    value="$(read_env_value STACK_UID .env)"
+  fi
+  value="${value:-1000}"
+  if ! is_valid_identity_id "$value"; then
+    stack_identity_invalid STACK_UID "$value" "Use 0 or a positive integer."
+  fi
+  STACK_UID="$value"
+
+  value="${STACK_GID:-}"
+  if [ -z "$value" ] && [ -f .env ]; then
+    value="$(read_env_value STACK_GID .env)"
+  fi
+  value="${value:-1000}"
+  if ! is_valid_identity_id "$value"; then
+    stack_identity_invalid STACK_GID "$value" "Use 0 or a positive integer."
+  fi
+  STACK_GID="$value"
+
+  readonly STACK_ROOTLESS STACK_UID STACK_GID
 }
 
 # Print an STE error for an invalid stack domain and exit 1.
@@ -409,13 +477,38 @@ graphql_ok() {
   return 0
 }
 
+# Print the container engine to use. Return 1 when none is available.
+# CONTAINER_ENGINE wins. Then try docker, then nerdctl on PATH.
+# Last, try the nerdctl binary in the user local bin directory.
+container_engine() {
+  if [ -n "${CONTAINER_ENGINE:-}" ]; then
+    printf '%s\n' "$CONTAINER_ENGINE"
+    return 0
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    printf 'docker\n'
+    return 0
+  fi
+  if command -v nerdctl >/dev/null 2>&1; then
+    printf 'nerdctl\n'
+    return 0
+  fi
+  local home="${HOME:-}"
+  if [ -n "$home" ] && [ -x "$home/.local/bin/nerdctl" ]; then
+    printf '%s\n' "$home/.local/bin/nerdctl"
+    return 0
+  fi
+  return 1
+}
+
 # Create the observer in LLDAP through the GraphQL API and set its password.
 # Return 1 when any step fails. The caller then uses the manual path.
 auto_create_observer() {
   local admin_user="$1" admin_pass="$2" base_dn="$3"
   command -v curl >/dev/null 2>&1 || return 1
   command -v python3 >/dev/null 2>&1 || return 1
-  command -v docker >/dev/null 2>&1 || return 1
+  local engine
+  engine="$(container_engine)" || return 1
   [ -n "$admin_pass" ] || return 1
 
   local token login_response observer_email group_id body response
@@ -457,10 +550,10 @@ except Exception:
 
   # The upstream helper sets the password through the OPAQUE endpoints.
   # It lives in the LLDAP image. Pass the value through the environment so
-  # it does not appear in the docker command line.
+  # the container engine command line does not show it.
   if ! (
     export LLDAP_USER_PASSWORD="$observer_password"
-    docker compose exec -T -e LLDAP_USER_PASSWORD \
+    "$engine" compose exec -T -e LLDAP_USER_PASSWORD \
       lldap /app/lldap_set_password \
       --base-url http://127.0.0.1:17170 \
       --token "$token" \
@@ -492,6 +585,22 @@ is_managed_key() {
   esac
 }
 
+# The engine subcommand prints the selected container engine.
+if [ "${1:-}" = "engine" ]; then
+  shift
+  if [ "$#" -ne 0 ]; then
+    echo "error: The engine subcommand takes no arguments." >&2
+    exit 2
+  fi
+  if ! engine="$(container_engine)"; then
+    echo "error: No container engine found." >&2
+    echo "error: Install docker or nerdctl, or set CONTAINER_ENGINE." >&2
+    exit 1
+  fi
+  printf '%s\n' "$engine"
+  exit 0
+fi
+
 # The clean subcommand removes the tinyauth configuration and data.
 if [ "${1:-}" = "clean" ]; then
   shift
@@ -512,6 +621,7 @@ if ! is_valid_stack_domain "$stack_domain"; then
   stack_domain_invalid
 fi
 resolve_capability_flags
+resolve_stack_identity
 resolve_consul_addr
 readonly consul_addr consul_mode consul_token_file
 if [ "$LITEFS_ENABLED" = "1" ]; then
@@ -643,8 +753,10 @@ mkdir -p "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
 chmod 0700 "$CONFIG_DIR" "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
 
 # Create the OIDC signing keys. Do not rely on the app to create them at boot.
-# A re-run keeps the existing keys. The app runs as uid 1000 and needs write
-# access on the key files, so set the owner and the mode on every run.
+# A re-run keeps the existing keys. The app needs write access on the key files.
+# Rootful mode: set the owner to STACK_UID:STACK_GID and set the mode.
+# Rootless mode: the host user owns the files and container root reads them.
+# The wizard skips the chown in rootless mode.
 private_key="$OIDC_SECRETS_DIR/private.pem"
 public_key="$OIDC_SECRETS_DIR/public.pem"
 if [ ! -s "$private_key" ]; then
@@ -662,7 +774,12 @@ if [ ! -s "$public_key" ]; then
   echo "Created the OIDC public key at $public_key."
 fi
 chmod 0600 "$private_key" "$public_key"
-chown 1000:1000 "$private_key" "$public_key" 2>/dev/null || true
+if [ "$STACK_ROOTLESS" != "1" ]; then
+  current_owner="$(stat -c '%u:%g' "$private_key" 2>/dev/null || true)"
+  if [ "$current_owner" != "${STACK_UID}:${STACK_GID}" ]; then
+    chown "${STACK_UID}:${STACK_GID}" "$private_key" "$public_key" 2>/dev/null || true
+  fi
+fi
 
 # The Consul token stays in the shared consul secrets tree. The wizard never
 # copies the token into the tinyauth secrets tree. The entrypoint reads the
@@ -939,5 +1056,6 @@ else
   echo "hint: Consul is still required. The app does not use Consul without LiteFS."
 fi
 echo "hint: the OIDC key files live in the backed-up secrets tree at $OIDC_SECRETS_DIR (mounted at /etc/tinyauth/secrets/oidc)."
-echo "Next step: docker compose up -d tinyauth"
+next_engine="$(container_engine)" || next_engine="docker"
+echo "Next step: $next_engine compose up -d tinyauth"
 echo "hint: the caddy service owns the virtual host for tinyauth.$stack_domain."

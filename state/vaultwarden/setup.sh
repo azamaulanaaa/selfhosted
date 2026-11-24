@@ -5,7 +5,8 @@
 # not use Consul.
 # Safe to run again: it rewrites the managed keys and keeps the other lines.
 # It never prints secret values. It prints paths only.
-# The official image runs as uid 1000 and listens on port 80.
+# The official image listens on port 80. The container user is STACK_UID:GID.
+# In rootless mode, the host user owns the files and container root reads them.
 #
 # Usage:
 #   setup.sh vaultwarden                          Run the Vaultwarden wizard.
@@ -39,6 +40,12 @@
 #   VAULTWARDEN_SMTP_SECURITY        VAULTWARDEN_SMTP_PASSWORD writes the secret
 #   VAULTWARDEN_SMTP_USERNAME        file config/vaultwarden/secrets/smtp_password.
 #   VAULTWARDEN_SMTP_PASSWORD
+#   STACK_ROOTLESS                   1 selects rootless nerdctl. The wizard
+#                                    then skips every chown call. Default: 0.
+#   STACK_UID                        Container user id. Default: 1000.
+#                                    Use 0 in rootless mode.
+#   STACK_GID                        Container group id. Default: 1000.
+#                                    Use 0 in rootless mode.
 #   PUBLIC_IP                        Compose only. This wizard does not read it.
 #
 # The Tinyauth client secret lives at config/tinyauth/secrets/oidc/vaultwarden
@@ -63,8 +70,9 @@ readonly TINYAUTH_SECRET="config/tinyauth/secrets/oidc/vaultwarden"
 
 readonly DEFAULT_STACK_DOMAIN="sh.lan"
 readonly DEFAULT_CLIENT_ID="vaultwarden"
-readonly APP_UID=1000
-readonly APP_GID=1000
+readonly DEFAULT_ROOTLESS=0
+readonly DEFAULT_UID=1000
+readonly DEFAULT_GID=1000
 
 # Print one value from a KEY=VALUE file. Print nothing when the key is absent.
 read_env_value() {
@@ -77,6 +85,85 @@ read_env_value() {
 # Print the STACK_DOMAIN value from the root .env file.
 read_env_stack_domain() {
   read_env_value STACK_DOMAIN .env
+}
+
+# Return 0 when the root .env file holds the key.
+env_file_has_key() {
+  [ -f .env ] && grep -qE "^$1=" .env
+}
+
+# Return 0 when the argument is 0 or 1.
+is_valid_rootless() {
+  [ "$1" = "0" ] || [ "$1" = "1" ]
+}
+
+# Return 0 when the argument is a non-negative integer.
+is_valid_identity_id() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# Print an STE error for an invalid identity value and exit 1.
+# The message names the source that holds the bad value.
+stack_identity_invalid() {
+  local key="$1" value="$2" source="$3" rule="$4"
+  case "$source" in
+  env)
+    echo "error: $key '$value' is not valid. $rule" >&2
+    ;;
+  envfile)
+    echo "error: The root .env holds the invalid $key '$value'. Fix .env by hand or set $key." >&2
+    ;;
+  *)
+    echo "error: '$value' is not valid. $rule" >&2
+    ;;
+  esac
+  exit 1
+}
+
+# Resolve one identity value. Print the value.
+# The order is: the environment, then the root .env, then the default.
+resolve_identity_value() {
+  local key="$1" default="$2"
+  if [ -n "${!key+x}" ]; then
+    printf '%s\n' "${!key}"
+  elif env_file_has_key "$key"; then
+    read_env_value "$key" .env
+  else
+    printf '%s\n' "$default"
+  fi
+}
+
+# Return the source word for one identity value. Use it in an error message.
+identity_value_source() {
+  local key="$1"
+  if [ -n "${!key+x}" ]; then
+    printf 'env\n'
+  elif env_file_has_key "$key"; then
+    printf 'envfile\n'
+  else
+    printf 'default\n'
+  fi
+}
+
+# Resolve the container identity. Set stack_rootless, stack_uid, and stack_gid.
+# The default is rootful Docker: 0, 1000, 1000.
+resolve_stack_identity() {
+  local source
+  source="$(identity_value_source STACK_ROOTLESS)"
+  stack_rootless="$(resolve_identity_value STACK_ROOTLESS "$DEFAULT_ROOTLESS")"
+  if ! is_valid_rootless "$stack_rootless"; then
+    stack_identity_invalid STACK_ROOTLESS "$stack_rootless" "$source" "Use 0 or 1."
+  fi
+  source="$(identity_value_source STACK_UID)"
+  stack_uid="$(resolve_identity_value STACK_UID "$DEFAULT_UID")"
+  if ! is_valid_identity_id "$stack_uid"; then
+    stack_identity_invalid STACK_UID "$stack_uid" "$source" "Use a non-negative integer."
+  fi
+  source="$(identity_value_source STACK_GID)"
+  stack_gid="$(resolve_identity_value STACK_GID "$DEFAULT_GID")"
+  if ! is_valid_identity_id "$stack_gid"; then
+    stack_identity_invalid STACK_GID "$stack_gid" "$source" "Use a non-negative integer."
+  fi
 }
 
 # Resolve the stack domain. Set stack_domain and stack_domain_source.
@@ -172,46 +259,59 @@ write_secret_file() {
   chmod 0600 "$path"
 }
 
-# Make one secret file readable by uid 1000.
+# Make one secret file readable by the container user.
+# In rootless mode, the host user owns the file and container root reads it.
 # Use chown first. When chown fails, use chgrp with mode 0640.
 # Print a warning when neither method works. Never print the value.
 make_secret_readable() {
   local path="$1"
-  if chown "${APP_UID}:${APP_GID}" "$path" 2>/dev/null; then
+  if [ "$stack_rootless" = "1" ]; then
     chmod 0600 "$path"
     return 0
   fi
-  if chgrp "$APP_GID" "$path" 2>/dev/null; then
+  if chown "${stack_uid}:${stack_gid}" "$path" 2>/dev/null; then
+    chmod 0600 "$path"
+    return 0
+  fi
+  if chgrp "$stack_gid" "$path" 2>/dev/null; then
     chmod 0640 "$path"
     return 0
   fi
-  echo "warning: cannot give uid $APP_UID read access to $path." >&2
-  echo "warning: Set the owner or group by hand. The container runs as uid $APP_UID." >&2
+  echo "warning: cannot give uid $stack_uid read access to $path." >&2
+  echo "warning: Set the owner or group by hand. The container runs as uid $stack_uid." >&2
   return 1
 }
 
-# Create the data store with mode 0700 and owner 1000:1000 when possible.
+# Create the data store with mode 0700 and the container owner when possible.
+# In rootless mode, keep the host user as the owner.
 prepare_store_dir() {
   mkdir -p "$STORE_DIR"
   chmod 0700 "$STORE_DIR"
-  if chown "${APP_UID}:${APP_GID}" "$STORE_DIR" 2>/dev/null; then
+  if [ "$stack_rootless" = "1" ]; then
     return 0
   fi
-  echo "warning: cannot set the owner of $STORE_DIR to $APP_UID:$APP_GID." >&2
-  echo "warning: The container runs as uid $APP_UID. Set the owner by hand." >&2
+  if chown "${stack_uid}:${stack_gid}" "$STORE_DIR" 2>/dev/null; then
+    return 0
+  fi
+  echo "warning: cannot set the owner of $STORE_DIR to $stack_uid:$stack_gid." >&2
+  echo "warning: The container runs as uid $stack_uid. Set the owner by hand." >&2
   return 1
 }
 
-# Create the secret directory with mode 0700 and owner 1000:1000 when possible.
-# The container mounts the directory and runs as uid 1000. It must traverse it.
+# Create the secret directory with mode 0700 and the container owner when
+# possible. The container mounts the directory and must traverse it.
+# In rootless mode, keep the host user as the owner.
 prepare_secrets_dir() {
   mkdir -p "$SECRETS_DIR"
   chmod 0700 "$SECRETS_DIR"
-  if chown "${APP_UID}:${APP_GID}" "$SECRETS_DIR" 2>/dev/null; then
+  if [ "$stack_rootless" = "1" ]; then
     return 0
   fi
-  echo "warning: cannot set the owner of $SECRETS_DIR to $APP_UID:$APP_GID." >&2
-  echo "warning: The container runs as uid $APP_UID and must traverse this directory." >&2
+  if chown "${stack_uid}:${stack_gid}" "$SECRETS_DIR" 2>/dev/null; then
+    return 0
+  fi
+  echo "warning: cannot set the owner of $SECRETS_DIR to $stack_uid:$stack_gid." >&2
+  echo "warning: The container runs as uid $stack_uid and must traverse this directory." >&2
   echo "warning: Set the owner by hand." >&2
   return 1
 }
@@ -421,6 +521,10 @@ if [ "${1:-}" = "clean" ]; then
   clean_service "$@"
   exit 0
 fi
+
+# Step 0: resolve the container identity before any file is written.
+resolve_stack_identity
+readonly stack_rootless stack_uid stack_gid
 
 # Step 1: resolve the stack domain and the local Tinyauth state.
 resolve_stack_domain

@@ -40,6 +40,10 @@ services:
       - LITEFS_ENABLED=${LITEFS_ENABLED:-0}
       - OIDC_ENABLED=${OIDC_ENABLED:-0}
       - TLS_ENABLED=${TLS_ENABLED:-0}
+      # Rootless nerdctl sets STACK_UID and STACK_GID to 0. Container root
+      # maps to the host user, and that mapping can read the host files.
+      - EXEC_UID=${STACK_UID:-1000}
+      - EXEC_GID=${STACK_GID:-1000}
     env_file:
       # Wizard-generated. Holds FORGEJO_* answers and *_FILE paths only.
       - ./config/forgejo/forgejo.env

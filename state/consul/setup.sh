@@ -29,21 +29,32 @@
 #                          stores it in the root .env. This script reads PUBLIC_IP from the
 #                          environment, then from the PUBLIC_IP line in the root .env.
 #                          When neither source has a value, advertise_addr is omitted from local.hcl.
+#   STACK_ROOTLESS         1 when container root maps to the host user (rootless nerdctl).
+#                          0 for rootful Docker. This script reads it from the environment,
+#                          then from the STACK_ROOTLESS line in the root .env. Default: 0.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 readonly REPO_ROOT
 
-# The consul container starts as root. The entrypoint then drops to uid 100 and gid 1000.
+# The consul container starts as root.
+# In rootful mode, the entrypoint then drops to uid 100 and gid 1000.
+# In rootless mode, the entrypoint stays as container root and container root maps to
+# the host user. The file must stay readable by the host user.
 readonly CONTAINER_GID=1000
 
 # Give the consul container user read access to a file.
-# On success the group becomes 1000 and the mode becomes 0640.
-# On failure the file gets the fallback mode and a warning is printed.
+# Rootless mode sets the fallback mode and returns. Container root maps to the host user.
+# Rootful mode makes the group 1000 and the mode 0640 on success.
+# Rootful mode sets the fallback mode and prints a warning on failure.
 grant_read_access() {
   local file="$1"
   local fallback_mode="$2"
+  if [ "$stack_rootless" = "1" ]; then
+    chmod "$fallback_mode" "$file"
+    return 0
+  fi
   if chgrp "$CONTAINER_GID" "$file" 2>/dev/null; then
     chmod 0640 "$file"
     return 0
@@ -62,6 +73,42 @@ read_env_value() {
   fi
   { grep -E "^${key}=" .env || true; } | tail -n1 | cut -d= -f2- |
     sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\\1/" -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//'
+}
+
+# Resolve the container runtime mode. Set stack_rootless.
+# The order is: the process environment, then the root .env file, then 0.
+# Exit 1 with an STE error when the value is not 0 or 1.
+resolve_stack_rootless() {
+  local value=""
+  local source="none"
+  if [ -n "${STACK_ROOTLESS+x}" ]; then
+    value="$STACK_ROOTLESS"
+    source="env"
+  elif [ -f .env ] && grep -qE '^STACK_ROOTLESS=' .env; then
+    value="$(read_env_value STACK_ROOTLESS)"
+    source="envfile"
+  else
+    value="0"
+    source="default"
+  fi
+  case "$value" in
+  0 | 1) ;;
+  *)
+    case "$source" in
+    env)
+      echo "error: STACK_ROOTLESS '$value' is not valid. Use 0 or 1." >&2
+      ;;
+    envfile)
+      echo "error: The root .env holds the invalid STACK_ROOTLESS '$value'. Fix .env by hand or set STACK_ROOTLESS." >&2
+      ;;
+    *)
+      echo "error: '$value' is not valid. Use 0 or 1." >&2
+      ;;
+    esac
+    exit 1
+    ;;
+  esac
+  stack_rootless="$value"
 }
 
 # Resolve the advertise address for this node. Set public_ip and public_ip_source.
@@ -443,6 +490,10 @@ usage_nodes() {
   echo "       setup.sh consul nodes remove <ip> [<ip>...]" >&2
   echo "       setup.sh consul nodes list" >&2
 }
+
+# Resolve the container runtime mode before the first file access.
+# The nodes subcommands and the wizard both call grant_read_access.
+resolve_stack_rootless
 
 # The nodes subcommands manage the peer IPs of this Consul server.
 # They never prompt and never need openssl. They run before the wizard path.

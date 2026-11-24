@@ -39,6 +39,11 @@
 #                             0 uses http://<PUBLIC_IP>:3000/ as ROOT_URL.
 #                             For Caddy with the internal CA and the domain URL,
 #                             set TLS_ENABLED=1 and CADDY_TLS_MODE=internal.
+#   STACK_ROOTLESS            1 runs the container as root for rootless nerdctl.
+#                             0 runs it as uid 1000 and gid 1000. Read from the
+#                             environment, then the root .env, then 0.
+#                             This wizard does not chown. The host user owns the
+#                             files, and container root can read them.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -85,7 +90,8 @@ resolve_flag() {
 
 litefs_enabled="$(resolve_flag LITEFS_ENABLED)"
 oidc_enabled="$(resolve_flag OIDC_ENABLED)"
-readonly litefs_enabled oidc_enabled
+rootless="$(resolve_flag STACK_ROOTLESS)"
+readonly litefs_enabled oidc_enabled rootless
 
 # Print the STACK_DOMAIN value from the root .env file.
 read_env_stack_domain() {
@@ -552,6 +558,8 @@ case "$auto_register" in
 esac
 
 # Step 5: create the directory layout with strict modes.
+# The host user owns these files. A rootless container runs as root and reads
+# them. This wizard never changes the owner.
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$SECRETS_DIR"
 mkdir -p "$STORE_DIR"
@@ -680,6 +688,11 @@ if [ "$consul_mode" = "local" ]; then
   echo "Mode: integrated with local Consul."
 else
   echo "Mode: standalone with remote Consul."
+fi
+if [ "$rootless" = "1" ]; then
+  echo "Runtime: rootless nerdctl. The container runs as root."
+else
+  echo "Runtime: rootful Docker. The container runs as uid 1000 and gid 1000."
 fi
 if [ "$litefs_enabled" -eq 1 ]; then
   echo "LiteFS: enabled. Peer git port: $peer_git_port"

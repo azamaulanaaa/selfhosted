@@ -42,6 +42,10 @@ services:
       - LLDAP_JWT_SECRET_FILE=/etc/lldap/secrets/jwt_secret
       - LLDAP_KEY_SEED_FILE=/etc/lldap/secrets/key_seed
       - LLDAP_LDAP_USER_PASS_FILE=/etc/lldap/secrets/ldap_user_pass
+      # Rootless nerdctl maps container root to the host user. Rootless mode
+      # uses 0 for both values. The default 1000 is for rootful Docker.
+      - UID=${STACK_UID:-1000}
+      - GID=${STACK_GID:-1000}
     ports:
       # LDAP port for clients. Bound to PUBLIC_IP, which defaults
       # to 127.0.0.1. Set PUBLIC_IP to a trusted LAN address to expose it.

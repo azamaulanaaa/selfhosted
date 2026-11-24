@@ -48,6 +48,21 @@ The root `setup.sh` resolves Consul before it runs this wizard. Consul is
 always required. The Vaultwarden container does not read `CONSUL_ADDR`. The
 compose fragment has no Consul address and no Consul flag.
 
+### Rootless runtime
+
+Rootless nerdctl runs the container as user 0. The runtime maps container
+user 0 to the host user. The host user owns the files under `config/` and
+`data/`. Container root reads those files.
+
+Set `STACK_ROOTLESS=1`, `STACK_UID=0`, and `STACK_GID=0` in the root `.env`.
+The compose fragment uses `${STACK_UID:-1000}` and `${STACK_GID:-1000}` as
+the container user. The wizard reads the same keys.
+
+In rootless mode, the wizard does not chown the secret directory, the OIDC
+secret file, or the data store. It keeps the mode changes. The host user
+stays the owner. The full contract is in
+[layout](layout.md#rootless-container-runtime).
+
 ### Standalone
 
 Standalone means remote Consul, an external OIDC provider, and an external
@@ -113,6 +128,9 @@ The non-interactive environment variables are:
 - `VAULTWARDEN_OIDC_CLIENT_SECRET`
 - `VAULTWARDEN_SSO_SIGNUPS` (`yes` or `no`)
 - `VAULTWARDEN_ROTATE_OIDC_SECRET` (`1` replaces the existing secret)
+- `STACK_ROOTLESS` (`1` skips the chown calls)
+- `STACK_UID` (container user id, default `1000`)
+- `STACK_GID` (container group id, default `1000`)
 - `PUBLIC_IP` (compose only, not read by this wizard)
 
 The wizard writes these files:
@@ -121,27 +139,29 @@ The wizard writes these files:
 | Path                                             | Mode | Owner                  | When     |
 | ------------------------------------------------ | ---- | ---------------------- | -------- |
 | `config/vaultwarden/vaultwarden.env`             | 600  | current user           | always   |
-| `config/vaultwarden/secrets`                     | 700  | uid 1000 when possible | always   |
-| `config/vaultwarden/secrets/oidc-client-secret`  | 600  | uid 1000               | always   |
-| `config/vaultwarden/secrets/admin_token`         | 600  | uid 1000               | optional |
-| `config/vaultwarden/secrets/smtp_password`       | 600  | uid 1000               | optional |
-| `data/vaultwarden/store`                         | 700  | uid 1000               | always   |
+| `config/vaultwarden/secrets`                     | 700  | `STACK_UID` when able  | always   |
+| `config/vaultwarden/secrets/oidc-client-secret`  | 600  | `STACK_UID`            | always   |
+| `config/vaultwarden/secrets/admin_token`         | 600  | `STACK_UID`            | optional |
+| `config/vaultwarden/secrets/smtp_password`       | 600  | `STACK_UID`            | optional |
+| `data/vaultwarden/store`                         | 700  | `STACK_UID`            | always   |
 <!-- markdownlint-enable MD013 -->
 
 The wizard never prints a secret value. It prints paths only.
 
-The container mounts the whole secrets directory and runs as `1000:1000`.
-The wizard sets the directory owner to `1000:1000`. When `chown` fails, it
-prints a warning. Set the owner by hand in that case. The container must
-traverse the directory to read the secret files.
+The container mounts the whole secrets directory. The container user is
+`STACK_UID:STACK_GID`, default `1000:1000`. The wizard sets the directory
+owner to that identity. When `chown` fails, it prints a warning. Set the
+owner by hand in that case. The container must traverse the directory to
+read the secret files. In rootless mode the wizard skips this chown.
 
-The wizard makes each secret file readable by uid 1000. It uses
-`chown 1000:1000`. When `chown` fails, it uses `chgrp 1000` and mode 640.
-When both fail, it prints a warning. Set the owner by hand in that case.
+The wizard makes each secret file readable by the container user. It uses
+`chown STACK_UID:STACK_GID`. When `chown` fails, it uses `chgrp STACK_GID`
+and mode 640. When both fail, it prints a warning. Set the owner by hand in
+that case. In rootless mode the wizard skips this chown.
 
-The data store needs owner `1000:1000` so the container can write the SQLite
-database. The wizard sets it when possible and prints a warning when it
-cannot.
+The data store needs owner `STACK_UID:STACK_GID` so the container can write
+the SQLite database. The wizard sets it when possible and prints a warning
+when it cannot. In rootless mode the host user stays the owner.
 
 The wizard is idempotent. A second run rewrites the managed keys in the
 environment file and keeps the other lines. It keeps the existing OIDC secret

@@ -61,6 +61,9 @@ readonly POLICY_NAME="lldap-litefs"
 readonly POLICY_RULES_JSON='key \"lldap/litefs\" { policy = \"write\" } session \"litefs\" { policy = \"write\" }'
 
 # The base image exports UID and GID as the lldap runtime ids.
+# Rootless nerdctl uses UID=0 and GID=0. Container root maps to the host user,
+# so LLDAP reads the host-owned files. The gosu call below then runs LLDAP as
+# container root.
 # POSIX sh does not define these names, therefore allow them here.
 # shellcheck disable=SC3028
 EXEC_UID="${UID:-1000}"

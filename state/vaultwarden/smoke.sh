@@ -8,6 +8,34 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly REPO_ROOT
 
+# Print one value from a KEY=VALUE file. Print nothing when the key is absent.
+read_env_value() {
+  local key="$1" file="$2"
+  [ -f "$file" ] || return 0
+  { grep -E "^${key}=" "$file" || true; } | tail -n1 | cut -d= -f2- |
+    sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\\1/"
+}
+
+# Print one container identity value.
+# The order is: the environment, then the root .env, then the default.
+resolve_identity() {
+  local key="$1" default="$2" candidate
+  if [ -n "${!key+x}" ]; then
+    printf '%s\n' "${!key}"
+    return 0
+  fi
+  candidate="$(read_env_value "$key" "$REPO_ROOT/.env")"
+  if [ -n "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  printf '%s\n' "$default"
+}
+
+identity_rootless="$(resolve_identity STACK_ROOTLESS 0)"
+identity_uid="$(resolve_identity STACK_UID 1000)"
+identity_gid="$(resolve_identity STACK_GID 1000)"
+
 scratch=""
 passed=0
 failed=0
@@ -66,18 +94,22 @@ write_root_env() {
 
 # Run the wizard in a scratch tree without an interactive terminal.
 # Drop inherited wizard variables so one test cannot affect the next.
+# The container identity defaults to the identity of this host.
 run_wizard() {
   local tree="$1"
   shift
   (
     cd "$tree"
-    env -u STACK_DOMAIN -u VAULTWARDEN_DOMAIN -u VAULTWARDEN_OIDC_ISSUER \
+    env -u STACK_ROOTLESS -u STACK_UID -u STACK_GID -u STACK_DOMAIN \
+      -u VAULTWARDEN_DOMAIN -u VAULTWARDEN_OIDC_ISSUER \
       -u VAULTWARDEN_OIDC_CLIENT_ID -u VAULTWARDEN_OIDC_CLIENT_SECRET \
       -u VAULTWARDEN_SSO_SIGNUPS -u VAULTWARDEN_ROTATE_OIDC_SECRET \
       -u VAULTWARDEN_ADMIN_TOKEN -u VAULTWARDEN_SMTP_HOST \
       -u VAULTWARDEN_SMTP_FROM -u VAULTWARDEN_SMTP_PORT \
       -u VAULTWARDEN_SMTP_SECURITY -u VAULTWARDEN_SMTP_USERNAME \
       -u VAULTWARDEN_SMTP_PASSWORD \
+      STACK_ROOTLESS="$identity_rootless" STACK_UID="$identity_uid" \
+      STACK_GID="$identity_gid" \
       "$@" bash "$tree/state/vaultwarden/setup.sh" </dev/null
   ) >>"$tree/wizard.log" 2>&1
 }
@@ -102,11 +134,20 @@ file_owner() {
   stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null || printf 'unknown'
 }
 
-# Return 0 when this environment can change a file owner to uid 1000.
-can_chown_to_app_uid() {
-  local probe
+# Print the owner uid that the host user gives to a new file.
+host_file_owner() {
+  local probe owner
+  probe="$(mktemp "${scratch}/owner-probe.XXXXXX")"
+  owner="$(file_owner "$probe")"
+  rm -f -- "$probe"
+  printf '%s\n' "$owner"
+}
+
+# Return 0 when this environment can change a file owner to uid:gid.
+can_chown_to_stack_id() {
+  local uid="$1" gid="$2" probe
   probe="$(mktemp "${scratch}/chown-probe.XXXXXX")"
-  if chown 1000:1000 "$probe" 2>/dev/null; then
+  if chown "$uid:$gid" "$probe" 2>/dev/null; then
     rm -f -- "$probe"
     return 0
   fi
@@ -245,26 +286,38 @@ check_file_modes() {
   assert_mode "$tree/data/vaultwarden/store" 700 'data store directory has mode 700'
 }
 
-# Check the mode of the OIDC secret when the environment can set uid 1000.
-check_secret_owner() {
-  local tree="$1" label="$2"
-  if ! can_chown_to_app_uid; then
-    skip "$label skips the secret owner check because this environment blocks chown"
+# Check the owner uid of one path.
+assert_owner() {
+  local path="$1" expected="$2" description="$3" owner
+  if [ ! -e "$path" ]; then
+    fail "$description" "the path does not exist: $path"
     return 0
   fi
-  local owner
-  owner="$(file_owner "$tree/config/vaultwarden/secrets/oidc-client-secret")"
-  if [ "$owner" = '1000' ]; then
-    pass "$label gives the OIDC secret owner uid 1000"
+  owner="$(file_owner "$path")"
+  if [ "$owner" = "$expected" ]; then
+    pass "$description"
   else
-    fail "$label gives the OIDC secret owner uid 1000" "observed uid $owner"
+    fail "$description" "observed uid $owner"
   fi
-  owner="$(file_owner "$tree/data/vaultwarden/store")"
-  if [ "$owner" = '1000' ]; then
-    pass "$label gives the data store owner uid 1000"
-  else
-    fail "$label gives the data store owner uid 1000" "observed uid $owner"
+}
+
+# Check the owner of the OIDC secret and the data store.
+# In rootless mode, the host user keeps the owner.
+# In rootful mode, the wizard chowns to the container uid when it can.
+check_secret_owner() {
+  local tree="$1" label="$2" rootless="$3" uid="$4" gid="$5" expected
+  if [ "$rootless" = "1" ]; then
+    expected="$(host_file_owner)"
+    assert_owner "$tree/config/vaultwarden/secrets/oidc-client-secret" "$expected" "$label keeps the host owner on the OIDC secret"
+    assert_owner "$tree/data/vaultwarden/store" "$expected" "$label keeps the host owner on the data store"
+    return 0
   fi
+  if ! can_chown_to_stack_id "$uid" "$gid"; then
+    skip "$label skips the owner check because this environment blocks chown"
+    return 0
+  fi
+  assert_owner "$tree/config/vaultwarden/secrets/oidc-client-secret" "$uid" "$label gives the OIDC secret owner uid $uid"
+  assert_owner "$tree/data/vaultwarden/store" "$uid" "$label gives the data store owner uid $uid"
 }
 
 # Check standalone mode with remote Consul, an external issuer, and an
@@ -294,7 +347,7 @@ check_standalone() {
   check_env_shape "$env"
   check_file_modes "$tree" "$tree/config/vaultwarden/secrets/oidc-client-secret"
   assert_content "$tree/config/vaultwarden/secrets/oidc-client-secret" "$secret" 'standalone wizard writes the client secret'
-  check_secret_owner "$tree" 'standalone wizard'
+  check_secret_owner "$tree" 'standalone wizard' "$identity_rootless" "$identity_uid" "$identity_gid"
 
   if grep -q 'standalone' "$tree/wizard.log"; then
     fail 'standalone wizard log avoids the mode word' 'the log says standalone'
@@ -330,6 +383,46 @@ check_standalone() {
   assert_line "$env" 'SSO_SIGNUPS_ALLOWED=false' 'standalone wizard applies the no signup answer'
 }
 
+# Check the rootless path. The wizard must not chown the secret directory,
+# the OIDC secret, or the data store. The host user keeps the owner and
+# container root reads the files.
+check_rootless() {
+  local tree secret env host
+  tree="$(new_tree rootless)"
+  write_root_env "$tree" 'https://consul.remote.example:8500'
+  secret="smoke-rootless-secret-$(openssl rand -hex 8)"
+  secret_values+=("$secret")
+
+  if ! run_wizard "$tree" \
+    STACK_ROOTLESS=1 \
+    STACK_UID=0 \
+    STACK_GID=0 \
+    STACK_DOMAIN=example.test \
+    VAULTWARDEN_OIDC_ISSUER=https://auth.example.test \
+    VAULTWARDEN_OIDC_CLIENT_SECRET="$secret"; then
+    fail 'rootless wizard runs' "read $tree/wizard.log"
+    return 0
+  fi
+  pass 'rootless wizard runs'
+
+  env="$tree/config/vaultwarden/vaultwarden.env"
+  assert_line "$env" 'DOMAIN=https://vaultwarden.example.test' 'rootless wizard derives the public URL'
+  assert_line "$env" 'SSO_AUTHORITY=https://auth.example.test' 'rootless wizard uses the external issuer'
+  check_env_shape "$env"
+  check_file_modes "$tree" "$tree/config/vaultwarden/secrets/oidc-client-secret"
+
+  host="$(host_file_owner)"
+  assert_owner "$tree/config/vaultwarden/secrets" "$host" 'rootless wizard keeps the host owner on the secret directory'
+  assert_owner "$tree/config/vaultwarden/secrets/oidc-client-secret" "$host" 'rootless wizard keeps the host owner on the OIDC secret'
+  assert_owner "$tree/data/vaultwarden/store" "$host" 'rootless wizard keeps the host owner on the data store'
+  if grep -Fq 'cannot set the owner' "$tree/wizard.log" ||
+    grep -Fq 'cannot give uid' "$tree/wizard.log"; then
+    fail 'rootless wizard prints no owner warning' 'the log holds an owner warning'
+  else
+    pass 'rootless wizard prints no owner warning'
+  fi
+}
+
 # Check integrated mode with a local Tinyauth setup script and secret file.
 check_integrated() {
   local tree first_secret second_secret env
@@ -355,7 +448,7 @@ check_integrated() {
   check_env_shape "$env"
   check_file_modes "$tree" "$tree/config/vaultwarden/secrets/oidc-client-secret"
   assert_content "$tree/config/vaultwarden/secrets/oidc-client-secret" "$first_secret" 'integrated wizard reads the Tinyauth client secret'
-  check_secret_owner "$tree" 'integrated wizard'
+  check_secret_owner "$tree" 'integrated wizard' "$identity_rootless" "$identity_uid" "$identity_gid"
   if grep -q "Using the Tinyauth client secret at" "$tree/wizard.log"; then
     fail 'non-interactive integrated wizard prints no secret path note' 'the log holds the interactive note'
   else
@@ -437,20 +530,14 @@ check_optional_settings() {
   assert_content "$admin_file" "$admin" 'wizard writes the admin token file'
   assert_content "$smtp_file" "$smtp_password" 'wizard writes the SMTP password file'
 
-  if can_chown_to_app_uid; then
-    local owner
-    owner="$(file_owner "$admin_file")"
-    if [ "$owner" = '1000' ]; then
-      pass 'admin token file has owner uid 1000'
-    else
-      fail 'admin token file has owner uid 1000' "observed uid $owner"
-    fi
-    owner="$(file_owner "$smtp_file")"
-    if [ "$owner" = '1000' ]; then
-      pass 'SMTP password file has owner uid 1000'
-    else
-      fail 'SMTP password file has owner uid 1000' "observed uid $owner"
-    fi
+  if [ "$identity_rootless" = "1" ]; then
+    local host
+    host="$(host_file_owner)"
+    assert_owner "$admin_file" "$host" 'admin token file keeps the host owner'
+    assert_owner "$smtp_file" "$host" 'SMTP password file keeps the host owner'
+  elif can_chown_to_stack_id "$identity_uid" "$identity_gid"; then
+    assert_owner "$admin_file" "$identity_uid" "admin token file has owner uid $identity_uid"
+    assert_owner "$smtp_file" "$identity_uid" "SMTP password file has owner uid $identity_uid"
   else
     skip 'optional secret owner check skipped because this environment blocks chown'
   fi
@@ -529,6 +616,16 @@ check_validation() {
   else
     pass 'wizard rejects an invalid rotation flag'
   fi
+
+  if run_wizard "$tree" \
+    STACK_DOMAIN=example.test \
+    STACK_ROOTLESS=2 \
+    VAULTWARDEN_OIDC_ISSUER=https://auth.example.test \
+    VAULTWARDEN_OIDC_CLIENT_SECRET=test-secret; then
+    fail 'wizard rejects an invalid STACK_ROOTLESS value' 'the wizard accepted 2'
+  else
+    pass 'wizard rejects an invalid STACK_ROOTLESS value'
+  fi
 }
 
 # Check that the clean subcommand keeps the data without --data.
@@ -582,7 +679,8 @@ check_compose_fragment() {
   pass 'compose fragment exists'
   assert_line "$fragment" '    image: vaultwarden/server:1.37.4' 'fragment uses the official image tag'
   assert_line "$fragment" '    container_name: vaultwarden' 'fragment sets the container name'
-  assert_line "$fragment" '    user: "1000:1000"' 'fragment runs as uid 1000'
+  # shellcheck disable=SC2016
+  assert_line "$fragment" '    user: "${STACK_UID:-1000}:${STACK_GID:-1000}"' 'fragment runs as STACK_UID and STACK_GID'
   assert_line "$fragment" '      - SSO_CLIENT_SECRET_FILE=/run/secrets/vaultwarden/oidc-client-secret' 'fragment sets the OIDC secret file path'
   assert_line "$fragment" '      - ./config/vaultwarden/secrets:/run/secrets/vaultwarden:ro' 'fragment mounts the secret directory read-only'
   assert_no_line "$fragment" './config/vaultwarden/secrets/oidc-client-secret:/run/secrets/oidc-client-secret' 'fragment has no old single-file secret mount'
@@ -661,6 +759,7 @@ check_logs_for_secrets() {
 
 scratch="$(mktemp -d /tmp/vaultwarden-smoke.XXXXXX)"
 check_standalone
+check_rootless
 check_integrated
 check_validation
 check_optional_settings

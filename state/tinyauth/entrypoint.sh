@@ -61,8 +61,10 @@ readonly POLICY_RULES_JSON='key \"tinyauth/litefs\" { policy = \"write\" } sessi
 # The base image creates the tinyauth user with uid 1000 and gid 1000.
 # The base image keeps the binary in /tinyauth. It does not set USER, so the
 # container starts as root. gosu drops root before the app starts.
-EXEC_UID=1000
-EXEC_GID=1000
+# Rootless operation sets EXEC_UID and EXEC_GID to 0. Container root then maps
+# to the host user, which owns the mounted files.
+EXEC_UID="${EXEC_UID:-1000}"
+EXEC_GID="${EXEC_GID:-1000}"
 EXEC_BINARY=/tinyauth/tinyauth
 readonly EXEC_UID EXEC_GID EXEC_BINARY
 

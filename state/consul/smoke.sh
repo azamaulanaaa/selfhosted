@@ -156,6 +156,74 @@ check_vhost_descriptor() {
   fi
 }
 
+# Check that the compose fragment passes CONSUL_DISABLE_PERM_MGMT to the consul service.
+check_rootless_entrypoint() {
+  local fragment="$REPO_ROOT/compose/consul.yaml"
+  grep -qE '^[[:space:]]*- CONSUL_DISABLE_PERM_MGMT$' "$fragment" ||
+    fail "compose/consul.yaml does not pass CONSUL_DISABLE_PERM_MGMT."
+  if grep -qE '^[[:space:]]*- CONSUL_DISABLE_PERM_MGMT=' "$fragment"; then
+    fail "compose/consul.yaml sets a value for CONSUL_DISABLE_PERM_MGMT."
+  fi
+}
+
+# Check that the init command skips chown when STACK_ROOTLESS is 1.
+check_rootless_init_command() {
+  local fragment="$REPO_ROOT/compose/consul.yaml"
+  local chmod_count chown_count
+  grep -q 'STACK_ROOTLESS' "$fragment" ||
+    fail "compose/consul.yaml does not read STACK_ROOTLESS."
+  grep -q 'mkdir -p /consul/data' "$fragment" ||
+    fail "The init command does not create /consul/data on every path."
+  awk '
+    /^[[:space:]]*command:[[:space:]]*[|][[:space:]]*$/ { in_command = 1; next }
+    in_command && /^[[:space:]]*entrypoint:/ { in_command = 0 }
+    in_command && /else/ { in_else = 1 }
+    in_command && /chown/ {
+      if (!in_else) {
+        print "chown outside the rootful branch"
+        bad = 1
+      }
+    }
+    END { exit bad }
+  ' "$fragment" ||
+    fail "The init command runs chown outside the rootful branch."
+  chmod_count="$(grep -c 'chmod 0700 /consul/data' "$fragment")"
+  [ "$chmod_count" -eq 2 ] ||
+    fail "The init command does not set mode 0700 on both paths."
+  chown_count="$(grep -c 'chown 100:1000 /consul/data' "$fragment")"
+  [ "$chown_count" -eq 1 ] ||
+    fail "The init command does not keep one rootful chown."
+}
+
+# Check that grant_read_access has the rootless branch.
+check_grant_read_access_rootless() {
+  local wizard="$REPO_ROOT/state/consul/setup.sh"
+  local body
+  body="$(sed -n '/^grant_read_access()/,/^}/p' "$wizard")"
+  if ! printf '%s\n' "$body" | awk '
+    /stack_rootless/ { rootless = 1 }
+    !rootless && /chgrp/ { bad = 1 }
+    rootless && /chmod/ && /fallback_mode/ { fallback = 1 }
+    END { exit !(rootless && fallback && !bad) }
+  '; then
+    fail "grant_read_access has no rootless branch before chgrp."
+  fi
+}
+
+# Check that a rootless wizard run does not use group 1000.
+check_rootless_run() {
+  local tree="$1"
+  local mode
+  if grep -q 'Group 1000' "$tree/wizard.log"; then
+    fail "The rootless wizard run uses group 1000."
+  fi
+  [ -f "$tree/config/consul/secrets/agent.hcl" ] ||
+    fail "The rootless wizard did not write the secret file."
+  mode="$(stat -c '%a' "$tree/config/consul/secrets/agent.hcl")"
+  [ "$mode" = "600" ] ||
+    fail "The rootless secret file has mode $mode. Use mode 600."
+}
+
 # Check that no production file uses CONSUL_ENABLED.
 check_no_consul_enabled() {
   local file
@@ -195,7 +263,7 @@ check_acl_commands() {
 }
 
 main() {
-  local env_tree env_file_tree
+  local env_tree env_file_tree rootless_tree rootless_env_tree
 
   env_tree="$(new_scratch_tree)"
   run_wizard "$env_tree" "CONSUL_JOIN_IPS=10.0.0.12, 10.0.0.21" "CONSUL_BOOTSTRAP_EXPECT=3"
@@ -215,6 +283,18 @@ main() {
   check_single_bootstrap_expect "$env_file_tree"
   check_idempotent_run "$env_file_tree"
 
+  rootless_tree="$(new_scratch_tree)"
+  run_wizard "$rootless_tree" "STACK_ROOTLESS=1"
+  check_rootless_run "$rootless_tree"
+
+  rootless_env_tree="$(new_scratch_tree)"
+  printf 'STACK_ROOTLESS=1\n' >"$rootless_env_tree/.env"
+  run_wizard "$rootless_env_tree"
+  check_rootless_run "$rootless_env_tree"
+
+  check_rootless_entrypoint
+  check_rootless_init_command
+  check_grant_read_access_rootless
   check_bootstrap_mount
   check_vhost_descriptor
   check_no_consul_enabled

@@ -53,8 +53,10 @@ readonly POLICY_NAME="forgejo-litefs"
 readonly POLICY_RULES_JSON='key \"forgejo/litefs\" { policy = \"write\" } key \"forgejo/peers/\" { policy = \"write\" } session \"litefs\" { policy = \"write\" } session \"forgejo-peers\" { policy = \"write\" }'
 
 # Forgejo runs as uid 1000 and gid 1000 in the pinned base image.
-EXEC_UID=1000
-EXEC_GID=1000
+# Rootless nerdctl sets both values to 0. Container root maps to the host user,
+# and that mapping can read the host files.
+EXEC_UID="${EXEC_UID:-1000}"
+EXEC_GID="${EXEC_GID:-1000}"
 EXEC_BINARY=/app/gitea/gitea
 readonly EXEC_UID EXEC_GID EXEC_BINARY
 

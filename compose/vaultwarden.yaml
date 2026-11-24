@@ -32,4 +32,4 @@ services:
         host_ip: ${PUBLIC_IP:-127.0.0.1}
         protocol: tcp
     restart: unless-stopped
-    user: "1000:1000"
+    user: "${STACK_UID:-1000}:${STACK_GID:-1000}"

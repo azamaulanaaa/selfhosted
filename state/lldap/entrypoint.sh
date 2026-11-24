@@ -100,6 +100,22 @@ json_field() {
   grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -n1 | cut -d'"' -f4
 }
 
+# Print the Rules value of a Consul policy response.
+# The value stays JSON-encoded: an inner quote is the two characters \".
+# The comparison in create_litefs_token uses this encoded form.
+# Print nothing when the field is absent.
+json_rules_field() {
+  grep -o '"Rules"[[:space:]]*:[[:space:]]*"\([^"\\]\|\\.\)*"' |
+    head -n1 |
+    sed -e 's/^"Rules"[[:space:]]*:[[:space:]]*"//' -e 's/"$//'
+}
+
+# Print the JSON body for the LiteFS policy. The body holds no secret value.
+policy_body_json() {
+  printf '{"Name":"%s","Description":"LiteFS lease for the lldap cluster","Rules":"%s"}' \
+    "$POLICY_NAME" "$POLICY_RULES_JSON"
+}
+
 # Return 0 when the value contains only letters, digits, and hyphens.
 is_token_chars() {
   case "$1" in
@@ -112,8 +128,10 @@ is_token_chars() {
   esac
 }
 
-# Create or reuse the Consul policy and token for the LiteFS lease.
+# Create, update, or reuse the Consul policy and token for the LiteFS lease.
 # The policy grants write access to the lease key and to any Consul session.
+# An existing policy keeps its token. The function rewrites the rules when they
+# differ from POLICY_RULES_JSON.
 # The function prints the token on stdout.
 # Return 1 with a message on stderr when any step fails.
 create_litefs_token() {
@@ -144,13 +162,13 @@ create_litefs_token() {
 
   resp_file="${LITEFS_YML}.policy-response.json"
 
-  # Reuse the policy when it exists. Create it when it does not.
+  # Reuse the policy when it exists and its rules match. Update the rules when
+  # they differ. Create the policy when it does not exist.
   policy_code="$(curl -fsS -o "$resp_file" -w '%{http_code}' \
     -H "X-Consul-Token: $mgmt_token" \
     "$CONSUL_ADDR/v1/acl/policy/name/$POLICY_NAME" 2>/dev/null || true)"
   if [ "$policy_code" = "404" ]; then
-    policy_body="$(printf '{"Name":"%s","Description":"LiteFS lease for the lldap cluster","Rules":"%s"}' \
-      "$POLICY_NAME" "$POLICY_RULES_JSON")"
+    policy_body="$(policy_body_json)"
     policy_code="$(curl -fsS -o "$resp_file" -w '%{http_code}' \
       -X PUT -H "X-Consul-Token: $mgmt_token" \
       -H "Content-Type: application/json" \
@@ -162,7 +180,31 @@ create_litefs_token() {
     fi
     log "created the consul policy $POLICY_NAME"
   elif [ "$policy_code" = "200" ]; then
-    log "reusing the existing consul policy $POLICY_NAME"
+    existing_rules="$(json_rules_field <"$resp_file")"
+    if [ "$existing_rules" = "$POLICY_RULES_JSON" ]; then
+      log "reusing the existing consul policy $POLICY_NAME"
+    else
+      policy_id="$(json_field ID <"$resp_file")"
+      if [ -z "$policy_id" ]; then
+        err "the consul policy response has no ID."
+        return 1
+      fi
+      if ! is_token_chars "$policy_id"; then
+        err "the consul policy ID has unexpected characters."
+        return 1
+      fi
+      policy_body="$(policy_body_json)"
+      policy_code="$(curl -fsS -o "$resp_file" -w '%{http_code}' \
+        -X PUT -H "X-Consul-Token: $mgmt_token" \
+        -H "Content-Type: application/json" \
+        -d "$policy_body" \
+        "$CONSUL_ADDR/v1/acl/policy/$policy_id" 2>/dev/null || true)"
+      if [ "$policy_code" != "200" ]; then
+        err "could not update the consul policy $POLICY_NAME (HTTP $policy_code)."
+        return 1
+      fi
+      log "updated the rules of the consul policy $POLICY_NAME"
+    fi
   else
     err "could not read the consul policy $POLICY_NAME (HTTP $policy_code)."
     return 1

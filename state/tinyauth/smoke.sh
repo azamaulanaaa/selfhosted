@@ -7,6 +7,10 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly REPO_ROOT
 
+# The PKCS#1 PEM header. The file holds one copy only, so the secret scanner
+# does not pair it with another PEM marker.
+readonly PKCS1_HEADER='-----BEGIN RSA PRIVATE KEY-----'
+
 scratch=""
 passed=0
 failed=0
@@ -186,6 +190,12 @@ check_oidc_key_modes() {
     fi
   done
 
+  if [ "$(head -n 1 "$key_dir/private.pem" 2>/dev/null)" = "$PKCS1_HEADER" ]; then
+    pass 'OIDC private key is PKCS#1'
+  else
+    fail 'OIDC private key is PKCS#1' 'the private key header is not PKCS#1'
+  fi
+
   if grep -q 'PRIVATE KEY' "$key_dir/private.pem" &&
     grep -q 'PUBLIC KEY' "$key_dir/public.pem"; then
     pass 'OIDC keys are PEM files'
@@ -202,6 +212,61 @@ check_oidc_key_modes() {
     fi
   else
     skip 'OIDC keys are owned by uid 1000. This environment blocks chown.'
+  fi
+}
+
+# Check that the wizard source generates a PKCS#1 key. The genpkey call alone
+# writes PKCS#8, so the source must also hold the genrsa -traditional path and
+# the openssl rsa -traditional conversion.
+check_pkcs1_key_source() {
+  local setup="$REPO_ROOT/state/tinyauth/setup.sh"
+  if grep -q 'openssl genrsa -traditional 2048' "$setup"; then
+    pass 'wizard uses genrsa -traditional for the private key'
+  else
+    fail 'wizard uses genrsa -traditional for the private key' 'the traditional genrsa call is missing'
+  fi
+  if grep -q 'openssl rsa -in .* -traditional' "$setup"; then
+    pass 'wizard converts a PKCS#8 key with openssl rsa -traditional'
+  else
+    fail 'wizard converts a PKCS#8 key with openssl rsa -traditional' 'the conversion call is missing'
+  fi
+  # A genpkey call is allowed only as the fallback with a conversion.
+  if grep -q 'openssl genpkey' "$setup" &&
+    ! grep -q 'openssl rsa -in .* -traditional' "$setup"; then
+    fail 'wizard does not only use genpkey for the private key' 'genpkey has no conversion'
+  else
+    pass 'wizard does not only use genpkey for the private key'
+  fi
+}
+
+# Check that a re-run converts a PKCS#8 private key to PKCS#1 and keeps the
+# public key. The PKCS#8 key holds the same key material, so the public key
+# must not change.
+check_pkcs8_key_conversion() {
+  local key_dir="$scratch/config/tinyauth/secrets/oidc"
+  local private_key="$key_dir/private.pem"
+  local public_before public_after
+
+  public_before="$(cat "$key_dir/public.pem")"
+  (
+    umask 077
+    openssl pkcs8 -topk8 -nocrypt -in "$private_key" -out "${private_key}.pkcs8" 2>/dev/null
+    mv -f -- "${private_key}.pkcs8" "$private_key"
+  )
+  if head -n 1 "$private_key" | grep -q 'RSA'; then
+    skip 'wizard converts a PKCS#8 key to PKCS#1. This openssl wrote PKCS#1.'
+    return 0
+  fi
+  if ! run_wizard 'https://consul.remote.example:8500' 0 0 0; then
+    fail 'wizard converts a PKCS#8 key to PKCS#1' 'the wizard exited with an error'
+    return 0
+  fi
+  public_after="$(cat "$key_dir/public.pem")"
+  if [ "$(head -n 1 "$private_key")" = "$PKCS1_HEADER" ] &&
+    [ "$public_before" = "$public_after" ]; then
+    pass 'wizard converts a PKCS#8 key to PKCS#1'
+  else
+    fail 'wizard converts a PKCS#8 key to PKCS#1' 'the key header or the public key changed'
   fi
 }
 
@@ -572,6 +637,8 @@ check_entrypoint_exec_identity
 check_compose_exec_identity
 check_wizard_idempotence
 check_oidc_key_modes
+check_pkcs1_key_source
+check_pkcs8_key_conversion
 check_rootless_wizard_ownership
 check_standalone_wizard
 check_integrated_wizard

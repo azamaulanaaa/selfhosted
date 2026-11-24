@@ -7,6 +7,7 @@
 #   {{ or (env "NAME") "default" }}
 #   {{ file "PATH" | trimSpace }}
 #   {{ if eq (env "NAME") "VALUE" }} ... {{ else }} ... {{ end }}
+#   {{ if eq (env "NAME") "VALUE" }}A{{ else }}B{{ end }}
 # Lines between the peer block markers are dropped. This script never prints a
 # secret value.
 # Usage: render.sh <template> <output>
@@ -94,6 +95,53 @@ parent_active=1
 branch_active=1
 in_peer_block=0
 
+# Check that a line holds one inline conditional.
+is_inline_conditional() {
+  case "$1" in
+  *'{{ if eq'*'{{ end }}'*) return 0 ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+# Render one line that holds an inline conditional. The line holds one
+# {{ if eq (env "NAME") "VALUE" }} expression, one optional {{ else }}
+# expression, and one {{ end }} expression.
+render_inline_conditional() {
+  line="$1"
+  prefix="${line%%"{{ if eq"*}"
+  rest="${line#*"{{ if eq"}"
+  expression="${rest%%"}}"*}"
+  rest="${rest#*"}}"}"
+  var="$(printf '%s\n' "$expression" | sed -n 's/.*env "\([^"]*\)".*/\1/p')"
+  want="$(printf '%s\n' "$expression" | sed -n 's/.*) "\([^"]*\)".*/\1/p')"
+  case "$rest" in
+  *'{{ else }}'*)
+    then_body="${rest%%"{{ else }}"*}"
+    rest="${rest#*"{{ else }}"}"
+    else_body="${rest%%"{{ end }}"*}"
+    suffix="${rest#*"{{ end }}"}"
+    ;;
+  *)
+    then_body="${rest%%"{{ end }}"*}"
+    else_body=""
+    suffix="${rest#*"{{ end }}"}"
+    ;;
+  esac
+  if [ "$(env_value "$var")" = "$want" ]; then
+    body="$then_body"
+  else
+    body="$else_body"
+  fi
+  rendered="$(substitute_line "${prefix}${body}${suffix}")"
+  # An empty result drops the line. consul-template renders no blank line.
+  if [ -z "$rendered" ]; then
+    return 0
+  fi
+  printf '%s\n' "$rendered"
+}
+
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
   '# BEGIN CONSUL PEER BLOCK'*)
@@ -106,6 +154,13 @@ while IFS= read -r line || [ -n "$line" ]; do
     ;;
   esac
   if [ "$in_peer_block" -eq 1 ]; then
+    continue
+  fi
+
+  if is_inline_conditional "$line"; then
+    if [ "$active" -eq 1 ]; then
+      render_inline_conditional "$line" >>"$output_file"
+    fi
     continue
   fi
 

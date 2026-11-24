@@ -6,7 +6,8 @@
 
 [DEFAULT]
 APP_NAME = {{ or (env "FORGEJO_APP_NAME") "Forgejo" }}
-RUN_USER = git
+RUN_USER = {{ if eq (env "EXEC_UID") "0" }}root{{ else }}git{{ end }}
+{{ if eq (env "EXEC_UID") "0" }}I_AM_BEING_UNSAFE_RUNNING_AS_ROOT = true{{ end }}
 RUN_MODE = prod
 
 [server]

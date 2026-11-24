@@ -43,7 +43,6 @@ check_lacks() {
 
 # Load the entrypoint functions without starting the container.
 # shellcheck source=state/caddy/entrypoint.sh
-# shellcheck disable=SC1091
 CADDY_ENTRYPOINT_LIB=1 . state/caddy/entrypoint.sh
 
 # Check the local and remote token file selection.
@@ -57,10 +56,7 @@ CADDY_ENTRYPOINT_LIB=1 . state/caddy/entrypoint.sh
 # Check that the token reader selects the file for the address.
 printf '%s\n' 'agent {' '  initial_management = "local-test-token"' '}' >"$scratch/agent.hcl"
 printf '%s\n' 'remote-test-token' >"$scratch/remote-token"
-# The sourced entrypoint reads these paths in its token helpers.
-# shellcheck disable=SC2034
 MANAGEMENT_FILE="$scratch/agent.hcl"
-# shellcheck disable=SC2034
 REMOTE_TOKEN_FILE="$scratch/remote-token"
 consul_addr="$test_local_addr"
 [ "$(read_management_token)" = "local-test-token" ] ||
@@ -82,6 +78,49 @@ check_contains "$template" 'eq (sprig_toString $mode) "static"'
 check_contains "$template" 'reverse_proxy {{ sprig_toString $upstream }} {'
 check_contains "$template" 'header_up Host {host}'
 check_contains "$template" 'header_up X-Real-IP {remote_host}'
+
+# Extract one named template definition. Stop at the closing end at column 1.
+template_block() {
+  sed -n "/{{ define \"$1\" }}/,/^{{ end }}$/p" "$template"
+}
+
+# The smart_proxy template falls back to the local upstream when the LiteFS
+# KV key is absent. The fallback must hold the local reverse_proxy.
+smart_proxy_block="$(template_block smart_proxy)"
+printf '%s\n' "$smart_proxy_block" | grep -Fq '{{ else }}' ||
+  fail "The smart_proxy template misses the else branch."
+printf '%s\n' "$smart_proxy_block" | awk '
+  index($0, "{{ else }}") { fallback = 1; next }
+  fallback && index($0, "reverse_proxy {{ $local_addr }} {") { found = 1 }
+  END { exit(found ? 0 : 1) }
+' || fail "The smart_proxy template does not fall back to the local upstream."
+
+# Check the entrypoint ACL and CA bundle paths.
+entrypoint="state/caddy/entrypoint.sh"
+check_contains "$entrypoint" 'create_read_acl_with_curl'
+check_contains "$entrypoint" 'consul_api()'
+check_contains "$entrypoint" 'X-Consul-Token'
+check_contains "$entrypoint" '/v1/acl/policy'
+check_contains "$entrypoint" '/v1/acl/token'
+check_contains "$entrypoint" 'write_ca_bundle'
+check_contains "$entrypoint" 'write_ca_bundle &'
+check_contains "$entrypoint" 'ca-bundle.crt'
+check_contains "$entrypoint" 'intermediate.crt'
+
+# Check the CA bundle holds the intermediate first, then the root.
+ca_store="$scratch/ca-store"
+mkdir -p "$ca_store/pki/authorities/local"
+printf 'test-intermediate\n' >"$ca_store/pki/authorities/local/intermediate.crt"
+printf 'test-root\n' >"$ca_store/pki/authorities/local/root.crt"
+saved_store="$STORE"
+STORE="$ca_store"
+write_ca_bundle >/dev/null 2>&1
+STORE="$saved_store"
+expected_ca_bundle="$(printf 'test-intermediate\ntest-root\n')"
+[ "$(cat "$ca_store/ca-bundle.crt")" = "$expected_ca_bundle" ] ||
+  fail "The CA bundle does not hold the intermediate first and the root second."
+[ "$(stat -c '%a' "$ca_store/ca-bundle.crt")" = "644" ] ||
+  fail "The CA bundle does not have mode 0644."
 
 # Check the registry file selection and the vhost block header.
 check_contains "$template" 'env "CADDY_VHOSTS_FILE"'
@@ -212,4 +251,4 @@ check_contains "$scratch/fallback-error.txt" \
 check_contains "$scratch/fallback-error.txt" "vaultwarden:<fullchain>:<key>"
 check_lacks "$scratch/fallback-error.txt" "garage"
 
-echo "Checked the caddy template, vhost registry, fallback vhosts, TLS list, token selection, and consul-template address."
+echo "Checked the caddy template, local fallback, ACL paths, CA bundle, vhost registry, fallback vhosts, TLS list, token selection, and consul-template address."

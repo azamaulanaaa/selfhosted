@@ -170,6 +170,7 @@ check_compose_consul_contract() {
 }
 
 # Check that the rootless identity reaches the entrypoint.
+# Check that the rootless app user and the unsafe-root key follow EXEC_UID.
 # The wizard reads STACK_ROOTLESS, and the compose fragment maps STACK_UID and
 # STACK_GID to EXEC_UID and EXEC_GID.
 check_rootless_contract() {
@@ -314,6 +315,39 @@ check_integrated() {
   echo "smoke: integrated mode passed."
 }
 
+# Render the rootless mode into the scratch tree.
+render_rootless() {
+  mode_dir="$scratch/rootless"
+  mkdir -p "$mode_dir/secrets"
+  printf 'test-secret-key' >"$mode_dir/secrets/secret-key"
+  env \
+    SECRET_FILE_ROOT="$mode_dir/secrets" \
+    EXEC_UID=0 \
+    EXEC_GID=0 \
+    LITEFS_ENABLED=0 \
+    OIDC_ENABLED=0 \
+    TLS_ENABLED=0 \
+    STACK_DOMAIN=sh.lan \
+    PUBLIC_IP=127.0.0.1 \
+    FORGEJO_APP_NAME=Forgejo \
+    sh "$RENDER" "$APP_TPL" "$mode_dir/app.ini"
+}
+
+# Check that the app user and the unsafe-root key follow EXEC_UID.
+# Rootless mode runs the app as container root. Forgejo refuses root unless
+# the unsafe-root key is set. The normal uid-1000 mode sets neither.
+check_rootless_app_user() {
+  mode_dir="$scratch/rootless"
+  app_ini="$mode_dir/app.ini"
+  expect_contains "$APP_TPL" 'RUN_USER = {{ if eq (env "EXEC_UID") "0" }}root{{ else }}git{{ end }}' "app.ini template"
+  expect_contains "$APP_TPL" '{{ if eq (env "EXEC_UID") "0" }}I_AM_BEING_UNSAFE_RUNNING_AS_ROOT = true{{ end }}' "app.ini template"
+  expect_line "$app_ini" "RUN_USER = root" "rootless app.ini"
+  expect_line "$app_ini" "I_AM_BEING_UNSAFE_RUNNING_AS_ROOT = true" "rootless app.ini"
+  expect_line "$scratch/standalone/out/app.ini" "RUN_USER = git" "standalone app.ini"
+  expect_no_text "$scratch/standalone/out/app.ini" "I_AM_BEING_UNSAFE_RUNNING_AS_ROOT" "standalone app.ini"
+  echo "smoke: rootless app user passed."
+}
+
 # Check the sh.lan fallback when STACK_DOMAIN is not set.
 check_domain_fallback() {
   mode_dir="$scratch/fallback"
@@ -334,6 +368,8 @@ render_standalone
 check_standalone
 render_integrated
 check_integrated
+render_rootless
+check_rootless_app_user
 check_domain_fallback
 check_compose_port_bindings
 check_peer_service_no_build

@@ -40,6 +40,10 @@
 #                             For Caddy with the internal CA and the domain URL,
 #                             set TLS_ENABLED=1 and CADDY_TLS_MODE=internal.
 #   STACK_ROOTLESS            1 runs the container as root for rootless nerdctl.
+#                             The app runs as container root, not as git.
+#                             Forgejo refuses root unless app.ini sets
+#                             I_AM_BEING_UNSAFE_RUNNING_AS_ROOT. The template
+#                             sets this key when EXEC_UID=0.
 #                             0 runs it as uid 1000 and gid 1000. Read from the
 #                             environment, then the root .env, then 0.
 #                             This wizard does not chown. The host user owns the

@@ -784,6 +784,6 @@ echo "note: the caddy service publishes ports 80 and 443."
 if [ "$consul_mode" = "local" ]; then
   echo "hint: consul must run too (docker compose up -d consul)."
 fi
-echo "hint: the entrypoint creates the caddy read ACL when the consul CLI is in the image."
+echo "hint: the entrypoint creates the caddy read ACL with the consul CLI, or with curl through the Consul HTTP API."
 echo "Next step: docker compose up -d caddy"
 echo "hint: the caddy image is built locally from state/caddy/Dockerfile (build context ./state/caddy)."

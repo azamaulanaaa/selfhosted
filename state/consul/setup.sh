@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Generate the Consul wizard files for this stack.
 # Safe to run again: it rewrites local.hcl and keeps the secret file unless you rotate.
+# The secret file holds the acl.tokens.agent key. A rerun migrates the old
+# acl.tokens.initial_agent value to the agent key.
 # It never prints secret values. It prints paths only.
 #
 # The root dispatcher (setup.sh) calls this script. It can also run standalone.
@@ -855,6 +857,36 @@ current_gossip_key() {
   grep -E '^[[:space:]]*encrypt' config/consul/secrets/agent.hcl | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
+# Print the value of a token key from the agent secret file.
+# Print nothing when the file or the key is missing.
+secret_token_value() {
+  local key="$1"
+  if [ ! -f config/consul/secrets/agent.hcl ]; then
+    return 0
+  fi
+  { grep -E "^[[:space:]]*${key}[[:space:]]*=" config/consul/secrets/agent.hcl || true; } |
+    head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
+# Print the current agent token. Read the agent key first, then the old initial_agent key.
+# The old key is deprecated. Consul 2.1.0 rejects it.
+current_agent_token() {
+  local value
+  value="$(secret_token_value agent)"
+  if [ -z "$value" ]; then
+    value="$(secret_token_value initial_agent)"
+  fi
+  printf '%s\n' "$value"
+}
+
+# Return 0 when the agent secret file holds the old initial_agent key.
+has_legacy_agent_key() {
+  if [ ! -f config/consul/secrets/agent.hcl ]; then
+    return 1
+  fi
+  grep -qE '^[[:space:]]*initial_agent[[:space:]]*=' config/consul/secrets/agent.hcl
+}
+
 # Resolve the shared gossip key. Store the key in the backed-up secrets tree.
 # Create a new key when the file is missing or when rotation was accepted.
 # The operator copies the key file to every node in the cluster.
@@ -885,9 +917,11 @@ resolve_gossip_key() {
 # Step 4: write the secret file.
 # The gossip key comes from the shared key file, so every cluster node uses the same key.
 # The ACL tokens stay the same unless the user rotates them.
+# The agent token uses the agent key. A file with the old initial_agent key is migrated.
 secret_state="kept"
 resolve_gossip_key
 needs_write=0
+agent_token="$(current_agent_token)"
 if [ ! -f config/consul/secrets/agent.hcl ] || [ "$rotate" -eq 1 ]; then
   needs_write=1
   if [ -f config/consul/secrets/agent.hcl ]; then
@@ -898,19 +932,26 @@ if [ ! -f config/consul/secrets/agent.hcl ] || [ "$rotate" -eq 1 ]; then
 elif [ "$(current_gossip_key)" != "$encrypt_key" ]; then
   needs_write=1
   secret_state="updated"
+elif has_legacy_agent_key || [ -z "$agent_token" ]; then
+  needs_write=1
+  secret_state="migrated"
 fi
 if [ "$needs_write" -eq 1 ]; then
-  if [ "$secret_state" = "updated" ]; then
-    initial_management="$(grep -E '^[[:space:]]*initial_management' config/consul/secrets/agent.hcl | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
-    initial_agent="$(grep -E '^[[:space:]]*initial_agent' config/consul/secrets/agent.hcl | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
-    if [ -z "$initial_management" ] || [ -z "$initial_agent" ]; then
-      initial_management="$(openssl rand -hex 32)"
-      initial_agent="$(openssl rand -hex 32)"
-    fi
-  else
+  case "$secret_state" in
+  created | rotated)
     initial_management="$(openssl rand -hex 32)"
-    initial_agent="$(openssl rand -hex 32)"
-  fi
+    agent_token="$(openssl rand -hex 32)"
+    ;;
+  *)
+    initial_management="$(secret_token_value initial_management)"
+    if [ -z "$initial_management" ]; then
+      initial_management="$(openssl rand -hex 32)"
+    fi
+    if [ -z "$agent_token" ]; then
+      agent_token="$(openssl rand -hex 32)"
+    fi
+    ;;
+  esac
   (
     umask 077
     {
@@ -919,7 +960,7 @@ if [ "$needs_write" -eq 1 ]; then
       printf 'acl {\n'
       printf '  tokens {\n'
       printf '    initial_management = "%s"\n' "$initial_management"
-      printf '    initial_agent = "%s"\n' "$initial_agent"
+      printf '    agent = "%s"\n' "$agent_token"
       printf '  }\n'
       printf '}\n'
     } >config/consul/secrets/agent.hcl
@@ -984,6 +1025,9 @@ rotated)
   ;;
 updated)
   echo "  config/consul/secrets/agent.hcl (key updated)"
+  ;;
+migrated)
+  echo "  config/consul/secrets/agent.hcl (agent key migrated)"
   ;;
 *)
   echo "  config/consul/secrets/agent.hcl (kept)"

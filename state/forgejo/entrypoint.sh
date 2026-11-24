@@ -160,9 +160,10 @@ is_valid_ipv4() {
   [ "$local_octet_count" -eq 4 ]
 }
 
-# Create or reuse the Consul policy and token for the LiteFS lease.
+# Create, update, or reuse the Consul policy and token for the LiteFS lease.
 # The policy grants write access to the lease key, the peer keys, and the
-# sessions. The function prints the token on stdout.
+# sessions. When the stored rules differ from the current rules, the function
+# updates the policy. The function prints the token on stdout.
 # Return 1 with a message on stderr when any step fails.
 create_litefs_token() {
   mgmt_token="$1"
@@ -176,6 +177,7 @@ create_litefs_token() {
   fi
 
   resp_file="${LITEFS_YML}.policy-response.json"
+  policy_id=""
 
   # Reuse the policy when it exists. Create it when it does not.
   policy_code="$(curl -fsS -o "$resp_file" -w '%{http_code}' \
@@ -195,13 +197,42 @@ create_litefs_token() {
     fi
     log "created the consul policy $POLICY_NAME"
   elif [ "$policy_code" = "200" ]; then
-    log "reusing the existing consul policy $POLICY_NAME"
+    # Read the stored rules. The response holds the rules as an escaped JSON
+    # string, so the comparison uses the escaped form of POLICY_RULES_JSON.
+    policy_rules="$(sed -nE 's/.*"Rules"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)".*/\1/p' "$resp_file" | head -n1)"
+    if [ "$policy_rules" = "$POLICY_RULES_JSON" ]; then
+      log "reusing the existing consul policy $POLICY_NAME"
+    else
+      policy_id="$(json_field ID <"$resp_file")"
+      if [ -z "$policy_id" ]; then
+        err "the consul policy response has no ID."
+        return 1
+      fi
+      if ! is_token_chars "$policy_id"; then
+        err "the consul policy ID has unexpected characters."
+        return 1
+      fi
+      policy_body="$(printf '{"Name":"%s","Description":"LiteFS lease for the forgejo cluster","Rules":"%s"}' \
+        "$POLICY_NAME" "$POLICY_RULES_JSON")"
+      policy_code="$(curl -fsS -o "$resp_file" -w '%{http_code}' \
+        -X PUT -H "X-Consul-Token: $mgmt_token" \
+        -H "Content-Type: application/json" \
+        -d "$policy_body" \
+        "$CONSUL_ADDR/v1/acl/policy/$policy_id" 2>/dev/null || true)"
+      if [ "$policy_code" != "200" ]; then
+        err "could not update the consul policy $POLICY_NAME (HTTP $policy_code)."
+        return 1
+      fi
+      log "updated the consul policy $POLICY_NAME"
+    fi
   else
     err "could not read the consul policy $POLICY_NAME (HTTP $policy_code)."
     return 1
   fi
 
-  policy_id="$(json_field ID <"$resp_file")"
+  if [ -z "$policy_id" ]; then
+    policy_id="$(json_field ID <"$resp_file")"
+  fi
   if [ -z "$policy_id" ]; then
     err "the consul policy response has no ID."
     return 1

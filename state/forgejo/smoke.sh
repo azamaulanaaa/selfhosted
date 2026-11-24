@@ -165,10 +165,15 @@ check_litefs_token_contract() {
 
 # Check that the LiteFS ACL covers the hostname-based session name.
 # The token stays scoped to the lease key and the peer keys.
+# The entrypoint updates a stored policy when its rules differ.
 check_litefs_policy_contract() {
   expect_contains "$ENTRYPOINT" 'key \"forgejo/litefs\" { policy = \"write\" }' "entrypoint"
   expect_contains "$ENTRYPOINT" 'session_prefix \"\" { policy = \"write\" }' "entrypoint"
   expect_no_text "$ENTRYPOINT" 'session \"litefs\"' "entrypoint"
+  expect_contains "$ENTRYPOINT" "policy_rules=" "entrypoint"
+  expect_contains "$ENTRYPOINT" "if [ \"\$policy_rules\" = \"\$POLICY_RULES_JSON\" ]; then" "entrypoint"
+  expect_contains "$ENTRYPOINT" "/v1/acl/policy/\$policy_id" "entrypoint"
+  expect_contains "$ENTRYPOINT" "updated the consul policy" "entrypoint"
   echo "smoke: LiteFS policy contract passed."
 }
 

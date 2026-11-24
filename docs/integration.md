@@ -110,6 +110,20 @@ not run two nodes on one SQLite file. See
 [`docs/vaultwarden.md`](vaultwarden.md) and
 [`docs/scaling.md`](scaling.md).
 
+## Vhost registry
+
+Each web service commits one descriptor at `state/<service>/vhost.json`.
+
+The root wizard assembles the descriptors of the enabled services into
+`config/caddy/vhosts.json` and `config/caddy/vhosts.txt`. Caddy renders one
+vhost per descriptor.
+
+Garage has no descriptor and no Caddy vhost.
+
+After the enabled service set changes, rerun `setup.sh` and restart caddy.
+
+The descriptor schema is in [`docs/layout.md`](layout.md#vhost-registry).
+
 ## Capability flags
 
 The root `.env` file holds three capability flags:

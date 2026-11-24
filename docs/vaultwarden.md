@@ -77,6 +77,13 @@ detects `state/tinyauth/setup.sh`. It then defaults the issuer to
 `https://tinyauth.<STACK_DOMAIN>` and the client ID to `vaultwarden`. The
 Caddy vhost serves `vaultwarden.<STACK_DOMAIN>` and proxies `vaultwarden:80`.
 
+The service has the vhost descriptor `state/vaultwarden/vhost.json`. The
+descriptor uses `static` mode with the upstream `http://vaultwarden:80`. It
+sets `x_real_ip`, so Caddy sends `X-Real-IP` and Vaultwarden reads that
+header. The root wizard assembles the enabled descriptors into
+`config/caddy/vhosts.json`. The descriptor schema is in
+[layout](layout.md#vhost-registry).
+
 ## Setup
 
 Run the wizard from the repository root:
@@ -305,7 +312,7 @@ bash state/vaultwarden/smoke.sh
 
 The check uses scratch trees. It needs no Docker, no Consul, and no network.
 It covers both modes, the file modes, the disabled features, the compose
-fragment, and the scaling manifest.
+fragment, the scaling manifest, and the vhost descriptor.
 
 The compose fragment is `compose/vaultwarden.yaml`. Regenerate the root
 `compose.yaml` with this command after a fragment change:

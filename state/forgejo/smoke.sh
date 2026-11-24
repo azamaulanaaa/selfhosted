@@ -149,6 +149,20 @@ check_consul_contract() {
   echo "smoke: Consul contract passed."
 }
 
+# Check that LiteFS reads the Consul token from the process environment.
+# LiteFS reads CONSUL_HTTP_TOKEN. It does not read CONSUL_HTTP_TOKEN_FILE.
+check_litefs_token_contract() {
+  expect_contains "$ENTRYPOINT" "CONSUL_HTTP_TOKEN=\"\$token\" litefs mount -config \"\$LITEFS_YML\" &" "entrypoint"
+  litefs_line="$(grep -F -- 'litefs mount -config' "$ENTRYPOINT" || true)"
+  if [ -z "$litefs_line" ]; then
+    fail "the entrypoint has no litefs mount line."
+  fi
+  if printf '%s\n' "$litefs_line" | grep -Fq -- 'CONSUL_HTTP_TOKEN_FILE'; then
+    fail "the LiteFS start line must use CONSUL_HTTP_TOKEN, not CONSUL_HTTP_TOKEN_FILE."
+  fi
+  echo "smoke: LiteFS token contract passed."
+}
+
 # Check that the templates gate their optional blocks on the right flags.
 check_template_gates() {
   expect_contains "$APP_TPL" '{{ if eq (env "TLS_ENABLED") "1" }}' "app.ini template"
@@ -374,6 +388,7 @@ check_domain_fallback
 check_compose_port_bindings
 check_peer_service_no_build
 check_consul_contract
+check_litefs_token_contract
 check_template_gates
 check_compose_consul_contract
 check_rootless_contract

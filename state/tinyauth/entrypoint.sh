@@ -226,8 +226,9 @@ check_litefs_token() {
 }
 
 # Render the LiteFS configuration. Values come from the container environment.
-# The file must not contain secrets. The token travels through
-# the CONSUL_HTTP_TOKEN_FILE environment variable instead.
+# The file must not contain secrets. LiteFS reads the Consul token from the
+# CONSUL_HTTP_TOKEN environment variable. LiteFS does not read
+# CONSUL_HTTP_TOKEN_FILE. The start command passes the token value directly.
 render_integrated_config() {
   mkdir -p "$LITEFS_DATA_DIR"
   chmod 0700 "$LITEFS_DATA_DIR"
@@ -328,7 +329,7 @@ start_integrated() {
   log "litefs internal data lives at $LITEFS_DATA_DIR (back this up)"
   log "the app data is created on the elected primary at first boot"
 
-  CONSUL_HTTP_TOKEN_FILE="$TOKEN_FILE" litefs mount -config "$LITEFS_YML" &
+  CONSUL_HTTP_TOKEN="$token" litefs mount -config "$LITEFS_YML" &
   litefs_pid=$!
 
   # Forward signals to litefs. Docker stops the container with SIGTERM.

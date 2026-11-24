@@ -83,6 +83,8 @@ check_entrypoint_modes() {
   assert_line "$ENTRYPOINT" 'exec gosu' 'The branch without LiteFS lacks the direct LLDAP start.'
   assert_line "$ENTRYPOINT" 'initial_management' 'The entrypoint does not read the local Consul token.'
   assert_line "$ENTRYPOINT" 'litefs mount -config' 'The LiteFS branch lacks the LiteFS start.'
+  assert_line "$ENTRYPOINT" 'CONSUL_HTTP_TOKEN="$token" litefs mount -config "$LITEFS_YML" &' 'The LiteFS start does not pass the Consul token value.'
+  assert_no_line "$ENTRYPOINT" 'CONSUL_HTTP_TOKEN_FILE="$RUNTIME_TOKEN_FILE" litefs mount' 'The LiteFS start still passes CONSUL_HTTP_TOKEN_FILE.'
   assert_no_line "$ENTRYPOINT" 'CONSUL_HTTP_ADDR' 'The entrypoint still holds the old Consul address key.'
 }
 

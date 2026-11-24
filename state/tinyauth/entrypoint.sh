@@ -107,6 +107,42 @@ json_field() {
   grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -n1 | cut -d'"' -f4
 }
 
+# Print the Rules value from a Consul policy JSON response.
+# Print the value in its JSON-escaped form, which matches POLICY_RULES_JSON.
+# Print nothing when the field is absent.
+# The scan copies each escaped pair and stops at the first bare quote.
+policy_rules() {
+  awk '
+    {
+      marker = "\"Rules\":"
+      start = index($0, marker)
+      if (start == 0) {
+        exit
+      }
+      rest = substr($0, start + length(marker))
+      sub(/^[[:space:]]*/, "", rest)
+      if (substr(rest, 1, 1) != "\"") {
+        exit
+      }
+      rest = substr(rest, 2)
+      value = ""
+      for (i = 1; i <= length(rest); i++) {
+        ch = substr(rest, i, 1)
+        if (ch == "\\") {
+          value = value ch substr(rest, i + 1, 1)
+          i++
+          continue
+        }
+        if (ch == "\"") {
+          print value
+          exit
+        }
+        value = value ch
+      }
+    }
+  '
+}
+
 # Return 0 when the value contains only letters, digits, and hyphens.
 is_token_chars() {
   case "$1" in
@@ -143,9 +179,11 @@ create_litefs_token() {
   resp_file="${LITEFS_YML}.policy-response.json"
 
   # Reuse the policy when it exists. Create it when it does not.
+  # Update an existing policy when its rules differ from POLICY_RULES_JSON.
   policy_code="$(curl -fsS -o "$resp_file" -w '%{http_code}' \
     -H "X-Consul-Token: $mgmt_token" \
     "$CONSUL_ADDR/v1/acl/policy/name/$POLICY_NAME" 2>/dev/null || true)"
+  policy_id=""
   if [ "$policy_code" = "404" ]; then
     policy_body="$(printf '{"Name":"%s","Description":"LiteFS lease for the tinyauth cluster","Rules":"%s"}' \
       "$POLICY_NAME" "$POLICY_RULES_JSON")"
@@ -160,20 +198,46 @@ create_litefs_token() {
     fi
     log "created the consul policy $POLICY_NAME"
   elif [ "$policy_code" = "200" ]; then
-    log "reusing the existing consul policy $POLICY_NAME"
+    policy_id="$(json_field ID <"$resp_file")"
+    if [ -z "$policy_id" ]; then
+      err "the consul policy response has no ID."
+      return 1
+    fi
+    if ! is_token_chars "$policy_id"; then
+      err "the consul policy ID has unexpected characters."
+      return 1
+    fi
+    existing_rules="$(policy_rules <"$resp_file")"
+    if [ "$existing_rules" = "$POLICY_RULES_JSON" ]; then
+      log "reusing the existing consul policy $POLICY_NAME"
+    else
+      policy_body="$(printf '{"Name":"%s","Rules":"%s"}' "$POLICY_NAME" "$POLICY_RULES_JSON")"
+      policy_code="$(curl -fsS -o "$resp_file" -w '%{http_code}' \
+        -X PUT -H "X-Consul-Token: $mgmt_token" \
+        -H "Content-Type: application/json" \
+        -d "$policy_body" \
+        "$CONSUL_ADDR/v1/acl/policy/$policy_id" 2>/dev/null || true)"
+      if [ "$policy_code" != "200" ]; then
+        err "could not update the consul policy $POLICY_NAME (HTTP $policy_code)."
+        return 1
+      fi
+      log "updated the consul policy $POLICY_NAME"
+    fi
   else
     err "could not read the consul policy $POLICY_NAME (HTTP $policy_code)."
     return 1
   fi
 
-  policy_id="$(json_field ID <"$resp_file")"
   if [ -z "$policy_id" ]; then
-    err "the consul policy response has no ID."
-    return 1
-  fi
-  if ! is_token_chars "$policy_id"; then
-    err "the consul policy ID has unexpected characters."
-    return 1
+    policy_id="$(json_field ID <"$resp_file")"
+    if [ -z "$policy_id" ]; then
+      err "the consul policy response has no ID."
+      return 1
+    fi
+    if ! is_token_chars "$policy_id"; then
+      err "the consul policy ID has unexpected characters."
+      return 1
+    fi
   fi
 
   token_body="$(printf '{"Name":"%s","Policies":[{"ID":"%s"}]}' "$POLICY_NAME" "$policy_id")"

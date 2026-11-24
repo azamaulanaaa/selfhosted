@@ -4,13 +4,16 @@
 # Consul runs in this stack (local) or outside it (remote). The CONSUL_ADDR
 # value selects the location. A service never asks about Consul.
 # The per-service wizards live in state/<service>/setup.sh.
+# When caddy is enabled, the script assembles the enabled service vhost
+# descriptors into config/caddy/vhosts.json and config/caddy/vhosts.txt.
 # The stack assembles compose services with include. compose requires .env; this script creates it when it is missing.
 # Safe to run again: the per-service wizards are idempotent. This script
 # rewrites the managed lines in the root .env and keeps the other lines.
 # It never prints secret values. It prints paths only.
 #
 # Order: create .env, assemble compose.yaml, resolve Consul, enable services,
-# resolve PUBLIC_IP, write .env, run the service wizards.
+# assemble the Caddy vhost registry, resolve PUBLIC_IP, write .env, run the
+# service wizards.
 #
 # Usage:
 #   setup.sh                        Ask which services to enable and for the shared PUBLIC_IP,
@@ -458,6 +461,62 @@ normalize_enabled_services() {
   enabled=("${normalized[@]}")
 }
 
+# Build the Caddy vhost registry from the enabled service descriptors.
+# Read only state/<service>/vhost.json and keep the enabled order.
+# A service without a descriptor gets no vhost.
+# Write config/caddy/vhosts.json as a JSON array and config/caddy/vhosts.txt
+# with one name per line. The directory is mode 750. Both files are mode 640.
+assemble_caddy_vhosts() {
+  local caddy_dir="config/caddy"
+  local json_file="$caddy_dir/vhosts.json"
+  local names_file="$caddy_dir/vhosts.txt"
+  local service descriptor content name
+  local json="["
+  local first=1
+  local -a names=()
+  for service in "${enabled[@]}"; do
+    descriptor="state/$service/vhost.json"
+    if [ ! -f "$descriptor" ]; then
+      continue
+    fi
+    content="$(<"$descriptor")"
+    if [ "${content:0:1}" != "{" ] || [ "${content: -1}" != "}" ]; then
+      echo "error: The vhost descriptor state/$service/vhost.json is not valid." >&2
+      echo "error: The file must start with '{' and end with '}'." >&2
+      exit 1
+    fi
+    name="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$descriptor")"
+    if [ -z "$name" ]; then
+      echo "error: The vhost descriptor state/$service/vhost.json has no name." >&2
+      exit 1
+    fi
+    if [ "$first" -eq 1 ]; then
+      first=0
+    else
+      json="$json,"
+    fi
+    json="$json$content"
+    names+=("$name")
+  done
+  json="$json]"
+
+  mkdir -p "$caddy_dir"
+  chmod 0750 "$caddy_dir"
+  local tmp_json tmp_names
+  tmp_json="$(mktemp "$caddy_dir/.vhosts.json.XXXXXX")"
+  tmp_names="$(mktemp "$caddy_dir/.vhosts.txt.XXXXXX")"
+  chmod 0640 "$tmp_json" "$tmp_names"
+  printf '%s\n' "$json" >"$tmp_json"
+  if [ "${#names[@]}" -gt 0 ]; then
+    printf '%s\n' "${names[@]}" >"$tmp_names"
+  fi
+  mv "$tmp_json" "$json_file"
+  mv "$tmp_names" "$names_file"
+  chmod 0640 "$json_file" "$names_file"
+  echo "Wrote the Caddy vhost registry: $json_file"
+  echo "Wrote the Caddy vhost names: $names_file"
+}
+
 # Write the root .env with the shared Consul values and PUBLIC_IP. Keep the other lines.
 # Preserve every line except the managed keys.
 # In remote mode, do not write CONSUL_JOIN_IPS or CONSUL_BOOTSTRAP_EXPECT.
@@ -619,7 +678,15 @@ fi
 # Consul is mandatory in local mode. It is absent in remote mode.
 normalize_enabled_services
 
-# Step 6: resolve the public IP of this node. The enabled services advertise it.
+# Step 6: assemble the Caddy vhost registry when caddy is enabled.
+for service in "${enabled[@]}"; do
+  if [ "$service" = "caddy" ]; then
+    assemble_caddy_vhosts
+    break
+  fi
+done
+
+# Step 7: resolve the public IP of this node. The enabled services advertise it.
 resolve_public_ip_default
 if [ -n "$public_ip_default" ] && ! is_valid_ipv4 "$public_ip_default"; then
   public_ip_default_invalid
@@ -642,7 +709,7 @@ if [ -z "$public_ip" ]; then
 fi
 export PUBLIC_IP="$public_ip"
 
-# Step 7: write the root .env with the shared Consul values and PUBLIC_IP. Keep the other lines.
+# Step 8: write the root .env with the shared Consul values and PUBLIC_IP. Keep the other lines.
 write_env_file "$consul_addr" "$consul_join_ips" "$consul_bootstrap_expect" "$public_ip"
 
 if [ "${#enabled[@]}" -eq 0 ]; then
@@ -650,7 +717,7 @@ if [ "${#enabled[@]}" -eq 0 ]; then
   exit 0
 fi
 
-# Step 8: run the wizard of each enabled service, in sorted order.
+# Step 9: run the wizard of each enabled service, in sorted order.
 for service in "${enabled[@]}"; do
   if ! bash "$REPO_ROOT/state/$service/setup.sh"; then
     echo "error: the $service setup failed." >&2
@@ -658,7 +725,7 @@ for service in "${enabled[@]}"; do
   fi
 done
 
-# Step 9: print the summary.
+# Step 10: print the summary.
 echo "Configured the stack:"
 for service in "${enabled[@]}"; do
   echo "  $service"

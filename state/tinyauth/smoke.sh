@@ -469,6 +469,44 @@ check_litefs_consul_token() {
   fi
 }
 
+# Check that the LiteFS policy allows the hostname-based session name.
+# LiteFS creates a Consul session named after the hostname, not "litefs".
+check_litefs_policy_rules() {
+  local entrypoint="$REPO_ROOT/state/tinyauth/entrypoint.sh"
+  local rules
+
+  rules="$(grep -F 'POLICY_RULES_JSON=' "$entrypoint" || true)"
+  if printf '%s\n' "$rules" | grep -qF 'session_prefix \"\"'; then
+    pass 'litefs policy uses session_prefix'
+  else
+    fail 'litefs policy uses session_prefix' 'the policy rules do not use session_prefix'
+  fi
+  if printf '%s\n' "$rules" | grep -qF 'session \"litefs\"'; then
+    fail 'litefs policy no longer names the litefs session' 'the policy rules still name the litefs session'
+  else
+    pass 'litefs policy no longer names the litefs session'
+  fi
+}
+
+# Check that the entrypoint updates an existing policy when its rules differ.
+check_litefs_policy_update() {
+  local entrypoint="$REPO_ROOT/state/tinyauth/entrypoint.sh"
+
+  # The patterns are literal script text, not shell variables.
+  # shellcheck disable=SC2016
+  if grep -qF '"$CONSUL_ADDR/v1/acl/policy/$policy_id"' "$entrypoint"; then
+    pass 'entrypoint has a litefs policy update path'
+  else
+    fail 'entrypoint has a litefs policy update path' 'the entrypoint has no policy update URL'
+  fi
+  # shellcheck disable=SC2016
+  if grep -qF 'if [ "$existing_rules" = "$POLICY_RULES_JSON" ]' "$entrypoint"; then
+    pass 'entrypoint compares the existing litefs policy rules'
+  else
+    fail 'entrypoint compares the existing litefs policy rules' 'the entrypoint does not compare the existing rules'
+  fi
+}
+
 # Check the Caddy vhost descriptor. The descriptor sends writes to the LiteFS
 # primary. The file holds no secret values.
 check_vhost_descriptor() {
@@ -668,6 +706,8 @@ check_standalone_entrypoint
 check_integrated_entrypoint
 check_remote_token_selection
 check_litefs_consul_token
+check_litefs_policy_rules
+check_litefs_policy_update
 
 printf 'smoke checks: %d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then

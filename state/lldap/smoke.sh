@@ -85,6 +85,11 @@ check_entrypoint_modes() {
   assert_line "$ENTRYPOINT" 'litefs mount -config' 'The LiteFS branch lacks the LiteFS start.'
   assert_line "$ENTRYPOINT" 'CONSUL_HTTP_TOKEN="$token" litefs mount -config "$LITEFS_YML" &' 'The LiteFS start does not pass the Consul token value.'
   assert_no_line "$ENTRYPOINT" 'CONSUL_HTTP_TOKEN_FILE="$RUNTIME_TOKEN_FILE" litefs mount' 'The LiteFS start still passes CONSUL_HTTP_TOKEN_FILE.'
+  assert_line "$ENTRYPOINT" 'session_prefix \"\" { policy = \"write\" }' 'The LiteFS policy lacks the session_prefix rule.'
+  assert_no_line "$ENTRYPOINT" 'session \"litefs\" { policy = \"write\" }' 'The LiteFS policy still holds the fixed session name.'
+  assert_line "$ENTRYPOINT" 'existing_rules="$(json_rules_field <"$resp_file")"' 'The entrypoint does not read the existing policy rules.'
+  assert_line "$ENTRYPOINT" '"$CONSUL_ADDR/v1/acl/policy/$policy_id"' 'The entrypoint has no policy update path.'
+  assert_line "$ENTRYPOINT" 'updated the rules of the consul policy' 'The entrypoint does not report the policy update.'
   assert_no_line "$ENTRYPOINT" 'CONSUL_HTTP_ADDR' 'The entrypoint still holds the old Consul address key.'
 }
 

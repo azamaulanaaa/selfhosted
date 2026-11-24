@@ -163,6 +163,20 @@ check_litefs_token_contract() {
   echo "smoke: LiteFS token contract passed."
 }
 
+# Check that the LiteFS ACL covers the hostname-based session name.
+# The token stays scoped to the lease key and the peer keys.
+# The entrypoint updates a stored policy when its rules differ.
+check_litefs_policy_contract() {
+  expect_contains "$ENTRYPOINT" 'key \"forgejo/litefs\" { policy = \"write\" }' "entrypoint"
+  expect_contains "$ENTRYPOINT" 'session_prefix \"\" { policy = \"write\" }' "entrypoint"
+  expect_no_text "$ENTRYPOINT" 'session \"litefs\"' "entrypoint"
+  expect_contains "$ENTRYPOINT" "policy_rules=" "entrypoint"
+  expect_contains "$ENTRYPOINT" "if [ \"\$policy_rules\" = \"\$POLICY_RULES_JSON\" ]; then" "entrypoint"
+  expect_contains "$ENTRYPOINT" "/v1/acl/policy/\$policy_id" "entrypoint"
+  expect_contains "$ENTRYPOINT" "updated the consul policy" "entrypoint"
+  echo "smoke: LiteFS policy contract passed."
+}
+
 # Check that the templates gate their optional blocks on the right flags.
 check_template_gates() {
   expect_contains "$APP_TPL" '{{ if eq (env "TLS_ENABLED") "1" }}' "app.ini template"
@@ -389,6 +403,7 @@ check_compose_port_bindings
 check_peer_service_no_build
 check_consul_contract
 check_litefs_token_contract
+check_litefs_policy_contract
 check_template_gates
 check_compose_consul_contract
 check_rootless_contract

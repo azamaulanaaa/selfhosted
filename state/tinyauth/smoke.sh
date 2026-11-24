@@ -427,10 +427,51 @@ check_vhost_descriptor() {
   fi
 }
 
+# Check the engine diagnostic and the engine selection in the wizard.
+check_engine_selection() {
+  local fake_bin="$scratch/fake-bin"
+  local setup="$REPO_ROOT/state/tinyauth/setup.sh"
+  local engine custom
+
+  mkdir -p "$fake_bin"
+  cat >"$fake_bin/nerdctl" <<'EOF'
+#!/usr/bin/env bash
+printf 'fake nerdctl\n'
+EOF
+  chmod +x "$fake_bin/nerdctl"
+
+  if engine="$(env -u CONTAINER_ENGINE PATH="$fake_bin:$PATH" \
+    bash "$REPO_ROOT/setup.sh" tinyauth engine 2>"$scratch/engine.err")" &&
+    [ "$engine" = 'nerdctl' ]; then
+    pass 'engine subcommand selects nerdctl from PATH'
+  else
+    fail 'engine subcommand selects nerdctl from PATH' "observed '$engine'"
+  fi
+
+  custom="$scratch/custom-engine"
+  if engine="$(CONTAINER_ENGINE="$custom" PATH="$fake_bin:$PATH" \
+    bash "$REPO_ROOT/setup.sh" tinyauth engine 2>>"$scratch/engine.err")" &&
+    [ "$engine" = "$custom" ]; then
+    pass 'engine subcommand prefers CONTAINER_ENGINE'
+  else
+    fail 'engine subcommand prefers CONTAINER_ENGINE' "observed '$engine'"
+  fi
+
+  # The grep pattern is literal script text, not a shell variable.
+  # shellcheck disable=SC2016
+  if grep -qF '"$engine" compose exec' "$setup" &&
+    ! grep -qF 'docker compose exec' "$setup"; then
+    pass 'wizard uses the selected engine for compose exec'
+  else
+    fail 'wizard uses the selected engine for compose exec' 'the compose exec call is not engine-based'
+  fi
+}
+
 scratch="$(mktemp -d /tmp/tinyauth-smoke.XXXXXX)"
 setup_tree
 check_vhost_descriptor
 check_consul_flag_removed
+check_engine_selection
 check_wizard_idempotence
 check_oidc_key_modes
 check_standalone_wizard

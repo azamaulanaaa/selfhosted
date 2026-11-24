@@ -70,6 +70,13 @@
         header_up Host {host}
       }
     }
+  {{ else }}
+    # LiteFS is off. Serve every request from the local upstream.
+    handle {
+      reverse_proxy {{ $local_addr }} {
+        header_up Host {host}
+      }
+    }
   {{ end }}
 {{ end }}
 

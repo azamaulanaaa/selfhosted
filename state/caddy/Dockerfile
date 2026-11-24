@@ -2,6 +2,8 @@
 # The build context is state/caddy. Only entrypoint.sh is copied.
 # Supports linux/amd64 and linux/arm64. A multi-arch image is built
 # with docker buildx, or on a native arm64 host.
+# The base image includes curl through apk. The entrypoint uses curl for the
+# Consul HTTP API when the consul CLI is absent. Do not add the Consul CLI.
 FROM caddy:2.11.9
 
 # Pin the consul-template version. Both values change together on a bump:

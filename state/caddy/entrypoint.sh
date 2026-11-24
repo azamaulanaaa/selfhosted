@@ -83,51 +83,23 @@ supervise_consul_template() {
   done
 }
 
-# Create the caddy read ACL policy and token. Write a runtime consul-template
-# config that uses the token. Print commands when automatic creation fails.
-bootstrap_read_acl() {
-  management_token="$(read_management_token)"
-  if [ -z "$management_token" ] || ! command -v consul >/dev/null 2>&1; then
-    print_acl_commands
-    return 0
-  fi
+# Print the SecretID value from a Consul ACL token JSON response.
+read_secret_id() {
+  sed -n 's/.*"SecretID"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+}
 
-  policy_file="$STORE/caddy-read-policy.hcl"
-  printf '%s\n' \
-    'service_prefix "" {' \
-    '  policy = "read"' \
-    '}' \
-    'key_prefix "" {' \
-    '  policy = "read"' \
-    '}' >"$policy_file"
+# Print the JSON body for the caddy read ACL policy.
+# The rules match the CLI policy file.
+print_policy_json() {
+  printf '%s\n' '{"Name":"caddy-read","Description":"caddy read","Rules":"service_prefix \"\" { policy = \"read\" }\nkey_prefix \"\" { policy = \"read\" }\n"}'
+}
 
-  export CONSUL_HTTP_ADDR="$consul_addr"
-  export CONSUL_HTTP_TOKEN="$management_token"
-
-  if ! consul acl policy read -name caddy-read >/dev/null 2>&1; then
-    if ! consul acl policy create -name caddy-read -rules "@$policy_file" >/dev/null 2>&1; then
-      echo "warning: Could not create the caddy read ACL policy." >&2
-      print_acl_commands
-      return 0
-    fi
-  fi
-
-  token_json="$(consul acl token create -description 'caddy read' \
-    -policy-name caddy-read -format json 2>/dev/null)" || {
-    echo "warning: Could not create the caddy read ACL token." >&2
-    print_acl_commands
-    return 0
-  }
-  acl_token="$(printf '%s\n' "$token_json" |
-    sed -n 's/.*"SecretID"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  if [ -z "$acl_token" ]; then
-    echo "warning: Could not read the new caddy read ACL token." >&2
-    print_acl_commands
-    return 0
-  fi
-
+# Write the runtime token file and the consul-template configuration.
+# The configuration reads the token from the runtime token file.
+write_runtime_files() {
+  runtime_token="$1"
   runtime_token_file="$STORE/consul-template.token"
-  (umask 077 && printf '%s\n' "$acl_token" >"$runtime_token_file")
+  (umask 077 && printf '%s\n' "$runtime_token" >"$runtime_token_file")
 
   runtime_cfg="$STORE/consul-template.hcl"
   {
@@ -143,7 +115,100 @@ bootstrap_read_acl() {
     printf '}\n'
   } >"$runtime_cfg"
   CFG="$runtime_cfg"
-  echo "info: Created the caddy read ACL policy and token." >&2
+}
+
+# Create the caddy read ACL policy and token with the consul CLI.
+create_read_acl_with_cli() {
+  policy_file="$STORE/caddy-read-policy.hcl"
+  printf '%s\n' \
+    'service_prefix "" {' \
+    '  policy = "read"' \
+    '}' \
+    'key_prefix "" {' \
+    '  policy = "read"' \
+    '}' >"$policy_file"
+
+  export CONSUL_HTTP_ADDR="$consul_addr"
+  export CONSUL_HTTP_TOKEN="$management_token"
+
+  if ! consul acl policy read -name caddy-read >/dev/null 2>&1; then
+    if ! consul acl policy create -name caddy-read -rules "@$policy_file" >/dev/null 2>&1; then
+      return 1
+    fi
+  fi
+
+  token_json="$(consul acl token create -description 'caddy read' \
+    -policy-name caddy-read -format json 2>/dev/null)" || return 1
+  acl_token="$(printf '%s\n' "$token_json" | read_secret_id)"
+  if [ -z "$acl_token" ]; then
+    return 1
+  fi
+
+  write_runtime_files "$acl_token"
+  echo "info: Created the caddy read ACL policy and token with the consul CLI." >&2
+  return 0
+}
+
+# Run curl against the Consul HTTP API with the management token.
+consul_api() {
+  printf 'X-Consul-Token: %s\n' "$management_token" |
+    curl -fsS -H @- "$@"
+}
+
+# Create the caddy read ACL policy and token with the Consul HTTP API.
+create_read_acl_with_curl() {
+  api_base="${consul_addr%/}"
+
+  if ! consul_api -o /dev/null \
+    "$api_base/v1/acl/policy/name/caddy-read"; then
+    policy_json="$(print_policy_json)"
+    if ! consul_api -X PUT --data-binary "$policy_json" -o /dev/null \
+      "$api_base/v1/acl/policy"; then
+      return 1
+    fi
+  fi
+
+  token_body='{"Description":"caddy read","Policies":[{"Name":"caddy-read"}]}'
+  token_json="$(consul_api -X PUT --data-binary "$token_body" \
+    "$api_base/v1/acl/token")" || return 1
+  acl_token="$(printf '%s\n' "$token_json" | read_secret_id)"
+  if [ -z "$acl_token" ]; then
+    return 1
+  fi
+
+  write_runtime_files "$acl_token"
+  echo "info: Created the caddy read ACL policy and token with the Consul HTTP API." >&2
+  return 0
+}
+
+# Create the caddy read ACL policy and token. Write a runtime consul-template
+# config that uses the token. Print commands when every method fails.
+bootstrap_read_acl() {
+  management_token="$(read_management_token)"
+  if [ -z "$management_token" ]; then
+    print_acl_commands
+    return 0
+  fi
+
+  if command -v consul >/dev/null 2>&1; then
+    if create_read_acl_with_cli; then
+      return 0
+    fi
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    if create_read_acl_with_curl; then
+      return 0
+    fi
+  fi
+
+  if ! command -v consul >/dev/null 2>&1 &&
+    ! command -v curl >/dev/null 2>&1; then
+    echo "warning: The consul CLI and curl are both absent." >&2
+  else
+    echo "warning: Could not create the caddy read ACL policy and token." >&2
+  fi
+  print_acl_commands
 }
 
 # Render once, supervise consul-template, and run caddy in watch mode.

@@ -142,6 +142,20 @@ assert_no_line() {
   fi
 }
 
+# Check that a file holds one expected text.
+assert_contains() {
+  local file="$1" text="$2" description="$3"
+  if [ ! -f "$file" ]; then
+    fail "$description" "the file does not exist: $file"
+    return 0
+  fi
+  if grep -Fq -- "$text" "$file"; then
+    pass "$description"
+  else
+    fail "$description" "expected text: $text"
+  fi
+}
+
 # Check that a file is absent.
 assert_file_absent() {
   local path="$1" description="$2"
@@ -611,6 +625,23 @@ check_scaling_manifest() {
   assert_line "$manifest" $'data/vaultwarden/store\t700\tnode-local\tboth\trequired\tSQLite database and signing keys. Single-node only. Do not copy.' 'manifest marks the data store node-local'
 }
 
+# Check the Caddy vhost descriptor.
+check_vhost_descriptor() {
+  local descriptor="$REPO_ROOT/state/vaultwarden/vhost.json"
+  if [ ! -f "$descriptor" ]; then
+    fail 'vhost descriptor exists' "the file is missing: $descriptor"
+    return 0
+  fi
+  pass 'vhost descriptor exists'
+  assert_contains "$descriptor" '"name":"vaultwarden"' 'vhost descriptor names vaultwarden'
+  assert_contains "$descriptor" '"mode":"static"' 'vhost descriptor uses static mode'
+  assert_contains "$descriptor" '"upstream":"http://vaultwarden:80"' 'vhost descriptor proxies to vaultwarden:80'
+  assert_contains "$descriptor" '"x_real_ip":true' 'vhost descriptor sets X-Real-IP'
+  assert_no_line "$descriptor" 'secret' 'vhost descriptor holds no secret'
+  assert_no_line "$descriptor" 'token' 'vhost descriptor holds no token'
+  assert_no_line "$descriptor" 'password' 'vhost descriptor holds no password'
+}
+
 # Check that no secret value appears in any log file.
 check_logs_for_secrets() {
   local leaked=0 log_file value
@@ -636,6 +667,7 @@ check_optional_settings
 check_clean
 check_compose_fragment
 check_scaling_manifest
+check_vhost_descriptor
 check_logs_for_secrets
 
 printf 'smoke checks: %d passed, %d failed\n' "$passed" "$failed"

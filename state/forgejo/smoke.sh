@@ -1,8 +1,9 @@
 #!/bin/sh
 # Check that the Forgejo templates render in the standalone and integrated modes.
 # Check that the wizard, the entrypoint, and the compose fragment follow the
-# Consul-first contract. Each render writes into a scratch tree. No Consul agent
-# is required.
+# Consul-first contract. Check that the vhost descriptor names forgejo and holds
+# no secret values. Each render writes into a scratch tree. No Consul agent is
+# required.
 set -eu
 
 REPO_ROOT="$(cd -- "$(dirname -- "$0")/../.." && pwd)"
@@ -15,6 +16,7 @@ readonly HOOK_TPL="$STATE_DIR/post-receive.tpl"
 readonly WIZARD="$STATE_DIR/setup.sh"
 readonly ENTRYPOINT="$STATE_DIR/entrypoint.sh"
 readonly COMPOSE_FILE="$REPO_ROOT/compose/forgejo.yaml"
+readonly VHOST="$STATE_DIR/vhost.json"
 
 scratch="$(mktemp -d)"
 trap 'rm -rf -- "$scratch"' EXIT
@@ -52,6 +54,17 @@ expect_contains() {
   label="$3"
   if ! grep -Fq -- "$text" "$file"; then
     fail "$label does not hold this text: $text"
+  fi
+}
+
+# Check that a file holds one JSON field with one exact string value.
+expect_json_field() {
+  file="$1"
+  field="$2"
+  value="$3"
+  label="$4"
+  if ! grep -Eq "\"$field\"[[:space:]]*:[[:space:]]*\"$value\"" "$file"; then
+    fail "$label does not hold the field $field with the value $value."
   fi
 }
 
@@ -154,6 +167,30 @@ check_compose_consul_contract() {
   expect_contains "$block" './config/consul/secrets:/config/consul/secrets:ro' "forgejo service"
   expect_no_text "$block" './config/consul/secrets/agent.hcl:/config/consul/agent.hcl:ro' "forgejo service"
   echo "smoke: compose Consul contract passed."
+}
+
+# Check that the vhost descriptor exists and names forgejo as a static vhost.
+check_vhost_descriptor() {
+  if [ ! -f "$VHOST" ]; then
+    fail "the vhost descriptor is missing: $VHOST"
+  fi
+  expect_json_field "$VHOST" name forgejo "vhost descriptor"
+  expect_json_field "$VHOST" mode static "vhost descriptor"
+  expect_json_field "$VHOST" upstream 'http://forgejo:3000' "vhost descriptor"
+
+  keys="$(grep -o '"[a-z_]*"[[:space:]]*:' "$VHOST" | sed -E 's/[":[:space:]]//g' | LC_ALL=C sort)"
+  if [ "$keys" != "$(printf 'mode\nname\nupstream')" ]; then
+    fail "the vhost descriptor holds fields other than name, mode, and upstream."
+  fi
+  echo "smoke: vhost descriptor passed."
+}
+
+# Check that the vhost descriptor holds no secret values.
+check_vhost_no_secrets() {
+  if grep -Eq '"(secret|token|password|passwd|key|credential)[a-z_-]*"[[:space:]]*:' "$VHOST"; then
+    fail "the vhost descriptor holds a secret field. A secret value does not belong in state/."
+  fi
+  echo "smoke: vhost descriptor secret check passed."
 }
 
 # Render the standalone mode into the scratch tree.
@@ -288,4 +325,6 @@ check_peer_service_no_build
 check_consul_contract
 check_template_gates
 check_compose_consul_contract
+check_vhost_descriptor
+check_vhost_no_secrets
 echo "smoke: all checks passed."

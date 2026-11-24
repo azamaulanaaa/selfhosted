@@ -135,6 +135,27 @@ check_bootstrap_mount() {
     fail "compose/consul.yaml does not load config/consul/bootstrap.hcl."
 }
 
+# Check that the vhost descriptor selects the Consul catalog on port 8500.
+# The descriptor must not hold a secret.
+check_vhost_descriptor() {
+  local file="state/consul/vhost.json"
+  [ -f "$file" ] || fail "state/consul/vhost.json is missing."
+  grep -q '"name":"consul"' "$file" ||
+    fail "state/consul/vhost.json does not name consul."
+  grep -q '"mode":"catalog"' "$file" ||
+    fail "state/consul/vhost.json does not use catalog mode."
+  grep -q '"service":"consul"' "$file" ||
+    fail "state/consul/vhost.json does not select the consul service."
+  grep -q '"port":8500' "$file" ||
+    fail "state/consul/vhost.json does not use port 8500."
+  if grep -qiE '"(token|password|secret|credential|api[_-]?key|private[_-]?key)"' "$file"; then
+    fail "state/consul/vhost.json holds a secret field."
+  fi
+  if grep -qE '://[^/"]*:[^/"]*@' "$file"; then
+    fail "state/consul/vhost.json holds credentials in a URL."
+  fi
+}
+
 # Check that no production file uses CONSUL_ENABLED.
 check_no_consul_enabled() {
   local file
@@ -195,6 +216,7 @@ main() {
   check_idempotent_run "$env_file_tree"
 
   check_bootstrap_mount
+  check_vhost_descriptor
   check_no_consul_enabled
 
   echo "Consul standalone smoke checks passed."

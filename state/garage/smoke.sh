@@ -435,6 +435,35 @@ check_consul_address_validation() {
   fi
 }
 
+# Check that Garage has no Caddy vhost descriptor.
+# Garage is an S3 API, not a web UI. The compose fragment publishes only the
+# S3 API, the RPC port, the static website, and the admin API.
+check_no_vhost_descriptor() {
+  assert_file_absent "$REPO_ROOT/state/garage/vhost.json" 'state/garage/vhost.json does not exist'
+
+  local fragment="$REPO_ROOT/compose/garage.yaml"
+  if [ ! -f "$fragment" ]; then
+    fail 'garage compose fragment exists' "the file is missing: $fragment"
+    return 0
+  fi
+  pass 'garage compose fragment exists'
+
+  assert_line "$fragment" '      - target: 3900' 'fragment publishes the S3 API on port 3900'
+  assert_line "$fragment" '      - target: 3901' 'fragment publishes the RPC port 3901'
+  assert_line "$fragment" '      - target: 3902' 'fragment publishes the static website on port 3902'
+  assert_line "$fragment" '      - target: 3903' 'fragment publishes the admin API on port 3903'
+  assert_no_line "$fragment" '      - target: 80' 'fragment publishes no HTTP UI port 80'
+  assert_no_line "$fragment" '      - target: 443' 'fragment publishes no HTTPS UI port 443'
+
+  local port_count
+  port_count="$(grep -cF -- '      - target: ' "$fragment" || true)"
+  if [ "$port_count" = '4' ]; then
+    pass 'fragment publishes exactly four ports'
+  else
+    fail 'fragment publishes exactly four ports' "observed $port_count port entries"
+  fi
+}
+
 # Check that no secret value appears in any log file.
 check_logs_for_secrets() {
   local leaked=0
@@ -458,6 +487,7 @@ check_standalone_mode
 check_remote_token
 check_integrated_mode
 check_consul_address_validation
+check_no_vhost_descriptor
 check_logs_for_secrets
 
 printf 'smoke checks: %d passed, %d failed\n' "$passed" "$failed"

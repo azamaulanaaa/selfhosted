@@ -47,15 +47,17 @@ services:
       # Wizard-generated. Holds TINYAUTH_* keys and *_FILE paths only.
       - ./config/tinyauth/tinyauth.env
     ports:
+      # Application port. A remote primary proxies write requests here.
+      # In the combined stack, Forgejo keeps host port 3000. Tinyauth moves
+      # to host port 3001. Caddy still proxies tinyauth:3000.
+      - target: 3000
+        published: 3001
+        host_ip: "${PUBLIC_IP:-127.0.0.1}"
+        protocol: tcp
       # LiteFS peer API. Peers reach the advertised URL on this interface.
       - target: 20202
         published: 20202
         host_ip: "${PUBLIC_IP}"
-        protocol: tcp
-      # Application port. A remote primary proxies write requests here.
-      - target: 3000
-        published: 3000
-        host_ip: "${PUBLIC_IP:-127.0.0.1}"
         protocol: tcp
     restart: unless-stopped
     healthcheck:

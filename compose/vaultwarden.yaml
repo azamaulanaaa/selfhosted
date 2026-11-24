@@ -1,0 +1,35 @@
+# dclint disable require-project-name-field
+# The root compose.yaml owns the project name. This file is an included fragment.
+services:
+  # Vaultwarden is a Bitwarden-compatible password manager. Caddy proxies
+  # vaultwarden:80 at vaultwarden.<STACK_DOMAIN> in the combined stack.
+  # Consul is required by the root setup, but this container does not use
+  # Consul. The official image has no S3 support. This service disables
+  # attachments and Sends, and it uses SSO only. The image runs as uid 1000 and
+  # serves HTTP on port 80. Port 8080 is published on PUBLIC_IP for standalone
+  # access through an external HTTPS reverse proxy.
+  vaultwarden:
+    image: vaultwarden/server:1.37.4
+    container_name: vaultwarden
+    volumes:
+      # Secret directory. Read-only. The wizard writes each file with mode 600.
+      # The container reads /run/secrets/vaultwarden/oidc-client-secret, the
+      # optional admin_token, and the optional smtp_password.
+      - ./config/vaultwarden/secrets:/run/secrets/vaultwarden:ro
+      # SQLite database and signing keys. Back it up.
+      - ./data/vaultwarden/store:/data:rw
+    environment:
+      # The OIDC client secret reaches the container as a file path.
+      - SSO_CLIENT_SECRET_FILE=/run/secrets/vaultwarden/oidc-client-secret
+    env_file:
+      # Wizard-generated. Holds non-secret settings and _FILE paths.
+      - ./config/vaultwarden/vaultwarden.env
+    ports:
+      # Standalone access through an external HTTPS reverse proxy.
+      # The long syntax binds the port to PUBLIC_IP only.
+      - target: 80
+        published: 8080
+        host_ip: ${PUBLIC_IP:-127.0.0.1}
+        protocol: tcp
+    restart: unless-stopped
+    user: "1000:1000"

@@ -137,6 +137,38 @@ Each flag defaults to `0`. A flag does not select the Consul location.
 `STACK_DOMAIN` defaults to `sh.lan`. `PUBLIC_IP` holds the address that peers
 use to reach this node.
 
+## Rootless nerdctl
+
+You can run the stack on rootless nerdctl. Set these keys in the root `.env`:
+
+- `STACK_ROOTLESS=1`
+- `STACK_UID=0`
+- `STACK_GID=0`
+- `CONSUL_DISABLE_PERM_MGMT=1`
+
+The root `setup.sh` exports `STACK_ROOTLESS`, `STACK_UID`, and `STACK_GID`
+to the service wizards. It writes `config/compose.env.yaml` after the
+wizards finish. That file is generated, not committed. `config/` is
+gitignored.
+
+nerdctl compose version 2.4.2 ignores `env_file`. The generated override
+supplies the Forgejo, Tinyauth, and Vaultwarden environment files. The
+other services read their values from `environment` in the fragments.
+
+Start the stack with both files:
+
+```text
+nerdctl compose -f compose.yaml -f config/compose.env.yaml up -d <services>
+```
+
+Container root maps to the unprivileged host user. The host user owns the
+files under `config/` and `data/`, and container root reads them. The
+services run as container root. The wizards do not change the file owner
+in rootless mode.
+
+Rootful Docker keeps the current behavior. It reads `env_file` from the
+fragments. Do not set the rootless keys on a rootful Docker host.
+
 ## Startup order
 
 Start the services in this order:
@@ -156,6 +188,9 @@ Start the services in this order:
 In local mode, run `docker compose up -d consul`, then
 `docker compose up -d lldap tinyauth forgejo garage`, then
 `docker compose up -d vaultwarden`, then `docker compose up -d caddy`.
+
+On rootless nerdctl, use `nerdctl compose -f compose.yaml -f
+config/compose.env.yaml` in place of `docker compose` in each command.
 
 ## Consul token files
 

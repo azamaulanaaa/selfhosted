@@ -40,6 +40,10 @@
 #                   an error. Local Consul always stays enabled.
 #   PUBLIC_IP       Public or LAN IPv4 of this node. The enabled services read it from .env.
 #                   compose substitutes ${PUBLIC_IP}.
+#   STACK_ROOTLESS  1 runs the services as container root for rootless nerdctl.
+#                   0 runs them as uid STACK_UID and gid STACK_GID.
+#   STACK_UID       Container user id. Use 0 when STACK_ROOTLESS is 1.
+#   STACK_GID       Container group id. Use 0 when STACK_ROOTLESS is 1.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -433,6 +437,90 @@ resolve_consul_local_settings() {
   fi
 }
 
+# Return 0 when the argument is 0 or 1.
+is_valid_rootless() {
+  [ "$1" = "0" ] || [ "$1" = "1" ]
+}
+
+# Return 0 when the argument is 0 or a positive integer.
+is_valid_identity_id() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# Print an STE error for an invalid stack identity value and exit 1.
+# The message tells the user which source holds the bad value.
+stack_identity_invalid() {
+  local key="$1"
+  local value="$2"
+  local source="$3"
+  local rule="$4"
+  case "$source" in
+  env)
+    echo "error: $key '$value' is not valid. $rule" >&2
+    ;;
+  envfile)
+    echo "error: The root .env holds the invalid $key '$value'. Fix .env by hand or set $key." >&2
+    ;;
+  *)
+    echo "error: '$value' is not valid. $rule" >&2
+    ;;
+  esac
+  exit 1
+}
+
+# Resolve the container runtime identity. Set stack_rootless, stack_uid, and stack_gid.
+# Read each value from the process environment, then from the root .env file.
+# The default is rootful Docker: 0, 1000, 1000.
+resolve_stack_identity() {
+  local value=""
+  local source="none"
+
+  if [ -n "${STACK_ROOTLESS+x}" ]; then
+    value="$STACK_ROOTLESS"
+    source="env"
+  elif env_file_has_key STACK_ROOTLESS; then
+    value="$(read_env_value STACK_ROOTLESS)"
+    source="envfile"
+  else
+    value="0"
+    source="default"
+  fi
+  if ! is_valid_rootless "$value"; then
+    stack_identity_invalid STACK_ROOTLESS "$value" "$source" "Use 0 or 1."
+  fi
+  stack_rootless="$value"
+
+  if [ -n "${STACK_UID+x}" ]; then
+    value="$STACK_UID"
+    source="env"
+  elif env_file_has_key STACK_UID; then
+    value="$(read_env_value STACK_UID)"
+    source="envfile"
+  else
+    value="1000"
+    source="default"
+  fi
+  if ! is_valid_identity_id "$value"; then
+    stack_identity_invalid STACK_UID "$value" "$source" "Use 0 or a positive integer."
+  fi
+  stack_uid="$value"
+
+  if [ -n "${STACK_GID+x}" ]; then
+    value="$STACK_GID"
+    source="env"
+  elif env_file_has_key STACK_GID; then
+    value="$(read_env_value STACK_GID)"
+    source="envfile"
+  else
+    value="1000"
+    source="default"
+  fi
+  if ! is_valid_identity_id "$value"; then
+    stack_identity_invalid STACK_GID "$value" "$source" "Use 0 or a positive integer."
+  fi
+  stack_gid="$value"
+}
+
 # Keep the discovered order. In local mode, force consul into the list.
 # In remote mode, remove consul from the list.
 normalize_enabled_services() {
@@ -564,6 +652,12 @@ mapfile -t services < <(list_known_services)
 
 # Step 1: create the root .env when it is missing. compose requires it.
 if [ ! -e .env ]; then : >.env && chmod 0640 .env; fi
+
+# Resolve the container runtime identity and export it to every service wizard.
+resolve_stack_identity
+export STACK_ROOTLESS="$stack_rootless"
+export STACK_UID="$stack_uid"
+export STACK_GID="$stack_gid"
 
 # Step 2: regenerate the stack assembler from the current service fragments.
 bash "$REPO_ROOT/scripts/compose-assemble.sh"

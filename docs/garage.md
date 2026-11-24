@@ -72,6 +72,10 @@ The compose fragment binds every port to `${PUBLIC_IP:-127.0.0.1}`.
 | 3902 | Static website endpoint |
 | 3903 | Admin and metrics API   |
 
+Garage has no Caddy virtual host. Clients use the S3 API on port 3900. The
+static website endpoint on port 3902 is separate from the Caddy vhost
+registry. Garage is not a web UI.
+
 ## Data and secrets
 
 The wizard writes `config/garage/garage.toml` with mode 600. The file

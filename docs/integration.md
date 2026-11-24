@@ -1,16 +1,20 @@
 # Combined stack
 
-This document describes how to run the six services together. The services
-are caddy, consul, forgejo, garage, lldap, and tinyauth. See
+This document describes how to run the seven services together. The services
+are caddy, consul, forgejo, garage, lldap, tinyauth, and vaultwarden. See
 [`docs/layout.md`](layout.md) for the file contract,
 [`docs/scaling.md`](scaling.md) for the shared and node-local files, and
 [`docs/caddy.md`](caddy.md) for the caddy keys.
 
 ## Consul is mandatory
 
-Every service uses Consul. Consul runs in this stack (local) or outside it
+The stack requires Consul. Consul runs in this stack (local) or outside it
 (remote). The root `setup.sh` asks about Consul first. A service wizard never
 asks about Consul.
+
+Most services use Consul for service discovery. Vaultwarden is the one
+exception: its container does not use Consul directly. The stack still
+requires Consul for the other services.
 
 `CONSUL_ADDR` selects the location:
 
@@ -43,14 +47,16 @@ the enabled services.
 
 ## Services
 
-- **caddy** is the reverse proxy. It serves the lldap, tinyauth and forgejo
-  web UIs over HTTPS. It also proxies the Consul web UI in local mode.
+- **caddy** is the reverse proxy. It serves the lldap, tinyauth, forgejo and
+  vaultwarden web UIs over HTTPS. It also proxies the Consul web UI in local
+  mode.
 - **consul** is the service registry and the KV store. It runs only in local
   mode.
 - **forgejo** is the Git forge.
 - **garage** is the S3-compatible object store.
 - **lldap** is the LDAP server.
 - **tinyauth** is the authentication proxy.
+- **vaultwarden** is the password manager. It uses SSO through Tinyauth.
 
 ### Garage
 
@@ -78,6 +84,32 @@ the remote address. The node keeps the same `rpc_secret` as the other
 Garage nodes. See [`docs/garage.md`](garage.md) and
 [`docs/scaling.md`](scaling.md).
 
+### Vaultwarden
+
+Caddy serves `vaultwarden.<STACK_DOMAIN>` and proxies to `vaultwarden:80`.
+The vhost sets the `X-Real-IP` header. The container listens on port 80.
+
+Vaultwarden uses SSO through Tinyauth only. The master password is still
+required. SSO replaces the account login. It does not unlock the vault.
+
+Add one Tinyauth client before the first login:
+
+- Name: `vaultwarden`
+- Redirect URI:
+  `https://vaultwarden.<STACK_DOMAIN>/identity/connect/oidc-signin`
+
+The Vaultwarden wizard reads `config/tinyauth/secrets/oidc/vaultwarden`
+when the file exists. Create the client with the Tinyauth wizard or the
+Tinyauth admin UI.
+
+Attachments and Sends are disabled. The stack has no S3 backend, and the
+official image has no S3 support. SMTP is off by default.
+
+Vaultwarden is single-node. It uses SQLite in `data/vaultwarden/store`. Do
+not run two nodes on one SQLite file. See
+[`docs/vaultwarden.md`](vaultwarden.md) and
+[`docs/scaling.md`](scaling.md).
+
 ## Capability flags
 
 The root `.env` file holds three capability flags:
@@ -97,18 +129,19 @@ Start the services in this order:
 
 1. In local mode, start consul first. Wait for a leader and for the web UI
     on port 8500. In remote mode, skip this step.
-2. Start garage. Wait for the health check. Then use the Garage CLI for the
-    layout. The wizard does not do this step. See
-    [`docs/garage.md`](garage.md).
-3. Start lldap, then tinyauth, then forgejo. The entrypoints read the LDAP
+2. Start lldap, tinyauth, forgejo, and garage. The entrypoints read the LDAP
     password from `config/ldap/secrets/user-pass`. Each entrypoint selects the
-    Consul token at container start.
+    Consul token at container start. Wait for the Garage health check. Then
+    use the Garage CLI for the layout. The wizard does not do this step. See
+    [`docs/garage.md`](garage.md).
+3. Start vaultwarden. Start it after tinyauth, because it uses Tinyauth as
+    its OIDC provider.
 4. Start caddy last. consul-template renders the vhosts from the Consul
     service list and KV keys.
 
 In local mode, run `docker compose up -d consul`, then
-`docker compose up -d garage`, then the other services, then
-`docker compose up -d caddy`.
+`docker compose up -d lldap tinyauth forgejo garage`, then
+`docker compose up -d vaultwarden`, then `docker compose up -d caddy`.
 
 ## Consul token files
 

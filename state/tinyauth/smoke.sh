@@ -377,8 +377,59 @@ check_remote_token_selection() {
   fi
 }
 
+# Check the Caddy vhost descriptor. The descriptor sends writes to the LiteFS
+# primary. The file holds no secret values.
+check_vhost_descriptor() {
+  local descriptor="$REPO_ROOT/state/tinyauth/vhost.json"
+  local content keys name mode upstream redirects
+
+  if [ ! -f "$descriptor" ]; then
+    fail 'vhost descriptor exists' 'the file is missing'
+    return 0
+  fi
+  pass 'vhost descriptor exists'
+
+  content="$(<"$descriptor")"
+
+  name="$(printf '%s\n' "$content" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if [ "$name" = 'tinyauth' ]; then
+    pass 'vhost descriptor names tinyauth'
+  else
+    fail 'vhost descriptor names tinyauth' 'the name field is wrong'
+  fi
+
+  mode="$(printf '%s\n' "$content" | sed -n 's/.*"mode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if [ "$mode" = 'litefs' ]; then
+    pass 'vhost descriptor uses the litefs mode'
+  else
+    fail 'vhost descriptor uses the litefs mode' 'the mode field is wrong'
+  fi
+
+  upstream="$(printf '%s\n' "$content" | sed -n 's/.*"upstream"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if [ "$upstream" = 'http://tinyauth:3000' ]; then
+    pass 'vhost descriptor uses the tinyauth upstream'
+  else
+    fail 'vhost descriptor uses the tinyauth upstream' 'the upstream field is wrong'
+  fi
+
+  redirects="$(printf '%s\n' "$content" | sed -n 's/.*"redirect_paths"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if [ "$redirects" = '[]' ]; then
+    pass 'vhost descriptor has an empty redirect list'
+  else
+    fail 'vhost descriptor has an empty redirect list' 'the redirect_paths field is wrong'
+  fi
+
+  keys="$(grep -o '"[a-z_]*"[[:space:]]*:' "$descriptor" | sed 's/[[:space:]]*:$//' | tr -d '"' | sort | tr '\n' ' ')"
+  if [ "$keys" = 'mode name redirect_paths upstream ' ]; then
+    pass 'vhost descriptor holds no secret values'
+  else
+    fail 'vhost descriptor holds no secret values' 'the file holds an unexpected field'
+  fi
+}
+
 scratch="$(mktemp -d /tmp/tinyauth-smoke.XXXXXX)"
 setup_tree
+check_vhost_descriptor
 check_consul_flag_removed
 check_wizard_idempotence
 check_oidc_key_modes

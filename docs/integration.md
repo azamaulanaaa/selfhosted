@@ -113,12 +113,20 @@ not run two nodes on one SQLite file. See
 ## Vhost registry
 
 Each web service commits one descriptor at `state/<service>/vhost.json`.
+The combined stack has five descriptors: consul, forgejo, lldap, tinyauth,
+and vaultwarden.
 
 The root wizard assembles the descriptors of the enabled services into
 `config/caddy/vhosts.json` and `config/caddy/vhosts.txt`. Caddy renders one
 vhost per descriptor.
 
+The Consul descriptor is `static`. It proxies to `http://consul:8500`.
 Garage has no descriptor and no Caddy vhost.
+
+A `litefs` descriptor uses the `<name>/litefs` KV key. When the key exists,
+write methods go to the primary and reads go to the local upstream. When the
+key is absent, as with `LITEFS_ENABLED=0`, `smart_proxy` falls back to the
+local upstream. The vhost never renders an empty handler.
 
 After the enabled service set changes, rerun `setup.sh` and restart caddy.
 
@@ -169,25 +177,70 @@ in rootless mode.
 Rootful Docker keeps the current behavior. It reads `env_file` from the
 fragments. Do not set the rootless keys on a rootful Docker host.
 
+## Host ports
+
+Forgejo and Tinyauth both use container port 3000. In the combined stack,
+Forgejo keeps host port 3000 and Tinyauth uses host port 3001. Caddy still
+proxies `forgejo:3000` and `tinyauth:3000`. The container ports do not
+change.
+
+## Caddy network and vhost names
+
+`scripts/compose-assemble.sh` writes the default network with subnet
+`10.90.0.0/24`. The caddy fragment sets the static address `10.90.0.10`.
+
+Rootless nerdctl resolves a dotted vhost name through the host or tailnet
+DNS. It does not use the network alias. The Forgejo and Vaultwarden
+fragments add `extra_hosts` for `consul`, `forgejo`, `lldap`, `tinyauth`,
+and `vaultwarden`. Each name resolves to `10.90.0.10`. Without these entries,
+an app can reach another Tailscale node that serves a different
+`*.sh.lan` certificate.
+
+The stack has no caddy network alias block. The `extra_hosts` entries
+replace it.
+
+## Caddy CA trust
+
+The caddy internal CA has an intermediate certificate. The entrypoint writes
+`data/caddy/store/caddy/ca-bundle.crt` from `intermediate.crt` and
+`root.crt`. The bundle holds the intermediate first.
+
+Forgejo and Vaultwarden mount the bundle at
+`/etc/ssl/certs/caddy-ca.pem` and set `SSL_CERT_FILE` to that path. The root
+certificate alone is not enough. Start these apps after caddy writes the
+bundle.
+
 ## Startup order
 
-Start the services in this order:
+Start the services in four stages. The caddy ACL token needs Consul. The CA
+bundle needs Caddy. The apps trust the bundle. The Tinyauth OIDC provider
+must run before the apps start their login flows.
 
-1. In local mode, start consul first. Wait for a leader and for the web UI
-    on port 8500. In remote mode, skip this step.
-2. Start lldap, tinyauth, forgejo, and garage. The entrypoints read the LDAP
-    password from `config/ldap/secrets/user-pass`. Each entrypoint selects the
-    Consul token at container start. Wait for the Garage health check. Then
-    use the Garage CLI for the layout. The wizard does not do this step. See
+1. Start local Consul, LLDAP, and Tinyauth. In remote mode, skip local
+    Consul. Wait for the Consul leader and the web UI on port 8500. The
+    Tinyauth OIDC provider is now up.
+2. Start Caddy. Wait until `data/caddy/store/caddy/ca-bundle.crt` exists.
+    Caddy creates the read ACL token through the Consul HTTP API. It renders
+    the vhosts from the Consul service list.
+3. Start Vaultwarden, Forgejo, and Garage. Vaultwarden and Forgejo read the
+    CA bundle. The entrypoints read the LDAP password from
+    `config/ldap/secrets/user-pass`. Each entrypoint selects the Consul token
+    at container start. Wait for the Garage health check. Then use the Garage
+    CLI for the layout. The wizard does not do this step. See
     [`docs/garage.md`](garage.md).
-3. Start vaultwarden. Start it after tinyauth, because it uses Tinyauth as
-    its OIDC provider.
-4. Start caddy last. consul-template renders the vhosts from the Consul
-    service list and KV keys.
+4. Verify the five vhosts and the Tinyauth OIDC discovery endpoint at
+    `https://tinyauth.<STACK_DOMAIN>/.well-known/openid-configuration`. The
+    vhosts are `consul`, `forgejo`, `lldap`, `tinyauth`, and `vaultwarden`.
+    Garage has no vhost.
 
-In local mode, run `docker compose up -d consul`, then
-`docker compose up -d lldap tinyauth forgejo garage`, then
-`docker compose up -d vaultwarden`, then `docker compose up -d caddy`.
+In local mode, run these commands in order:
+
+```bash
+docker compose up -d consul lldap tinyauth
+docker compose up -d caddy
+# Wait for data/caddy/store/caddy/ca-bundle.crt.
+docker compose up -d vaultwarden forgejo garage
+```
 
 On rootless nerdctl, use `nerdctl compose -f compose.yaml -f
 config/compose.env.yaml` in place of `docker compose` in each command.
@@ -208,9 +261,13 @@ garage, lldap and tinyauth mount `config/consul/secrets` read-only.
 ## Caddy read policy
 
 Consul uses `default_policy = "deny"`. The caddy entrypoint creates the
-`caddy-read` policy and token at start when the Consul CLI and the management
-token are available. If the CLI is absent, the entrypoint prints these
-commands. Run them by hand.
+`caddy-read` policy and token at start. It uses the `consul` CLI when the
+image has it. It creates the policy and token through the Consul HTTP API
+with `curl` when the CLI is absent. The management token goes in the
+`X-Consul-Token` header. The token stays in the runtime store under
+`/data/caddy`.
+
+Run the commands below by hand only when the API creation fails.
 
 For local Consul, read `initial_management` from
 `config/consul/secrets/agent.hcl`:

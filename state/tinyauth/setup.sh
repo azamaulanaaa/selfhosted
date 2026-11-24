@@ -2,6 +2,8 @@
 # Generate the Tinyauth wizard files for this stack.
 # Safe to run again: it keeps existing secrets unless rotation is asked for.
 # It never prints secret values. It prints paths only.
+# The OIDC private key is a PKCS#1 RSA key in PEM format. Tinyauth v5.2.0
+# parses PKCS#1 only. A re-run converts an existing PKCS#8 key to PKCS#1.
 #
 # Usage:
 #   setup.sh tinyauth                          Run the Tinyauth wizard.
@@ -753,7 +755,11 @@ mkdir -p "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
 chmod 0700 "$CONFIG_DIR" "$SECRETS_DIR" "$OIDC_SECRETS_DIR"
 
 # Create the OIDC signing keys. Do not rely on the app to create them at boot.
-# A re-run keeps the existing keys. The app needs write access on the key files.
+# The private key must be PKCS#1 because Tinyauth v5.2.0 parses PKCS#1 only.
+# Generate with genrsa -traditional. Fall back to genpkey and convert with
+# openssl rsa -traditional when genrsa rejects the flag.
+# A re-run keeps an existing PKCS#1 key. It converts an existing PKCS#8 key.
+# The app needs write access on the key files.
 # Rootful mode: set the owner to STACK_UID:STACK_GID and set the mode.
 # Rootless mode: the host user owns the files and container root reads them.
 # The wizard skips the chown in rootless mode.
@@ -762,9 +768,27 @@ public_key="$OIDC_SECRETS_DIR/public.pem"
 if [ ! -s "$private_key" ]; then
   (
     umask 077
-    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$private_key" 2>/dev/null
+    if ! openssl genrsa -traditional 2048 -out "$private_key" 2>/dev/null; then
+      openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${private_key}.pkcs8" 2>/dev/null
+      if ! openssl rsa -in "${private_key}.pkcs8" -traditional -out "$private_key" 2>/dev/null; then
+        rm -f -- "${private_key}.pkcs8" "$private_key"
+        exit 1
+      fi
+      rm -f -- "${private_key}.pkcs8"
+    fi
   )
   echo "Created the OIDC private key at $private_key."
+elif grep -q '^-----BEGIN PRIVATE KEY-----' "$private_key"; then
+  (
+    umask 077
+    if openssl rsa -in "$private_key" -traditional -out "${private_key}.pkcs1" 2>/dev/null; then
+      mv -f -- "${private_key}.pkcs1" "$private_key"
+    else
+      rm -f -- "${private_key}.pkcs1"
+      exit 1
+    fi
+  )
+  echo "Converted the OIDC private key to PKCS#1 at $private_key."
 fi
 if [ ! -s "$public_key" ]; then
   (

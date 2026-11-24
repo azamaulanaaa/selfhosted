@@ -253,6 +253,10 @@ user owns the files under `config/` and `data/`. Container root reads
 them. Each service runs as container root (`0:0`), not as uid 1000.
 Caddy and Consul already run as `0:0`.
 
+Forgejo refuses to run as container root. In rootless mode, the app.ini
+template sets `RUN_USER = root` and `I_AM_BEING_UNSAFE_RUNNING_AS_ROOT = true`
+when `EXEC_UID` is `0`. Without the unsafe-root key, Forgejo refuses to start.
+
 nerdctl compose version 2.4.2 ignores `env_file`. After the service
 wizards finish, the root wizard runs `scripts/compose-env.sh`. The script
 reads `config/<service>/<service>.env` and writes

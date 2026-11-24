@@ -41,11 +41,13 @@ container start:
 The container mounts `config/consul/secrets` read-only. The wizard never
 copies a token into `config/caddy/`.
 
-When the `consul` CLI and the token are both available, the entrypoint
-creates the `caddy-read` ACL policy and token. The policy grants read access
-to services and KV keys. The token stays in the runtime store under
-`/data/caddy`. When the CLI or the token is absent, the entrypoint prints the
-commands to create the policy by hand.
+When the token is available, the entrypoint creates the `caddy-read` ACL
+policy and token. It uses the `consul` CLI when the image has it. When the
+CLI is absent and `curl` is present, it uses the Consul HTTP API with the
+management token in the `X-Consul-Token` header. The policy grants read
+access to services and KV keys. The token stays in the runtime store under
+`/data/caddy`. When both methods fail, the entrypoint prints the commands to
+create the policy by hand.
 
 consul-template renders `state/caddy/Caddyfile.tpl` once at start. A
 supervisor restarts consul-template after a crash. Caddy reloads the file on
@@ -54,8 +56,16 @@ change with `caddy run --watch`.
 ## TLS
 
 `TLS_ENABLED=0` uses `tls internal` on every virtual host. Caddy issues
-certificates from its internal CA. Import
-`data/caddy/store/caddy/pki/authorities/local/root.crt` on each client.
+certificates from its internal CA. The internal CA has an intermediate
+certificate. Import `data/caddy/store/caddy/pki/authorities/local/root.crt`
+on each client.
+
+The entrypoint writes a CA bundle to
+`data/caddy/store/caddy/ca-bundle.crt` and sets mode `0644`. The bundle holds
+`intermediate.crt` first, then `root.crt`. The app containers mount the
+bundle at `/data/caddy/ca-bundle.crt` and set `SSL_CERT_FILE` to that path.
+The root alone is not enough because Caddy signs the leaf certificates with
+the intermediate.
 
 `TLS_ENABLED=1` asks for `CADDY_TLS_MODE`:
 
@@ -87,6 +97,11 @@ A descriptor has one of three modes:
 - `static`: `reverse_proxy <upstream>` with the `Host` header. When
   `x_real_ip` is true, it also sets the `X-Real-IP` header.
 
+The `litefs` mode uses the `<name>/litefs` KV key. When the key exists, write
+methods go to the primary and reads go to the local upstream. When the key is
+absent, as with `LITEFS_ENABLED=0`, every request goes to the local upstream.
+The vhost never renders an empty handler.
+
 The descriptor schema is in [layout](layout.md#vhost-registry).
 
 This branch has no service descriptors. When the registry is empty, Caddy
@@ -105,6 +120,6 @@ changes, rerun `setup.sh` and restart caddy.
 
 ## Checks
 
-Run `bash state/caddy/smoke.sh` to check the template, the vhost registry, the
-fallback vhosts, the TLS vhost list, the token selection, and the
-consul-template address.
+Run `bash state/caddy/smoke.sh` to check the template, the local fallback, the
+vhost registry, the fallback vhosts, the TLS vhost list, the token selection,
+the ACL paths, the CA bundle, and the consul-template address.

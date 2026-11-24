@@ -51,6 +51,11 @@ services:
       - '0.0.0.0:80:80/tcp'
       # HTTPS is required for every TLS mode.
       - '0.0.0.0:443:443/tcp'
+    networks:
+      default:
+        # Fixed address. Rootless nerdctl resolves a dotted vhost name through
+        # the host DNS, so the app containers use extra_hosts to reach caddy.
+        ipv4_address: 10.90.0.10
     restart: unless-stopped
     healthcheck:
       # Port 80 does not answer when no HTTP site exists (verified with the

@@ -33,6 +33,14 @@ fi
       printf '    env_file: .env\n'
     done
   fi
+  # Rootless nerdctl resolves a dotted vhost name through the host DNS. Pin the
+  # shared network so the caddy vhosts use a static address that the app
+  # containers can resolve with extra_hosts.
+  printf 'networks:\n'
+  printf '  default:\n'
+  printf '    ipam:\n'
+  printf '      config:\n'
+  printf '        - subnet: 10.90.0.0/24\n'
 } >"$tmp_output"
 
 # Leave the file untouched when the content is identical. This makes the script idempotent.

@@ -22,3 +22,8 @@ include:
   - path: compose/vaultwarden.yaml
     project_directory: .
     env_file: .env
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.90.0.0/24

@@ -31,5 +31,13 @@ services:
         published: 8080
         host_ip: ${PUBLIC_IP:-127.0.0.1}
         protocol: tcp
+    extra_hosts:
+      # Rootless nerdctl resolves a dotted vhost name through the host DNS.
+      # Send the stack vhosts to the fixed caddy address instead.
+      - "tinyauth.${STACK_DOMAIN}:10.90.0.10"
+      - "vaultwarden.${STACK_DOMAIN}:10.90.0.10"
+      - "forgejo.${STACK_DOMAIN}:10.90.0.10"
+      - "lldap.${STACK_DOMAIN}:10.90.0.10"
+      - "consul.${STACK_DOMAIN}:10.90.0.10"
     restart: unless-stopped
     user: "${STACK_UID:-1000}:${STACK_GID:-1000}"

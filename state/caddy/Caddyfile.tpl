@@ -123,3 +123,12 @@ https://forgejo.{{ env "STACK_DOMAIN" }} {
 		header_up Host {host}
 	}
 }
+
+# The Vaultwarden password manager. It uses SSO through Tinyauth.
+https://vaultwarden.{{ env "STACK_DOMAIN" }} {
+{{ template "tls_for" "vaultwarden" }}
+	reverse_proxy http://vaultwarden:80 {
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+	}
+}

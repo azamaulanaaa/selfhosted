@@ -488,7 +488,7 @@ fi
 discovered_vhosts="$(discover_vhosts | tr '\n' ' ')"
 TLS_VHOSTS="${discovered_vhosts% }"
 if [ -z "$TLS_VHOSTS" ]; then
-  TLS_VHOSTS="consul lldap tinyauth forgejo"
+  TLS_VHOSTS="consul lldap tinyauth forgejo vaultwarden"
 fi
 readonly TLS_VHOSTS
 
@@ -725,7 +725,7 @@ else
   echo "note: the entrypoint reads the ACL token from config/consul/secrets/remote-token."
 fi
 echo "note: mount config/consul/secrets into the caddy container before you start it."
-echo "caddy vhosts: https://consul.$stack_domain (all consul nodes, :8500), https://lldap.$stack_domain, https://tinyauth.$stack_domain, https://forgejo.$stack_domain"
+echo "caddy vhosts: https://consul.$stack_domain (all consul nodes, :8500), https://lldap.$stack_domain, https://tinyauth.$stack_domain, https://forgejo.$stack_domain, https://vaultwarden.$stack_domain"
 case "$tls_mode" in
 internal)
   echo "TLS mode: internal. caddy issues certificates from its internal CA."

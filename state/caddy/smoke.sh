@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Render the caddy template into a scratch tree and check the output.
-# Check the local and remote token selection and the consul-template address.
+# Check the vhosts, the local and remote token selection, and the
+# consul-template address.
 # Run this script from any directory. It finds the repository root on its own.
 set -euo pipefail
 
@@ -100,5 +101,27 @@ check_contains "$scratch/Caddyfile" "reverse_proxy http://forgejo:3000"
 check_contains "$scratch/Caddyfile" 'template "tls_for" "forgejo"'
 check_contains "$scratch/Caddyfile" 'service "consul"'
 check_lacks "$scratch/Caddyfile" "https://lan."
+
+# The scratch tree has no compose fragments. The vaultwarden vhost must
+# render from the template alone.
+check_contains "$scratch/Caddyfile" "https://vaultwarden.$test_domain {"
+check_contains "$scratch/Caddyfile" "reverse_proxy http://vaultwarden:80"
+check_contains "$scratch/Caddyfile" "header_up X-Real-IP {remote_host}"
+check_contains "$scratch/Caddyfile" 'template "tls_for" "vaultwarden"'
+
+# Check that a per-vhost certificate request lists vaultwarden.
+cert_dir="$scratch/certs"
+mkdir -p "$cert_dir"
+printf 'test-fullchain\n' >"$cert_dir/fullchain.pem"
+printf 'test-privkey\n' >"$cert_dir/privkey.pem"
+tls_status=0
+CADDY_TLS_MODE=existing TLS_ENABLED=1 \
+  CADDY_TLS_CERTS="forgejo:$cert_dir/fullchain.pem:$cert_dir/privkey.pem" \
+  CONSUL_ADDR="$test_local_addr" STACK_DOMAIN="$test_domain" \
+  bash "$wizard_root/state/caddy/setup.sh" </dev/null >"$scratch/tls-error.txt" 2>&1 ||
+  tls_status=$?
+[ "$tls_status" -ne 0 ] ||
+  fail "The wizard must reject a per-vhost certificate list with no vaultwarden pair."
+check_contains "$scratch/tls-error.txt" "vaultwarden:<fullchain>:<key>"
 
 echo "Checked the caddy template, token selection, and consul-template address."

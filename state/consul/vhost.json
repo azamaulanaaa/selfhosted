@@ -1,1 +1,1 @@
-{"name":"consul","mode":"catalog","service":"consul","port":8500}
+{"name":"consul","mode":"static","upstream":"http://consul:8500"}

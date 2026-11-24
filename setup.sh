@@ -806,11 +806,6 @@ export PUBLIC_IP="$public_ip"
 # Step 8: write the root .env with the shared Consul values and PUBLIC_IP. Keep the other lines.
 write_env_file "$consul_addr" "$consul_join_ips" "$consul_bootstrap_expect" "$public_ip"
 
-if [ "${#enabled[@]}" -eq 0 ]; then
-  echo "No services enabled."
-  exit 0
-fi
-
 # Step 9: run the wizard of each enabled service, in sorted order.
 for service in "${enabled[@]}"; do
   if ! bash "$REPO_ROOT/state/$service/setup.sh"; then
@@ -819,7 +814,16 @@ for service in "${enabled[@]}"; do
   fi
 done
 
-# Step 10: print the summary.
+# Step 10: generate the Compose environment override.
+# nerdctl compose ignores env_file, so the override holds the values.
+bash "$REPO_ROOT/scripts/compose-env.sh"
+
+if [ "${#enabled[@]}" -eq 0 ]; then
+  echo "No services enabled."
+  exit 0
+fi
+
+# Step 11: print the summary.
 echo "Configured the stack:"
 for service in "${enabled[@]}"; do
   echo "  $service"
@@ -830,4 +834,8 @@ if [ -n "$public_ip" ]; then
 else
   echo "PUBLIC_IP: not set"
 fi
-echo "Next step: docker compose up -d ${enabled[*]}"
+if [ "$stack_rootless" = "1" ]; then
+  echo "Next step: nerdctl compose -f compose.yaml -f config/compose.env.yaml up -d ${enabled[*]}"
+else
+  echo "Next step: docker compose up -d ${enabled[*]}"
+fi

@@ -211,6 +211,26 @@ bootstrap_read_acl() {
   print_acl_commands
 }
 
+# Write the CA bundle for the app containers.
+# The internal CA has an intermediate. The apps need the intermediate and the
+# root. The bundle holds the intermediate first, then the root.
+write_ca_bundle() {
+  ca_dir="$STORE/pki/authorities/local"
+  ca_bundle="$STORE/ca-bundle.crt"
+  tries=0
+  while [ ! -f "$ca_dir/root.crt" ] || [ ! -f "$ca_dir/intermediate.crt" ]; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 60 ]; then
+      echo "warning: The caddy CA files did not appear. The CA bundle is missing." >&2
+      return 0
+    fi
+    sleep 2
+  done
+  cat "$ca_dir/intermediate.crt" "$ca_dir/root.crt" >"$ca_bundle"
+  chmod 0644 "$ca_bundle"
+  echo "info: Wrote the CA bundle at $ca_bundle." >&2
+}
+
 # Render once, supervise consul-template, and run caddy in watch mode.
 start() {
   bootstrap_read_acl
@@ -229,6 +249,8 @@ start() {
   echo "info: consul-template rendered the caddyfile." >&2
 
   supervise_consul_template &
+
+  write_ca_bundle &
 
   echo "info: start caddy in watch mode." >&2
   exec caddy run --watch --config "$CADDYFILE" --adapter caddyfile

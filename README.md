@@ -284,6 +284,8 @@ See the [smolvm documentation](docs/smolvm.md) for the full list.
 
 ## Documentation
 
+- The [add a service](docs/add-feature.md) guide describes how to add one
+  service to the stack.
 - The [check pipeline](docs/ci.md) describes how the checks run and how
   to add a check.
 - The [release workflow](docs/release.md) describes the commit format

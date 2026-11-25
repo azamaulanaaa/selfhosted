@@ -174,6 +174,11 @@ Each service wizard supports `clean`.
   files. A service that was part of a cluster may need its own admin
   commands to leave the cluster cleanly.
 
+## Add a service
+
+See [Add a service](add-feature.md) for the branch, the service files, the
+Consul rules, the rootless checks, and the merge checks.
+
 ## Vhost registry
 
 A service that has a web vhost commits one descriptor at

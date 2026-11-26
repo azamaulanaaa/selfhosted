@@ -1,0 +1,3 @@
+# Traceloop Hub scaling files. The columns are path, mode, scope, when, presence, purpose.
+config/traceloop-hub	700	node-local	both	required	Traceloop Hub configuration directory.
+config/traceloop-hub/config.yaml	600	node-local	both	required	YAML Mode config. The user adds a provider, a model, and a pipeline before the gateway routes requests.

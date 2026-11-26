@@ -1,0 +1,39 @@
+# dclint disable require-project-name-field
+# The root compose.yaml owns the project name. This file is an included fragment.
+services:
+  # Traceloop Hub is an LLM gateway. This service runs YAML Mode with a static
+  # config file. It uses no database and no management API. Caddy proxies the
+  # gateway at traceloop-hub.<STACK_DOMAIN>. Port 3002 is published on
+  # PUBLIC_IP for standalone access. The gateway listens on port 3000.
+  traceloop-hub:
+    image: traceloop/hub:0.10.1
+    container_name: traceloop-hub
+    volumes:
+      # Wizard-written YAML Mode config. Read-only. The user edits the file
+      # before the gateway routes requests.
+      - ./config/traceloop-hub/config.yaml:/app/config.yaml:ro
+    environment:
+      # YAML Mode is the default. Set the values explicitly for clarity.
+      - HUB_MODE=yaml
+      - CONFIG_FILE_PATH=/app/config.yaml
+    ports:
+      # Standalone access through an external HTTPS reverse proxy.
+      # The long syntax binds the port to PUBLIC_IP only.
+      - target: 3000
+        published: 3002
+        host_ip: ${PUBLIC_IP:-127.0.0.1}
+        protocol: tcp
+    extra_hosts:
+      # Rootless nerdctl resolves a dotted vhost name through the host DNS.
+      # Send the stack vhost to the fixed caddy address instead.
+      - "traceloop-hub.${STACK_DOMAIN}:10.90.0.10"
+    restart: unless-stopped
+    healthcheck:
+      # The distroless debug image holds a busybox shell with wget.
+      # GET /health answers without authentication.
+      test: wget -q -O /dev/null http://127.0.0.1:3000/health
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    user: "${STACK_UID:-1000}:${STACK_GID:-1000}"

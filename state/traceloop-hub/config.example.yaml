@@ -1,0 +1,42 @@
+# Traceloop Hub YAML Mode configuration template.
+# The wizard copies this file to config/traceloop-hub/config.yaml when the
+# target file is absent. The wizard does not overwrite an existing file.
+# No provider is active. The gateway does not route requests until you add a
+# provider, a model, and a pipeline below.
+# The config supports ${ENV_VAR} substitution. Keep API keys in environment
+# variables. Do not write a secret into this file.
+
+general:
+  # Set to false to stop request and response content in traces.
+  trace_content_enabled: true
+
+# Add one entry for each upstream provider. Use a unique key for each entry.
+# Set api_key from an environment variable, for example ${OPENAI_API_KEY}.
+# Supported types: openai, anthropic, azure, bedrock, vertexai.
+# providers:
+#   - key: my-openai
+#     type: openai
+#     api_key: ${OPENAI_API_KEY}
+#     base_url: "https://api.openai.com/v1"
+providers: []
+
+# Add one entry for each model. The provider value must match a provider key.
+# models:
+#   - key: my-chat-model
+#     type: gpt-4
+#     provider: my-openai
+models: []
+
+# Add a pipeline to route requests. The pipeline type selects the endpoint.
+# Supported types: chat, completion, embeddings.
+# The model-router plugin lists the model keys to use.
+# pipelines:
+#   - name: default
+#     type: chat
+#     plugins:
+#       - logging:
+#           level: info
+#       - model-router:
+#           models:
+#             - my-chat-model
+pipelines: []
